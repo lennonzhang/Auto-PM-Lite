@@ -1,0 +1,49 @@
+{
+  "name": "auto-pm-lite",
+  "version": "0.1.0",
+  "packageManager": "pnpm@10.33.0",
+  "private": true,
+  "type": "module",
+  "description": "TypeScript control plane for supervising Claude and Codex runtimes.",
+  "bin": {
+    "auto-pm-lite": "dist/index.js"
+  },
+  "scripts": {
+    "build": "tsup",
+    "dev": "tsx src/index.ts",
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "spike:claude:permissions": "tsx spikes/claude-permissions.ts",
+    "spike:claude:mcp": "tsx spikes/claude-delegate-mcp.ts",
+    "spike:codex:stream": "tsx spikes/codex-stream.ts",
+    "spike:codex:mcp": "tsx spikes/codex-mcp-delegate.ts",
+    "spike:codex:approval": "tsx spikes/codex-approval.ts"
+  },
+  "engines": {
+    "node": ">=22.0.0"
+  },
+  "dependencies": {
+    "@anthropic-ai/claude-agent-sdk": "^0.1.12",
+    "@iarna/toml": "^2.2.5",
+    "@openai/codex-sdk": "^0.125.0",
+    "better-sqlite3": "^12.1.1",
+    "commander": "^14.0.0",
+    "pino": "^10.0.0",
+    "zod": "^4.1.5"
+  },
+  "devDependencies": {
+    "@types/better-sqlite3": "^7.6.13",
+    "@types/node": "^24.6.0",
+    "tsup": "^8.5.0",
+    "tsx": "^4.20.5",
+    "typescript": "^5.9.3",
+    "vitest": "^3.2.4"
+  },
+  "pnpm": {
+    "onlyBuiltDependencies": [
+      "better-sqlite3",
+      "esbuild"
+    ]
+  }
+}
