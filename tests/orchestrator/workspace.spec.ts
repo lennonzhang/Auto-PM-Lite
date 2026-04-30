@@ -31,9 +31,16 @@ describe("WorkspaceManager", () => {
       topLevelUseWorktree: true,
     });
 
+    const plan = manager.resolveWorkspacePlan({
+      taskKind: "top-level",
+      cwd: root,
+    });
+    expect(plan.kind).toBe("top-level-worktree");
+
     const workspace = manager.createTopLevelWorkspace({
       taskId: "task-1",
       cwd: root,
+      plan,
     });
 
     expect(workspace.path).toBe(path.join(workspaceRoot, "task-1"));
@@ -48,12 +55,35 @@ describe("WorkspaceManager", () => {
       topLevelUseWorktree: false,
     });
 
+    const plan = manager.resolveWorkspacePlan({
+      taskKind: "top-level",
+      cwd: "D:/Code/Auto-PM-Lite",
+    });
+    expect(plan.kind).toBe("direct-cwd");
+
     const workspace = manager.createTopLevelWorkspace({
       taskId: "task-2",
       cwd: "D:/Code/Auto-PM-Lite",
+      plan,
     });
 
     expect(path.normalize(workspace.path)).toBe(path.normalize("D:/Code/Auto-PM-Lite"));
     expect(workspace.unsafeDirectCwd).toBe(true);
+  });
+
+  it("uses direct cwd when policy explicitly opts into unsafe direct mode", () => {
+    const manager = new WorkspaceManager({
+      rootDir: "D:/tmp/auto-pm-workspaces",
+      topLevelUseWorktree: true,
+    });
+
+    const plan = manager.resolveWorkspacePlan({
+      taskKind: "top-level",
+      cwd: "D:/Code/Auto-PM-Lite",
+      policyUnsafeDirectCwd: true,
+    });
+
+    expect(plan.kind).toBe("direct-cwd");
+    expect(plan.unsafeDirectCwd).toBe(true);
   });
 });
