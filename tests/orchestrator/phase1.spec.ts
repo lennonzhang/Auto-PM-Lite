@@ -16,6 +16,7 @@ class FakeRuntimeAdapter implements RuntimeAdapter {
   public failNextRun = false;
   public cancelCalls = 0;
   public resumeCalls = 0;
+  public delayMs = 0;
 
   async startTask(input: StartRuntimeTaskInput): Promise<RuntimeTaskHandle> {
     return {
@@ -27,6 +28,10 @@ class FakeRuntimeAdapter implements RuntimeAdapter {
   async *runTurn(input: RunTurnInput): AsyncIterable<AgentEvent> {
     const ts = new Date().toISOString();
     yield { type: "turn.started", taskId: input.taskId, turnId: "turn-1", ts };
+
+    if (this.delayMs > 0) {
+      await new Promise((resolve) => setTimeout(resolve, this.delayMs));
+    }
 
     if (this.failNextRun) {
       this.failNextRun = false;
@@ -64,6 +69,49 @@ afterEach(async () => {
 });
 
 describe("Phase 1 boundary", () => {
+  it("normalizes snake_case config and sibling accounts.toml", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "auto-pm-lite-config-"));
+    tempPaths.push(root);
+
+    const configPath = path.join(root, "config.toml");
+    const accountsPath = path.join(root, "accounts.toml");
+    const dbPath = path.join(root, "auto-pm-lite.db");
+
+    await fs.writeFile(accountsPath, `
+[account.openai_main]
+vendor = "openai"
+secret_ref = "env:OPENAI_API_KEY"
+`, "utf8");
+    await fs.writeFile(configPath, `
+[storage]
+db_path = "${dbPath.replace(/\\/g, "/")}"
+busy_timeout_ms = 1000
+
+[policy.readonly]
+permission_mode = "read-only"
+sandbox_mode = "read-only"
+network_allowed = false
+approval_policy = "orchestrator"
+require_approval_for = ["cross_harness_delegation"]
+max_depth = 1
+allow_cross_harness_delegation = true
+allow_child_edit = false
+allow_child_network = false
+
+[profile.codex_main]
+runtime = "codex"
+account = "openai_main"
+policy = "readonly"
+model = "gpt-5-codex"
+`, "utf8");
+
+    const config = await loadConfig(configPath);
+    expect(config.accounts.openai_main?.secretRef).toBe("env:OPENAI_API_KEY");
+    expect(config.policies.readonly?.requireApprovalFor).toEqual(["cross_harness_delegation"]);
+    expect(config.profiles.codex_main?.accountId).toBe("openai_main");
+    expect(config.storage.dbPath.replace(/\\/g, "/")).toBe(dbPath.replace(/\\/g, "/"));
+  });
+
   it("loads config and resolves top-level task workspace policy", async () => {
     const root = await fs.mkdtemp(path.join(os.tmpdir(), "auto-pm-lite-phase1-"));
     tempPaths.push(root);
@@ -289,7 +337,7 @@ model = "claude-opus-4-7"
 
       orchestrator.createApproval({
         taskId: task.id,
-        kind: "filesystem",
+        kind: "workspace_write",
         payload: { path: "notes.txt" },
       });
 
@@ -393,19 +441,192 @@ model = "gpt-5-codex"
         requestedPermissionMode: "read-only",
       });
 
-      const childTask = orchestrator.getTask(delegated.childTaskId);
+      expect(delegated.status).toBe("completed");
+      expect(delegated.childTaskId).toBeDefined();
+      const childTaskId = delegated.childTaskId!;
+      const childTask = orchestrator.getTask(childTaskId);
       expect(childTask?.parentTaskId).toBe(parent.id);
       expect(childTask?.runtime).toBe("codex");
       expect(childTask?.cwd).toBe(parent.cwd);
       expect(childTask?.status).toBe("completed");
-      expect(delegated.result.status).toBe("completed");
-      expect(delegated.result.latestMessage).toBe("echo:review this");
-      expect(orchestrator.waitForTask(parent.id, delegated.childTaskId).taskId).toBe(delegated.childTaskId);
+      expect(delegated.finalResponse).toBe("echo:review this");
+      expect((await orchestrator.waitForTask(parent.id, childTaskId)).taskId).toBe(childTaskId);
 
       const events = db.db.prepare(`SELECT type FROM events WHERE task_id = ? ORDER BY id ASC`).all(parent.id) as Array<{ type: string }>;
       expect(events.map((event) => event.type)).toContain("delegation.requested");
       expect(events.map((event) => event.type)).toContain("delegation.started");
       expect(events.map((event) => event.type)).toContain("delegation.completed");
+    } finally {
+      await orchestrator.close();
+    }
+  });
+
+  it("requires approval before cross-harness delegation when policy asks for it", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "auto-pm-lite-phase3-approval-"));
+    tempPaths.push(root);
+
+    const dbPath = path.join(root, "auto-pm-lite.db");
+    const configPath = path.join(root, "config.toml");
+    await fs.writeFile(configPath, `
+[storage]
+dbPath = "${dbPath.replace(/\\/g, "/")}"
+busyTimeoutMs = 1000
+maxQueueSize = 100
+flushBatchSize = 10
+
+[workspace]
+rootDir = "${path.join(root, "workspaces").replace(/\\/g, "/")}"
+topLevelUseWorktree = false
+
+[policy.parent]
+permissionMode = "read-only"
+sandboxMode = "read-only"
+networkAllowed = false
+approvalPolicy = "orchestrator"
+requireApprovalFor = ["cross_harness_delegation"]
+maxDepth = 2
+allowCrossHarnessDelegation = true
+allowChildEdit = false
+allowChildNetwork = false
+
+[policy.child]
+permissionMode = "read-only"
+sandboxMode = "read-only"
+networkAllowed = false
+approvalPolicy = "orchestrator"
+requireApprovalFor = []
+maxDepth = 2
+allowCrossHarnessDelegation = true
+allowChildEdit = false
+allowChildNetwork = false
+
+[account.anthropic_personal]
+vendor = "anthropic"
+secretRef = "env:ANTHROPIC_API_KEY"
+
+[account.openai_personal]
+vendor = "openai"
+secretRef = "env:OPENAI_API_KEY"
+
+[profile.claude_parent]
+runtime = "claude"
+accountId = "anthropic_personal"
+policyId = "parent"
+model = "claude-opus-4-7"
+
+[profile.codex_child]
+runtime = "codex"
+accountId = "openai_personal"
+policyId = "child"
+model = "gpt-5-codex"
+`, "utf8");
+
+    const config = await loadConfig(configPath);
+    const db = new AppDatabase({ dbPath: config.storage.dbPath, busyTimeoutMs: config.storage.busyTimeoutMs });
+    const orchestrator = new Orchestrator(config, db, {
+      claude: new FakeRuntimeAdapter(),
+      codex: new FakeCodexRuntimeAdapter(),
+    });
+    orchestrator.syncConfig();
+
+    try {
+      const parent = await orchestrator.createTask({ profileId: "claude_parent", cwd: root });
+      const result = await orchestrator.delegateTask({
+        parentTaskId: parent.id,
+        targetRuntime: "codex",
+        taskType: "ask",
+        prompt: "review",
+        reason: "approval gate",
+        workspaceMode: "share",
+        requestedPermissionMode: "read-only",
+      });
+
+      expect(result.status).toBe("awaiting_approval");
+      expect(result.approvalId).toBeDefined();
+      expect(orchestrator.listApprovals(parent.id)).toHaveLength(1);
+      expect(orchestrator.listTasks().filter((task) => task.runtime === "codex")).toHaveLength(0);
+    } finally {
+      await orchestrator.close();
+    }
+  });
+
+  it("returns started for long delegation and wait_for_task observes completion later", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "auto-pm-lite-phase3-timeout-"));
+    tempPaths.push(root);
+
+    const dbPath = path.join(root, "auto-pm-lite.db");
+    const configPath = path.join(root, "config.toml");
+    await fs.writeFile(configPath, `
+[storage]
+dbPath = "${dbPath.replace(/\\/g, "/")}"
+busyTimeoutMs = 1000
+maxQueueSize = 100
+flushBatchSize = 10
+
+[workspace]
+rootDir = "${path.join(root, "workspaces").replace(/\\/g, "/")}"
+topLevelUseWorktree = false
+
+[policy.readonly]
+permissionMode = "read-only"
+sandboxMode = "read-only"
+networkAllowed = false
+approvalPolicy = "orchestrator"
+requireApprovalFor = []
+maxDepth = 2
+allowCrossHarnessDelegation = true
+allowChildEdit = false
+allowChildNetwork = false
+
+[account.anthropic_personal]
+vendor = "anthropic"
+secretRef = "env:ANTHROPIC_API_KEY"
+
+[account.openai_personal]
+vendor = "openai"
+secretRef = "env:OPENAI_API_KEY"
+
+[profile.claude_parent]
+runtime = "claude"
+accountId = "anthropic_personal"
+policyId = "readonly"
+model = "claude-opus-4-7"
+
+[profile.codex_child]
+runtime = "codex"
+accountId = "openai_personal"
+policyId = "readonly"
+model = "gpt-5-codex"
+`, "utf8");
+
+    const config = await loadConfig(configPath);
+    const db = new AppDatabase({ dbPath: config.storage.dbPath, busyTimeoutMs: config.storage.busyTimeoutMs });
+    const codex = new FakeCodexRuntimeAdapter();
+    codex.delayMs = 50;
+    const orchestrator = new Orchestrator(config, db, {
+      claude: new FakeRuntimeAdapter(),
+      codex,
+    });
+    orchestrator.syncConfig();
+
+    try {
+      const parent = await orchestrator.createTask({ profileId: "claude_parent", cwd: root });
+      const result = await orchestrator.delegateTask({
+        parentTaskId: parent.id,
+        targetRuntime: "codex",
+        taskType: "ask",
+        prompt: "slow review",
+        reason: "timeout",
+        workspaceMode: "share",
+        requestedPermissionMode: "read-only",
+        timeoutMs: 1,
+      });
+
+      expect(result.status).toBe("started");
+      expect(result.childTaskId).toBeDefined();
+      const waited = await orchestrator.waitForTask(parent.id, result.childTaskId!, 1000);
+      expect(waited.status).toBe("completed");
+      expect(waited.latestMessage).toBe("echo:slow review");
     } finally {
       await orchestrator.close();
     }
@@ -504,15 +725,17 @@ model = "gpt-5-codex"
         requestedPermissionMode: "read-only",
       });
 
-      await expect(orchestrator.delegateTask({
-        parentTaskId: child.childTaskId,
+      expect(child.childTaskId).toBeDefined();
+      const denied = await orchestrator.delegateTask({
+        parentTaskId: child.childTaskId!,
         targetRuntime: "claude",
         taskType: "ask",
         prompt: "second hop",
         reason: "loop back",
         workspaceMode: "share",
         requestedPermissionMode: "read-only",
-      })).rejects.toThrow(/max_depth|cycle_detected/);
+      });
+      expect(["max_depth", "cycle_detected"]).toContain(denied.status);
     } finally {
       await orchestrator.close();
     }
@@ -580,11 +803,12 @@ model = "claude-opus-4-7"
 
       const approval = await orchestrator.requestCapability({
         taskId: parent.id,
-        kind: "filesystem",
+        kind: "workspace_write",
         reason: "need write approval",
       });
       expect(approval.status).toBe("pending");
       expect(orchestrator.listApprovals(parent.id)).toHaveLength(1);
+      expect(db.getTask(parent.id)?.status).toBe("awaiting_approval");
 
       const artifact = orchestrator.reportArtifact({
         taskId: parent.id,

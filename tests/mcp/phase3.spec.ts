@@ -55,6 +55,13 @@ const config: AppConfig = {
     rootDir: "D:/tmp/workspaces",
     topLevelUseWorktree: false,
   },
+  scheduler: {
+    maxConcurrentTasksGlobal: 5,
+    maxConcurrentTasksPerAccount: 2,
+  },
+  rateLimit: {
+    enabled: false,
+  },
 };
 
 describe("AutoPmMcpService", () => {

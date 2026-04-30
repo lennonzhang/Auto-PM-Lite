@@ -53,7 +53,7 @@ describe("policy", () => {
 
   it("denies higher-trust references without approval", () => {
     expect(canExpandReference(
-      { ...basePolicy, requireApprovalFor: ["reference_access"] },
+      { ...basePolicy, requireApprovalFor: ["profile_switch"] },
       {
         requesterTaskId: "child",
         requesterLineage: ["parent"],
