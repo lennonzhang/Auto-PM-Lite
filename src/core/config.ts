@@ -29,7 +29,18 @@ const policySchema = z.object({
   sandboxMode: z.enum(["read-only", "workspace-write", "danger-full-access"]),
   networkAllowed: z.boolean().default(false),
   approvalPolicy: z.enum(["never", "on-request", "untrusted", "orchestrator"]),
-  requireApprovalFor: z.array(z.enum(["tool", "network", "filesystem", "delegation", "workspace_merge", "budget_increase", "reference_access"])).default([]),
+  requireApprovalFor: z.array(z.enum([
+    "shell",
+    "file_edit",
+    "network",
+    "workspace_write",
+    "cross_harness_delegation",
+    "profile_switch",
+    "budget_increase",
+    "sandbox_escape",
+    "workspace_merge",
+    "clarification",
+  ])).default([]),
   maxDepth: z.number().int().min(0).default(1),
   maxTurns: z.number().int().positive().optional(),
   maxMinutes: z.number().int().positive().optional(),
@@ -81,6 +92,19 @@ const configSchema = z.object({
     rootDir: path.join(os.homedir(), ".auto-pm-lite", "workspaces"),
     topLevelUseWorktree: true,
   }),
+  scheduler: z.object({
+    maxConcurrentTasksGlobal: z.number().int().positive().default(5),
+    maxConcurrentTasksPerAccount: z.number().int().positive().default(2),
+  }).default({
+    maxConcurrentTasksGlobal: 5,
+    maxConcurrentTasksPerAccount: 2,
+  }),
+  rateLimit: z.object({
+    enabled: z.boolean().default(false),
+    requestsPerMinute: z.number().int().positive().optional(),
+    requestsPerHour: z.number().int().positive().optional(),
+    tokensPerMinute: z.number().int().positive().optional(),
+  }).default({ enabled: false }),
 });
 
 export function defaultConfigPath(): string {
@@ -90,8 +114,37 @@ export function defaultConfigPath(): string {
 export async function loadConfig(configPath = defaultConfigPath()): Promise<AppConfig> {
   const raw = await fs.readFile(configPath, "utf8");
   const parsed = TOML.parse(raw) as Record<string, unknown>;
-  const normalized = normalizeConfig(parsed);
+  const accountsPath = path.join(path.dirname(configPath), "accounts.toml");
+  const accountsParsed = await readOptionalToml(accountsPath);
+  const merged = mergeAccountsToml(parsed, accountsParsed);
+  const normalized = normalizeConfig(merged);
   return configSchema.parse(normalized);
+}
+
+async function readOptionalToml(filePath: string): Promise<Record<string, unknown> | null> {
+  try {
+    const raw = await fs.readFile(filePath, "utf8");
+    return TOML.parse(raw) as Record<string, unknown>;
+  } catch (error) {
+    if (error && typeof error === "object" && "code" in error && error.code === "ENOENT") {
+      return null;
+    }
+    throw error;
+  }
+}
+
+function mergeAccountsToml(config: Record<string, unknown>, accountsToml: Record<string, unknown> | null): Record<string, unknown> {
+  if (!accountsToml) {
+    return config;
+  }
+
+  return {
+    ...config,
+    account: {
+      ...asRecord(accountsToml.account),
+      ...asRecord(config.account),
+    },
+  };
 }
 
 function normalizeConfig(input: Record<string, unknown>): Record<string, unknown> {
@@ -103,10 +156,12 @@ function normalizeConfig(input: Record<string, unknown>): Record<string, unknown
     accounts,
     policies,
     profiles,
-    redaction: input.redaction ?? {},
-    transcript: input.transcript ?? {},
-    storage: input.storage ?? {},
-    workspace: input.workspace ?? {},
+    redaction: normalizeKeys(asRecord(input.redaction)),
+    transcript: normalizeKeys(asRecord(input.transcript)),
+    storage: normalizeKeys(asRecord(input.storage)),
+    workspace: normalizeKeys(asRecord(input.workspace)),
+    scheduler: normalizeKeys(asRecord(input.scheduler)),
+    rateLimit: normalizeKeys(asRecord(input.rateLimit)),
   };
 }
 
@@ -121,7 +176,97 @@ function normalizeNamedSection(value: unknown, key: string): Record<string, Reco
         throw new Error(`Invalid [${key}.${id}] section`);
       }
 
-      return [id, { id, ...config }];
+      return [id, { id, ...normalizeKeys(config as Record<string, unknown>) }];
     }),
   );
+}
+
+function asRecord(value: unknown): Record<string, unknown> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return {};
+  }
+
+  return value as Record<string, unknown>;
+}
+
+function normalizeKeys(input: Record<string, unknown>): Record<string, unknown> {
+  const output: Record<string, unknown> = {};
+
+  for (const [key, value] of Object.entries(input)) {
+    output[normalizeKey(key)] = value;
+  }
+
+  if ("account" in output && !("accountId" in output)) {
+    output.accountId = output.account;
+  }
+  if ("policy" in output && !("policyId" in output)) {
+    output.policyId = output.policy;
+  }
+
+  return output;
+}
+
+function normalizeKey(key: string): string {
+  switch (key) {
+    case "base_url":
+      return "baseUrl";
+    case "secret_ref":
+      return "secretRef";
+    case "extra_headers":
+      return "extraHeaders";
+    case "extra_config":
+      return "extraConfig";
+    case "permission_mode":
+      return "permissionMode";
+    case "sandbox_mode":
+      return "sandboxMode";
+    case "network_allowed":
+      return "networkAllowed";
+    case "approval_policy":
+      return "approvalPolicy";
+    case "require_approval_for":
+      return "requireApprovalFor";
+    case "max_depth":
+      return "maxDepth";
+    case "max_turns":
+      return "maxTurns";
+    case "max_minutes":
+      return "maxMinutes";
+    case "max_tokens":
+      return "maxTokens";
+    case "max_cost_usd":
+      return "maxCostUsd";
+    case "allow_cross_harness_delegation":
+      return "allowCrossHarnessDelegation";
+    case "allow_child_edit":
+      return "allowChildEdit";
+    case "allow_child_network":
+      return "allowChildNetwork";
+    case "unsafe_direct_cwd":
+      return "unsafeDirectCwd";
+    case "allowed_models":
+      return "allowedModels";
+    case "system_prompt_override":
+      return "systemPromptOverride";
+    case "additional_patterns":
+      return "additionalPatterns";
+    case "store_raw_encrypted":
+      return "storeRawEncrypted";
+    case "raw_ttl_hours":
+      return "rawTtlHours";
+    case "db_path":
+      return "dbPath";
+    case "busy_timeout_ms":
+      return "busyTimeoutMs";
+    case "max_queue_size":
+      return "maxQueueSize";
+    case "flush_batch_size":
+      return "flushBatchSize";
+    case "root_dir":
+      return "rootDir";
+    case "top_level_use_worktree":
+      return "topLevelUseWorktree";
+    default:
+      return key;
+  }
 }

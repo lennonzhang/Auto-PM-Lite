@@ -14,6 +14,7 @@ export async function openOrchestrator(configPath: string): Promise<Orchestrator
   const claude = new ClaudeRuntimeAdapter({
     config,
     createMcpHandlers: (taskId) => orchestrator.createMcpHandlers(taskId),
+    requestApproval: (input) => orchestrator.requestCapability(input),
   });
   const codex = new CodexRuntimeAdapter({
     config,

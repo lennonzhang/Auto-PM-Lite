@@ -87,7 +87,10 @@ export class CodexRuntimeAdapter extends BaseRuntimeAdapter implements RuntimeAd
   private async buildCodexOptions(accountId: string, taskId: string, cwd?: string): Promise<CodexOptions> {
     const account = this.getAccount(accountId);
     const env = await this.resolveSecretEnv(account);
-    const providerConfig = buildCodexProviderConfig(account.vendor, account.id, account.baseUrl);
+    const customProvider = requiresCustomCodexProvider(account.vendor);
+    const providerConfig = customProvider
+      ? buildCodexProviderConfig(account.id, account.baseUrl)
+      : undefined;
     const mcpConfig = createCodexMcpServerConfig({
       config: this.deps.config,
       configPath: this.getConfigPath(),
@@ -99,6 +102,8 @@ export class CodexRuntimeAdapter extends BaseRuntimeAdapter implements RuntimeAd
       ...(providerConfig ?? {}),
       mcp_servers: {
         auto_pm_lite: {
+          enabled: true,
+          startup_timeout_sec: 30,
           ...(mcpConfig.command ? { command: mcpConfig.command } : {}),
           ...(mcpConfig.args ? { args: mcpConfig.args } : {}),
           ...(mcpConfig.url ? { url: mcpConfig.url } : {}),
@@ -108,7 +113,11 @@ export class CodexRuntimeAdapter extends BaseRuntimeAdapter implements RuntimeAd
       },
     };
 
+    // Provider routing: official OpenAI uses Codex's default auth path (no baseUrl, no provider config).
+    // Custom providers (azure / openai-compatible) flow through `model_providers.<id>` only — never
+    // top-level baseUrl, otherwise the SDK routes one way and the model_provider routes another.
     return {
+      ...(customProvider ? {} : account.baseUrl ? { baseUrl: account.baseUrl } : {}),
       env: {
         PATH: process.env.PATH ?? "",
         ...env,
@@ -125,12 +134,13 @@ export class CodexRuntimeAdapter extends BaseRuntimeAdapter implements RuntimeAd
       sandboxMode: policy.sandboxMode,
       approvalPolicy: mapApprovalPolicy(policy.approvalPolicy),
       networkAccessEnabled: policy.networkAllowed,
+      additionalDirectories: cwd ? [cwd] : [],
     };
   }
 }
 
-function buildCodexProviderConfig(vendor: VendorKind, accountId: string, baseUrl?: string): CodexConfigObject | undefined {
-  if (!requiresCustomCodexProvider(vendor) || !baseUrl) {
+function buildCodexProviderConfig(accountId: string, baseUrl?: string): CodexConfigObject | undefined {
+  if (!baseUrl) {
     return undefined;
   }
 

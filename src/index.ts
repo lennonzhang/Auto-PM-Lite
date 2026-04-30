@@ -5,6 +5,7 @@ import { Command } from "commander";
 import { defaultConfigPath, loadConfig } from "./core/config.js";
 import { openOrchestrator } from "./app.js";
 import { runStdioMcpServer } from "./mcp/stdio-server.js";
+import { categorizeApproval } from "./core/types.js";
 
 const program = new Command();
 
@@ -115,14 +116,20 @@ program
 
 program
   .command("approval:list")
-  .description("List approvals")
+  .description("List approvals (annotated with category)")
   .option("-t, --task <id>", "Optional task ID filter")
+  .option("--category <category>", "Filter by category: tool_approval | privilege_escalation | clarification | capability_request")
   .option("-c, --config <path>", "Path to config TOML", defaultConfigPath())
-  .action(async ({ config, task }) => {
+  .action(async ({ category, config, task }) => {
     const orchestrator = await openOrchestrator(config);
 
     try {
-      process.stdout.write(`${JSON.stringify(orchestrator.listApprovals(task), null, 2)}\n`);
+      const annotated = orchestrator.listApprovals(task).map((approval) => ({
+        ...approval,
+        category: categorizeApproval(approval.kind),
+      }));
+      const filtered = category ? annotated.filter((entry) => entry.category === category) : annotated;
+      process.stdout.write(`${JSON.stringify(filtered, null, 2)}\n`);
     } finally {
       await orchestrator.close();
     }
@@ -139,7 +146,7 @@ program
     const orchestrator = await openOrchestrator(config);
 
     try {
-      orchestrator.resolveApproval({
+      await orchestrator.resolveApproval({
         approvalId: approval,
         approved: decision === "approved",
         reason,
@@ -229,6 +236,47 @@ program
   .option("-c, --config <path>", "Path to config TOML", defaultConfigPath())
   .action(async ({ config, task }) => {
     await runStdioMcpServer(config, task);
+  });
+
+program
+  .command("events:stream")
+  .description("Replay persisted events then stream live events from the orchestrator")
+  .option("-c, --config <path>", "Path to config TOML", defaultConfigPath())
+  .option("-t, --task <id>", "Optional task ID filter")
+  .option("--since-id <number>", "Resume after a given event id (defaults to 0 = full history)")
+  .option("--no-replay", "Skip historical replay and only stream live events")
+  .action(async ({ config, task, sinceId, replay }) => {
+    const orchestrator = await openOrchestrator(config);
+
+    try {
+      const writer = (event: unknown) => process.stdout.write(`${JSON.stringify(event)}\n`);
+      let unsubscribe: () => void;
+
+      if (replay !== false) {
+        const result = await orchestrator.replayAndSubscribe({
+          taskId: task,
+          sinceId: sinceId ? Number(sinceId) : undefined,
+          listener: writer,
+        });
+        unsubscribe = result.unsubscribe;
+      } else {
+        unsubscribe = orchestrator.subscribeToEvents((event) => {
+          if (!task || event.taskId === task) {
+            writer(event);
+          }
+        });
+      }
+
+      process.on("SIGINT", () => {
+        unsubscribe();
+        orchestrator.close().then(() => process.exit(0));
+      });
+
+      await new Promise(() => {});
+    } catch (error) {
+      await orchestrator.close();
+      throw error;
+    }
   });
 
 program.parseAsync(process.argv).catch((error: unknown) => {

@@ -10,14 +10,19 @@ export function normalizeClaudeMessage(taskId: string, message: SDKMessage, turn
   }
 
   if (message.type === "result") {
+    const backendEvent: AgentEvent = { type: "task.backend_thread", taskId, backendThreadId: message.session_id, ts };
     if (message.subtype === "success") {
       return [
+        backendEvent,
         { type: "message.completed", taskId, turnId, text: message.result, ts },
         { type: "turn.completed", taskId, turnId, usage: toClaudeUsage(message), ts },
       ];
     }
 
-    return [{ type: "task.failed", taskId, error: message.subtype, ts }];
+    return [
+      backendEvent,
+      { type: "task.failed", taskId, error: message.errors?.join("\n") || message.subtype, ts },
+    ];
   }
 
   if (message.type === "system") {

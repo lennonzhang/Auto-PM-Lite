@@ -18,7 +18,8 @@
     "spike:claude:mcp": "tsx spikes/claude-delegate-mcp.ts",
     "spike:codex:stream": "tsx spikes/codex-stream.ts",
     "spike:codex:mcp": "tsx spikes/codex-mcp-delegate.ts",
-    "spike:codex:approval": "tsx spikes/codex-approval.ts"
+    "spike:codex:approval": "tsx spikes/codex-approval.ts",
+    "test:live": "tsx spikes/live-smoke.ts"
   },
   "engines": {
     "node": ">=22.0.0"

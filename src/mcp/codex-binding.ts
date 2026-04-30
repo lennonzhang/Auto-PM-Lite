@@ -50,7 +50,7 @@ export function buildCodexMcpServerEnv(config: AppConfig): Record<string, string
 
     const envName = account.secretRef.slice(4);
     const value = process.env[envName];
-    if (value) {
+    if (value !== undefined) {
       env[envName] = value;
     }
   }

@@ -3,23 +3,32 @@ import { query, type CanUseTool, type Options, type Query } from "@anthropic-ai/
 import type { AgentEvent } from "../core/types.js";
 import { createClaudeMcpServer } from "../mcp/claude-binding.js";
 import { AutoPmMcpService } from "../mcp/auto-pm-service.js";
-import { allowedClaudeTools, mapClaudePermissionMode } from "../orchestrator/policy.js";
+import { allowedClaudeTools, classifyClaudeTool, isClaudeEditTool, mapClaudePermissionMode } from "../orchestrator/policy.js";
 import { BaseRuntimeAdapter, type RuntimeDependencies } from "./base.js";
 import type { ResumeRuntimeTaskInput, RunTurnInput, RuntimeAdapter, RuntimeTaskHandle, StartRuntimeTaskInput } from "./adapter.js";
 import { normalizeClaudeMessage } from "./normalize/claude.js";
 
 export interface ClaudeRuntimeDependencies extends RuntimeDependencies {
   createMcpHandlers?: ((taskId: string) => ConstructorParameters<typeof AutoPmMcpService>[0]) | undefined;
+  requestApproval?: ((input: {
+    taskId: string;
+    kind: NonNullable<ReturnType<typeof classifyClaudeTool>>;
+    reason: string;
+    payload: Record<string, unknown>;
+  }) => Promise<{ approvalId: string; status: "pending" }>) | undefined;
 }
 
 export class ClaudeRuntimeAdapter extends BaseRuntimeAdapter implements RuntimeAdapter {
   readonly runtime = "claude" as const;
   private readonly sessions = new Map<string, Query>();
+  private readonly resumeIds = new Map<string, string>();
   private readonly createMcpHandlers?: ClaudeRuntimeDependencies["createMcpHandlers"];
+  private readonly requestApproval?: ClaudeRuntimeDependencies["requestApproval"];
 
   constructor(deps: ClaudeRuntimeDependencies) {
     super(deps);
     this.createMcpHandlers = deps.createMcpHandlers;
+    this.requestApproval = deps.requestApproval;
   }
 
   async startTask(input: StartRuntimeTaskInput): Promise<RuntimeTaskHandle> {
@@ -43,6 +52,10 @@ export class ClaudeRuntimeAdapter extends BaseRuntimeAdapter implements RuntimeA
       env: await this.resolveSecretEnv(account),
       permissionMode: mapClaudePermissionMode(policy),
     };
+    const resume = this.resumeIds.get(input.taskId);
+    if (resume) {
+      options.resume = resume;
+    }
 
     if (this.createMcpHandlers) {
       options.mcpServers = {
@@ -54,7 +67,7 @@ export class ClaudeRuntimeAdapter extends BaseRuntimeAdapter implements RuntimeA
     if (allowedTools) {
       options.allowedTools = allowedTools;
     } else {
-      options.canUseTool = createApprovalCallback(policy);
+      options.canUseTool = createApprovalCallback(input.taskId, policy, this.requestApproval);
     }
 
     const session = query({
@@ -75,6 +88,7 @@ export class ClaudeRuntimeAdapter extends BaseRuntimeAdapter implements RuntimeA
   }
 
   async resumeTask(input: ResumeRuntimeTaskInput): Promise<RuntimeTaskHandle> {
+    this.resumeIds.set(input.taskId, input.backendThreadId);
     return {
       taskId: input.taskId,
       backendThreadId: input.backendThreadId,
@@ -91,12 +105,26 @@ export class ClaudeRuntimeAdapter extends BaseRuntimeAdapter implements RuntimeA
 
   async closeTask(taskId: string): Promise<void> {
     this.sessions.delete(taskId);
+    this.resumeIds.delete(taskId);
   }
 }
 
-function createApprovalCallback(policy: ReturnType<BaseRuntimeAdapter["getPolicy"]>): CanUseTool {
+function createApprovalCallback(
+  taskId: string,
+  policy: ReturnType<BaseRuntimeAdapter["getPolicy"]>,
+  requestApproval: ClaudeRuntimeDependencies["requestApproval"],
+): CanUseTool {
   return async (toolName, input) => {
     if (!shouldAutoApproveTool(policy, toolName)) {
+      const kind = classifyClaudeTool(toolName) ?? "workspace_write";
+      if (requestApproval) {
+        await requestApproval({
+          taskId,
+          kind,
+          reason: `Claude requested tool: ${toolName}`,
+          payload: { toolName, input },
+        });
+      }
       return {
         behavior: "deny",
         message: `Tool requires orchestrator approval: ${toolName}`,
@@ -120,7 +148,7 @@ function shouldAutoApproveTool(policy: ReturnType<BaseRuntimeAdapter["getPolicy"
     return true;
   }
 
-  if (policy.permissionMode === "edit" && toolName === "Edit") {
+  if (policy.permissionMode === "edit" && isClaudeEditTool(toolName)) {
     return true;
   }
 
