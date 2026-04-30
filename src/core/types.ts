@@ -12,13 +12,49 @@ export type VendorKind =
 export type PermissionMode = "read-only" | "edit" | "full";
 export type SandboxMode = "read-only" | "workspace-write" | "danger-full-access";
 export type ApprovalKind =
-  | "tool"
+  | "shell"
+  | "file_edit"
   | "network"
-  | "filesystem"
-  | "delegation"
+  | "workspace_write"
+  | "cross_harness_delegation"
+  | "profile_switch"
   | "workspace_merge"
   | "budget_increase"
-  | "reference_access";
+  | "sandbox_escape"
+  | "clarification";
+
+/**
+ * Four interaction classes. The orchestrator routes these through different UX surfaces:
+ *
+ *   tool_approval        - per-call tool gate (e.g. Claude canUseTool denying Bash)
+ *   privilege_escalation - tightening or loosening a long-lived capability (sandbox, network)
+ *   clarification        - non-privileged ask-user question; should not collide with danger gates
+ *   capability_request   - structural changes (delegation target, budget, profile switch)
+ */
+export type ApprovalCategory =
+  | "tool_approval"
+  | "privilege_escalation"
+  | "clarification"
+  | "capability_request";
+
+export function categorizeApproval(kind: ApprovalKind): ApprovalCategory {
+  switch (kind) {
+    case "shell":
+    case "file_edit":
+    case "network":
+      return "tool_approval";
+    case "workspace_write":
+    case "sandbox_escape":
+      return "privilege_escalation";
+    case "clarification":
+      return "clarification";
+    case "cross_harness_delegation":
+    case "profile_switch":
+    case "workspace_merge":
+    case "budget_increase":
+      return "capability_request";
+  }
+}
 
 export interface Account {
   id: string;
@@ -82,6 +118,8 @@ export interface Workspace {
   path: string;
   repoRoot?: string | undefined;
   branch?: string | undefined;
+  head?: string | undefined;
+  dirty?: boolean | undefined;
   baseRef?: string | undefined;
   parentWorkspaceId?: string | undefined;
   status: "active" | "merged" | "discarded";
@@ -135,9 +173,45 @@ export interface TaskReference {
   turnNumber?: number | undefined;
 }
 
+export interface ArtifactRef {
+  id: string;
+  kind: "file" | "blob" | "url";
+  ref: string;
+  description?: string | undefined;
+}
+
+export interface DelegateToRequest {
+  targetProfileId?: string | undefined;
+  targetRuntime?: RuntimeKind | undefined;
+  taskType: "ask" | "review" | "edit" | "fix" | "test";
+  prompt: string;
+  reason: string;
+  requestedPermissionMode?: PermissionMode | undefined;
+  workspaceMode?: "share" | "new-worktree" | undefined;
+  timeoutMs?: number | undefined;
+  references?: TaskReference[] | undefined;
+}
+
+export interface DelegateToResult {
+  status:
+    | "completed"
+    | "started"
+    | "awaiting_approval"
+    | "denied"
+    | "max_depth"
+    | "cycle_detected"
+    | "failed";
+  childTaskId?: string | undefined;
+  approvalId?: string | undefined;
+  finalResponse?: string | undefined;
+  artifactRefs?: ArtifactRef[] | undefined;
+  message: string;
+}
+
 export type AgentEvent =
   | { type: "task.queued"; taskId: string; ts: string }
   | { type: "task.started"; taskId: string; runtime: RuntimeKind; profileId: string; ts: string }
+  | { type: "task.backend_thread"; taskId: string; backendThreadId: string; ts: string }
   | { type: "turn.started"; taskId: string; turnId: string; ts: string }
   | { type: "turn.completed"; taskId: string; turnId: string; usage?: TurnUsage | undefined; ts: string }
   | { type: "message.delta"; taskId: string; turnId?: string; text: string; ts: string }
@@ -154,6 +228,7 @@ export type AgentEvent =
   | { type: "budget.warning"; taskId: string; message: string; ts: string }
   | { type: "budget.exceeded"; taskId: string; message: string; ts: string }
   | { type: "task.completed"; taskId: string; summary: string; ts: string }
+  | { type: "task.interrupted"; taskId: string; error: string; ts: string }
   | { type: "task.failed"; taskId: string; error: string; ts: string }
   | { type: "task.cancelled"; taskId: string; ts: string };
 
@@ -177,5 +252,15 @@ export interface AppConfig {
   workspace: {
     rootDir: string;
     topLevelUseWorktree: boolean;
+  };
+  scheduler: {
+    maxConcurrentTasksGlobal: number;
+    maxConcurrentTasksPerAccount: number;
+  };
+  rateLimit: {
+    enabled: boolean;
+    requestsPerMinute?: number | undefined;
+    requestsPerHour?: number | undefined;
+    tokensPerMinute?: number | undefined;
   };
 }

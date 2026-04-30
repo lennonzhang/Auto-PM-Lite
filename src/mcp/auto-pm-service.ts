@@ -19,15 +19,32 @@ const delegateInputSchema = z.object({
   requestedPermissionMode: z.enum(["read-only", "edit", "full"]).optional(),
   workspaceMode: z.enum(["share", "new-worktree"]).optional(),
   timeoutMs: z.number().int().positive().optional(),
+  references: z.array(z.object({
+    taskId: z.string().min(1),
+    turnId: z.string().optional(),
+    turnNumber: z.number().int().positive().optional(),
+  })).optional(),
 });
 
 const capabilityInputSchema = z.object({
-  kind: z.enum(["filesystem", "network", "delegation", "workspace_merge", "reference_access"]),
+  kind: z.enum([
+    "shell",
+    "file_edit",
+    "network",
+    "workspace_write",
+    "cross_harness_delegation",
+    "profile_switch",
+    "budget_increase",
+    "sandbox_escape",
+    "workspace_merge",
+    "clarification",
+  ]),
   reason: z.string().min(1),
 });
 
 const taskResultInputSchema = z.object({
   taskId: z.string().min(1),
+  timeoutMs: z.number().int().positive().optional(),
 });
 
 const artifactInputSchema = z.object({

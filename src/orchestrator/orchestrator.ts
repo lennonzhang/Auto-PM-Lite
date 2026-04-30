@@ -1,14 +1,22 @@
 import { randomUUID } from "node:crypto";
 import fs from "node:fs";
-import type { AppConfig, AgentEvent, ApprovalKind, BudgetSnapshot, PermissionMode, Policy, Task, Workspace } from "../core/types.js";
+import type { AppConfig, AgentEvent, ApprovalKind, ArtifactRef, BudgetSnapshot, DelegateToResult, PermissionMode, Policy, Task, TaskReference, TurnUsage, Workspace } from "../core/types.js";
 import type { AutoPmMcpHandlers, McpToolResult } from "../mcp/auto-pm-service.js";
 import { redactText } from "../core/redaction.js";
+import { canAccessReference, policyTrustLevel } from "../core/reference.js";
+import { buildRawTranscriptCipher } from "../core/transcript.js";
 import { AppDatabase, type StoredArtifact } from "../storage/db.js";
 import { EventStore } from "../storage/event-store.js";
 import type { RuntimeAdapter } from "../runtime/adapter.js";
+import { shouldRequireApproval } from "./policy.js";
 import { assertReadOnlyDelegation, canAccessTaskLineage, exceedsDelegationDepth, resolveDelegationTargetProfile, type DelegateTaskInput as DelegateTaskRequest, wouldCreateDelegationCycle } from "./delegation.js";
 import { buildDelegationChain, nextDelegationDepth } from "./task-tree.js";
 import { WorkspaceManager } from "./workspace.js";
+import { checkBudget, updateBudget } from "./budget.js";
+import { DefaultTaskScheduler } from "./scheduler.js";
+import { NoOpRateLimiter, TokenBucketRateLimiter, type RateLimiter } from "./rate-limit.js";
+import { InMemoryEventStream } from "./event-stream.js";
+import { expirePendingApprovals } from "./approval.js";
 
 export interface CreateTaskInput {
   profileId: string;
@@ -32,7 +40,7 @@ export interface DelegateTaskInput extends DelegateTaskRequest {
 
 export interface CapabilityRequestInput {
   taskId: string;
-  kind: Extract<ApprovalKind, "filesystem" | "network" | "delegation" | "workspace_merge" | "reference_access">;
+  kind: ApprovalKind;
   reason: string;
 }
 
@@ -47,9 +55,20 @@ export interface TaskResultSnapshot {
   pendingApprovalIds: string[];
 }
 
+type ApprovalContinuation =
+  | { kind: "resolve_only" }
+  | { kind: "requeue" }
+  | { kind: "auto_resume"; prompt?: string | undefined };
+
 export class Orchestrator {
   private readonly workspaceManager: WorkspaceManager;
   private readonly eventStore: EventStore;
+  private readonly activeRuns = new Map<string, Promise<void>>();
+  private readonly scheduler: DefaultTaskScheduler;
+  private readonly rateLimiter: RateLimiter;
+  private readonly eventStream: InMemoryEventStream;
+  private readonly pendingContinuations = new Set<Promise<void>>();
+  private closed = false;
 
   constructor(
     private readonly config: AppConfig,
@@ -62,6 +81,14 @@ export class Orchestrator {
       maxQueueSize: config.storage.maxQueueSize,
       redaction: { additionalPatterns: config.redaction.additionalPatterns },
     });
+    this.scheduler = new DefaultTaskScheduler({
+      maxConcurrentTasksGlobal: config.scheduler.maxConcurrentTasksGlobal,
+      maxConcurrentTasksPerAccount: config.scheduler.maxConcurrentTasksPerAccount,
+    });
+    this.rateLimiter = config.rateLimit.enabled
+      ? new TokenBucketRateLimiter(config.rateLimit)
+      : new NoOpRateLimiter();
+    this.eventStream = new InMemoryEventStream();
   }
 
   syncConfig(): void {
@@ -77,9 +104,16 @@ export class Orchestrator {
     const policy = this.requirePolicy(profile.policyId);
     const now = new Date().toISOString();
     const taskId = randomUUID();
+    const workspacePlan = this.workspaceManager.resolveWorkspacePlan({
+      taskKind: "top-level",
+      cwd: input.cwd,
+      policyUnsafeDirectCwd: policy.unsafeDirectCwd,
+    });
     const workspace = this.workspaceManager.createTopLevelWorkspace({
       taskId,
       cwd: input.cwd,
+      plan: workspacePlan,
+      createdAt: now,
     });
 
     const task: Task = {
@@ -99,7 +133,7 @@ export class Orchestrator {
     };
 
     this.db.createTaskRecord({ task, workspace });
-    await this.eventStore.append({ type: "task.queued", taskId: task.id, ts: now });
+    await this.emitEvent({ type: "task.queued", taskId: task.id, ts: now });
     return task;
   }
 
@@ -116,7 +150,16 @@ export class Orchestrator {
   }
 
   listApprovals(taskId?: string): ReturnType<AppDatabase["listApprovals"]> {
-    return this.db.listApprovals(taskId);
+    const approvals = this.db.listApprovals(taskId);
+    const now = new Date().toISOString();
+    const expiredIds = expirePendingApprovals(approvals, now);
+
+    if (expiredIds.length > 0) {
+      this.db.expireApprovals(expiredIds, now);
+      return this.db.listApprovals(taskId);
+    }
+
+    return approvals;
   }
 
   listArtifacts(taskId: string): ReturnType<AppDatabase["listArtifacts"]> {
@@ -125,7 +168,7 @@ export class Orchestrator {
 
   createApproval(input: {
     taskId: string;
-    kind: "tool" | "network" | "filesystem" | "delegation" | "workspace_merge" | "budget_increase" | "reference_access";
+    kind: ApprovalKind;
     payload: Record<string, unknown>;
     expiresAt?: string | undefined;
   }): string {
@@ -135,7 +178,7 @@ export class Orchestrator {
       id: approvalId,
       taskId: input.taskId,
       kind: input.kind,
-      payload: input.payload,
+      payload: JSON.parse(redactText(JSON.stringify(input.payload), { additionalPatterns: this.config.redaction.additionalPatterns })) as Record<string, unknown>,
       status: "pending",
       requestedAt: now,
       expiresAt: input.expiresAt,
@@ -143,23 +186,83 @@ export class Orchestrator {
     return approvalId;
   }
 
-  resolveApproval(input: { approvalId: string; approved: boolean; reason?: string | undefined }): void {
+  async resolveApproval(input: { approvalId: string; approved: boolean; reason?: string | undefined }): Promise<void> {
+    const approvalRecords = this.db.listApprovals();
+    const approval = approvalRecords.find((entry) => entry.id === input.approvalId);
+    const resolvedAt = new Date().toISOString();
     this.db.resolveApproval({
       approvalId: input.approvalId,
       status: input.approved ? "approved" : "denied",
-      resolvedAt: new Date().toISOString(),
+      resolvedAt,
       resolutionReason: input.reason,
     });
+
+    if (!approval) {
+      return;
+    }
+
+    const task = this.db.getTask(approval.taskId);
+    const resolvedEvent: AgentEvent = {
+      type: "approval.resolved",
+      taskId: approval.taskId,
+      approvalId: input.approvalId,
+      approved: input.approved,
+      ts: resolvedAt,
+    };
+
+    await this.emitEvent(resolvedEvent);
+
+    if (!input.approved || !task) {
+      return;
+    }
+
+    const latestTurn = this.db.getLatestTurn(task.id);
+    const remainingPendingApprovals = this.db.listPendingApprovals(task.id).length;
+    const continuation = this.decideApprovalContinuation({
+      approval,
+      task,
+      latestTurn,
+      remainingPendingApprovals,
+    });
+
+    if (approval.kind === "budget_increase") {
+      this.db.updateTaskBudget(task.id, {
+        ...task.budget,
+        inputTokens: 0,
+        outputTokens: 0,
+        estimatedCostUsd: 0,
+      });
+    }
+
+    if (continuation.kind === "resolve_only") {
+      return;
+    }
+
+    this.db.updateTaskRuntimeState({
+      taskId: task.id,
+      status: "queued",
+      backendThreadId: task.backendThreadId,
+      updatedAt: resolvedAt,
+    });
+
+    if (continuation.kind === "auto_resume") {
+      const pending = this.continueTaskAfterApproval(task.id, continuation.prompt)
+        .catch(() => {})
+        .finally(() => {
+          this.pendingContinuations.delete(pending);
+        });
+      this.pendingContinuations.add(pending);
+    }
   }
 
   async requestCapability(input: CapabilityRequestInput): Promise<{ approvalId: string; status: "pending" }> {
-    this.requireTask(input.taskId);
+    const task = this.requireTask(input.taskId);
     const approvalId = this.createApproval({
       taskId: input.taskId,
       kind: input.kind,
       payload: { reason: input.reason },
     });
-    await this.eventStore.append({
+    await this.emitAndProjectEvent(task, {
       type: "approval.requested",
       taskId: input.taskId,
       approvalId,
@@ -183,39 +286,98 @@ export class Orchestrator {
     return artifact;
   }
 
-  async delegateTask(input: DelegateTaskInput): Promise<{ childTaskId: string; result: TaskResultSnapshot }> {
+  async delegateTask(input: DelegateTaskInput): Promise<DelegateToResult> {
     const parentTask = this.requireTask(input.parentTaskId);
     const parentProfile = this.requireProfile(parentTask.profileId);
     const parentPolicy = this.requirePolicy(parentProfile.policyId);
 
     if (!parentPolicy.allowCrossHarnessDelegation) {
-      throw new Error("cross_harness_delegation_disabled");
+      return { status: "denied", message: "cross_harness_delegation_disabled" };
     }
 
-    assertReadOnlyDelegation(input);
+    try {
+      assertReadOnlyDelegation(input);
+    } catch (error) {
+      return { status: "denied", message: error instanceof Error ? error.message : String(error) };
+    }
 
-    const targetProfile = resolveDelegationTargetProfile(this.config, parentTask, input);
+    let targetProfile;
+    try {
+      targetProfile = resolveDelegationTargetProfile(this.config, parentTask, input);
+    } catch (error) {
+      return { status: "failed", message: error instanceof Error ? error.message : String(error) };
+    }
     if (targetProfile.runtime === parentTask.runtime) {
-      throw new Error("cross_harness_delegation_required");
+      return { status: "denied", message: "cross_harness_delegation_required" };
     }
 
     const targetPolicy = this.requirePolicy(targetProfile.policyId);
     const nextDepth = nextDelegationDepth(parentTask.delegationDepth);
     if (exceedsDelegationDepth(parentTask.delegationDepth, parentPolicy.maxDepth) || exceedsDelegationDepth(parentTask.delegationDepth, targetPolicy.maxDepth)) {
-      throw new Error("max_depth");
+      return { status: "max_depth", message: "max_depth" };
     }
     if (targetPolicy.permissionMode !== "read-only" || targetPolicy.sandboxMode !== "read-only" || targetPolicy.networkAllowed) {
-      throw new Error("target_profile_not_readonly");
+      return { status: "denied", message: "target_profile_not_readonly" };
     }
 
     const lineage = this.getTaskLineage(parentTask);
     if (wouldCreateDelegationCycle(lineage, targetProfile)) {
-      throw new Error("cycle_detected");
+      return { status: "cycle_detected", message: "cycle_detected" };
+    }
+
+    if (input.references && input.references.length > 0) {
+      const denied = this.evaluateReferenceAccess({
+        requesterTask: parentTask,
+        requesterPolicy: parentPolicy,
+        targetPolicy,
+        references: input.references,
+      });
+      if (denied) {
+        return { status: "denied", message: denied };
+      }
+    }
+
+    if (shouldRequireApproval(parentPolicy, "cross_harness_delegation")) {
+      const approvalId = this.createApproval({
+        taskId: parentTask.id,
+        kind: "cross_harness_delegation",
+        payload: {
+          targetProfileId: targetProfile.id,
+          targetRuntime: targetProfile.runtime,
+          taskType: input.taskType,
+          reason: input.reason,
+        },
+      });
+      const now = new Date().toISOString();
+      await this.emitAndProjectEvent(parentTask, {
+        type: "approval.requested",
+        taskId: parentTask.id,
+        approvalId,
+        kind: "cross_harness_delegation",
+        ts: now,
+      });
+      return {
+        status: "awaiting_approval",
+        approvalId,
+        message: "cross_harness_delegation_awaiting_approval",
+      };
     }
 
     const now = new Date().toISOString();
     const childTaskId = randomUUID();
-    const workspace = this.createSharedChildWorkspace(childTaskId, parentTask, now);
+    const childWorkspacePlan = this.workspaceManager.resolveWorkspacePlan({
+      taskKind: "child",
+      cwd: parentTask.cwd,
+      parentWorkspace: this.requireWorkspace(parentTask.workspaceId),
+      requestedWorkspaceMode: input.workspaceMode,
+    });
+    const workspace = this.workspaceManager.createChildWorkspace({
+      taskId: childTaskId,
+      cwd: parentTask.cwd,
+      parentWorkspace: this.requireWorkspace(parentTask.workspaceId),
+      plan: childWorkspacePlan,
+      createdAt: now,
+    });
     const childTask: Task = {
       id: childTaskId,
       name: `${input.taskType}:${targetProfile.runtime}`,
@@ -234,26 +396,63 @@ export class Orchestrator {
     };
 
     this.db.createTaskRecord({ task: childTask, workspace });
-    await this.eventStore.append({ type: "delegation.requested", taskId: parentTask.id, request: { ...input, targetProfileId: targetProfile.id }, ts: now });
-    await this.eventStore.append({ type: "task.queued", taskId: childTask.id, ts: now });
-    await this.eventStore.append({ type: "delegation.started", taskId: parentTask.id, childTaskId: childTask.id, ts: now });
+    await this.emitEvent({ type: "delegation.requested", taskId: parentTask.id, request: { ...input, targetProfileId: targetProfile.id }, ts: now });
+    await this.emitEvent({ type: "task.queued", taskId: childTask.id, ts: now });
+    await this.emitEvent({ type: "delegation.started", taskId: parentTask.id, childTaskId: childTask.id, ts: now });
 
-    await this.runTask({
-      taskId: childTask.id,
-      prompt: input.prompt,
-    });
+    const run = this.runDelegatedChild(parentTask.id, childTask.id, input.prompt);
+    this.activeRuns.set(childTask.id, run);
 
-    const completedAt = new Date().toISOString();
-    await this.eventStore.append({ type: "delegation.completed", taskId: parentTask.id, childTaskId: childTask.id, ts: completedAt });
+    const timeoutMs = input.timeoutMs ?? 45_000;
+    const completed = await waitForCompletion(run, timeoutMs);
+    if (!completed) {
+      return {
+        status: "started",
+        childTaskId: childTask.id,
+        message: "delegation_started",
+      };
+    }
+
+    const childResult = this.getTaskResult(parentTask.id, childTask.id);
+    if (childResult.status === "failed" || childResult.status === "interrupted") {
+      return {
+        status: "failed",
+        childTaskId: childTask.id,
+        message: childResult.status,
+        finalResponse: childResult.latestMessage,
+        artifactRefs: toArtifactRefs(childResult.artifacts),
+      };
+    }
 
     return {
+      status: childResult.status === "awaiting_approval" ? "awaiting_approval" : "completed",
       childTaskId: childTask.id,
-      result: this.getTaskResult(parentTask.id, childTask.id),
+      finalResponse: childResult.latestMessage,
+      artifactRefs: toArtifactRefs(childResult.artifacts),
+      message: childResult.status,
     };
   }
 
-  waitForTask(requesterTaskId: string, taskId: string): TaskResultSnapshot {
+  async waitForTask(requesterTaskId: string, taskId: string, timeoutMs = 45_000): Promise<TaskResultSnapshot> {
+    const activeRun = this.activeRuns.get(taskId);
+    if (activeRun) {
+      await waitForCompletion(activeRun, timeoutMs);
+    }
     return this.getTaskResult(requesterTaskId, taskId);
+  }
+
+  private async runDelegatedChild(parentTaskId: string, childTaskId: string, prompt: string): Promise<void> {
+    try {
+      await this.runTask({
+        taskId: childTaskId,
+        prompt,
+      });
+    } catch {
+      // runTask already records failure state and event details.
+    } finally {
+      this.activeRuns.delete(childTaskId);
+      await this.emitEvent({ type: "delegation.completed", taskId: parentTaskId, childTaskId, ts: new Date().toISOString() });
+    }
   }
 
   getTaskResult(requesterTaskId: string, taskId: string): TaskResultSnapshot {
@@ -275,7 +474,7 @@ export class Orchestrator {
         const result = await this.requestCapability({ taskId, ...input });
         return this.toMcpToolResult(result);
       },
-      waitForTask: async (input) => this.toMcpToolResult(this.waitForTask(taskId, input.taskId)),
+      waitForTask: async (input) => this.toMcpToolResult(await this.waitForTask(taskId, input.taskId, input.timeoutMs)),
       getTaskResult: async (input) => this.toMcpToolResult(this.getTaskResult(taskId, input.taskId)),
       reportArtifact: async (input) => this.toMcpToolResult(this.reportArtifact({ taskId, ...input })),
     };
@@ -287,10 +486,26 @@ export class Orchestrator {
       throw new Error(`Unknown task: ${input.taskId}`);
     }
 
+    const profile = this.config.profiles[task.profileId];
+    if (!profile) {
+      throw new Error(`Unknown profile: ${task.profileId}`);
+    }
+
     const runtime = this.runtimes[task.runtime];
     if (!runtime) {
       throw new Error(`Runtime adapter not configured for ${task.runtime}`);
     }
+
+    // Check rate limits before starting
+    const rateLimitCheck = await this.rateLimiter.checkLimit(profile.accountId);
+    if (!rateLimitCheck.allowed) {
+      throw new Error(`Rate limit exceeded: ${rateLimitCheck.reason}`);
+    }
+
+    // Block here until a slot frees (per-account + global concurrency limits).
+    // For long waits, callers can observe queue depth via getSchedulerSnapshot().
+    await this.scheduler.acquire(task.id, profile.accountId);
+    this.rateLimiter.recordRequest(profile.accountId);
 
     const startedAt = new Date().toISOString();
     const handle = await runtime.startTask({
@@ -305,7 +520,7 @@ export class Orchestrator {
       backendThreadId: handle.backendThreadId,
       updatedAt: startedAt,
     });
-    await this.eventStore.append({
+    await this.emitEvent({
       type: "task.started",
       taskId: task.id,
       runtime: task.runtime,
@@ -326,6 +541,7 @@ export class Orchestrator {
       await this.failTask(task.id, handle.backendThreadId, error, true);
       throw error;
     } finally {
+      this.scheduler.recordComplete(task.id);
       await runtime.closeTask(task.id);
     }
   }
@@ -370,7 +586,7 @@ export class Orchestrator {
       backendThreadId: handle.backendThreadId,
       updatedAt: resumedAt,
     });
-    await this.eventStore.append({
+    await this.emitEvent({
       type: "task.started",
       taskId: task.id,
       runtime: task.runtime,
@@ -420,12 +636,53 @@ export class Orchestrator {
       updatedAt: now,
       completedAt: now,
     });
-    await this.eventStore.append({ type: "task.cancelled", taskId: task.id, ts: now });
+    await this.emitEvent({ type: "task.cancelled", taskId: task.id, ts: now });
   }
 
   async close(): Promise<void> {
+    this.closed = true;
+    await Promise.allSettled(Array.from(this.pendingContinuations));
     await this.eventStore.close();
+    this.eventStream.close();
     this.db.close();
+  }
+
+  subscribeToEvents(listener: (event: AgentEvent) => void): () => void {
+    return this.eventStream.subscribe(listener);
+  }
+
+  /**
+   * Replays persisted events from SQLite, then attaches a live subscription. The cursor is
+   * advanced as we drain history so a parallel writer cannot duplicate or skip events between
+   * the historical pull and the live attach.
+   */
+  async replayAndSubscribe(input: {
+    taskId?: string | undefined;
+    sinceId?: number | undefined;
+    listener: (event: AgentEvent) => void;
+  }): Promise<{ unsubscribe: () => void; lastReplayedId: number }> {
+    await this.eventStore.flush();
+    let cursor = input.sinceId ?? 0;
+
+    while (true) {
+      const batch = this.db.listEvents({ taskId: input.taskId, afterId: cursor, limit: 500 });
+      if (batch.length === 0) {
+        break;
+      }
+      for (const row of batch) {
+        input.listener(row.payload as AgentEvent);
+        cursor = row.id;
+      }
+    }
+
+    const unsubscribe = this.eventStream.subscribe((event) => {
+      if (input.taskId && event.taskId !== input.taskId) {
+        return;
+      }
+      input.listener(event);
+    });
+
+    return { unsubscribe, lastReplayedId: cursor };
   }
 
   private requirePolicy(policyId: string): Policy {
@@ -453,6 +710,14 @@ export class Orchestrator {
     return task;
   }
 
+  private requireWorkspace(workspaceId: string): Workspace {
+    const workspace = this.db.getWorkspace(workspaceId);
+    if (!workspace) {
+      throw new Error(`Unknown workspace: ${workspaceId}`);
+    }
+    return workspace;
+  }
+
   private getTaskLineage(task: Task): Task[] {
     const lineage: Task[] = [task];
     let current = task.parentTaskId ? this.db.getTask(task.parentTaskId) : null;
@@ -463,15 +728,51 @@ export class Orchestrator {
     return lineage;
   }
 
-  private createSharedChildWorkspace(taskId: string, parentTask: Task, createdAt: string): Workspace {
-    return {
-      id: `ws_${taskId}`,
-      path: parentTask.cwd,
-      parentWorkspaceId: parentTask.workspaceId,
-      status: "active",
-      unsafeDirectCwd: false,
-      createdAt,
-    };
+  private evaluateReferenceAccess(input: {
+    requesterTask: Task;
+    requesterPolicy: Policy;
+    targetPolicy: Policy;
+    references: TaskReference[];
+  }): string | null {
+    const requesterLineage = this.getTaskLineage(input.requesterTask).map((task) => task.id);
+    const requesterTrust = policyTrustLevel(input.requesterPolicy);
+
+    for (const reference of input.references) {
+      const targetTask = this.db.getTask(reference.taskId);
+      if (!targetTask) {
+        return `reference_unknown:${reference.taskId}`;
+      }
+
+      const targetProfile = this.config.profiles[targetTask.profileId];
+      const targetTrust = targetProfile
+        ? policyTrustLevel(this.requirePolicy(targetProfile.policyId))
+        : policyTrustLevel(input.targetPolicy);
+
+      const allowed = canAccessReference({
+        requesterTaskId: input.requesterTask.id,
+        requesterLineage,
+        targetTaskId: targetTask.id,
+        sameWorkspace: targetTask.workspaceId === input.requesterTask.workspaceId,
+        requesterTrustLevel: requesterTrust,
+        targetTrustLevel: targetTrust,
+        explicitApproval: false,
+      });
+
+      if (!allowed) {
+        return `reference_denied:${reference.taskId}`;
+      }
+
+      // Audit every successful expansion so reviewers can reconstruct what a child saw.
+      void this.emitEvent({
+        type: "reference.expanded",
+        taskId: input.requesterTask.id,
+        sourceTaskId: targetTask.id,
+        requestedByTaskId: input.requesterTask.id,
+        ts: new Date().toISOString(),
+      });
+    }
+
+    return null;
   }
 
   private buildTaskResult(task: Task): TaskResultSnapshot {
@@ -501,12 +802,18 @@ export class Orchestrator {
   private async beginTurn(taskId: string, prompt: string, startedAt: string): Promise<string> {
     const turnId = randomUUID();
     const promptRedacted = redactText(prompt, { additionalPatterns: this.config.redaction.additionalPatterns });
+    const rawCipher = buildRawTranscriptCipher({
+      prompt,
+      config: this.config.transcript,
+      now: new Date(startedAt),
+    });
     this.db.createTurn({
       id: turnId,
       taskId,
       promptRedacted,
       status: "running",
       startedAt,
+      ...(rawCipher ? { promptRawEncrypted: rawCipher.encrypted, promptRawTtlAt: rawCipher.ttlAt } : {}),
     });
     return turnId;
   }
@@ -518,8 +825,12 @@ export class Orchestrator {
     turnId: string,
     backendThreadId?: string | undefined,
   ): Promise<void> {
+    const profile = this.requireProfile(task.profileId);
+    const policy = this.requirePolicy(profile.policyId);
+
     for await (const event of runtime.runTurn(input)) {
-      await this.recordEvent(task, event);
+      await this.emitAndProjectEvent(task, event);
+
       if (event.type === "turn.completed") {
         this.db.updateTurn({
           turnId,
@@ -527,8 +838,56 @@ export class Orchestrator {
           usage: event.usage,
           completedAt: event.ts,
         });
+
+        if (event.usage && policy) {
+          const updatedTask = this.db.getTask(task.id);
+          if (updatedTask) {
+            this.rateLimiter.recordUsage(profile.accountId, usageToRateLimitTokens(event.usage));
+            const newBudget = updateBudget(updatedTask.budget, event.usage);
+            const budgetCheck = checkBudget(newBudget, policy);
+
+            this.db.updateTaskBudget(task.id, newBudget);
+
+            if (budgetCheck.warning) {
+              await this.emitAndProjectEvent(task, {
+                type: "budget.warning",
+                taskId: task.id,
+                message: budgetCheck.warning,
+                ts: new Date().toISOString(),
+              });
+            }
+
+            if (!budgetCheck.allowed) {
+              const exceededAt = new Date().toISOString();
+              const approvalId = this.createApproval({
+                taskId: task.id,
+                kind: "budget_increase",
+                payload: {
+                  reason: budgetCheck.reason ?? "Budget exceeded",
+                  budget: newBudget,
+                },
+              });
+              await this.emitAndProjectEvent(task, {
+                type: "budget.exceeded",
+                taskId: task.id,
+                message: budgetCheck.reason ?? "Budget exceeded",
+                ts: exceededAt,
+              });
+              // recordEvent flips task status to awaiting_approval when type is
+              // approval.requested, so we don't need a separate updateTaskRuntimeState.
+              await this.emitAndProjectEvent(task, {
+                type: "approval.requested",
+                taskId: task.id,
+                approvalId,
+                kind: "budget_increase",
+                ts: exceededAt,
+              });
+            }
+          }
+        }
       }
-      if (event.type === "task.failed") {
+
+      if (event.type === "task.interrupted" || event.type === "task.failed") {
         this.db.updateTurn({
           turnId,
           status: "failed",
@@ -547,19 +906,22 @@ export class Orchestrator {
       });
     }
 
-    this.db.updateTaskRuntimeState({
-      taskId: task.id,
-      status: "completed",
-      backendThreadId,
-      updatedAt: completedAt,
-      completedAt,
-    });
-    await this.eventStore.append({
-      type: "task.completed",
-      taskId: task.id,
-      summary: "Run completed",
-      ts: completedAt,
-    });
+    const currentTask = this.db.getTask(task.id);
+    if (currentTask?.status !== "awaiting_approval") {
+      this.db.updateTaskRuntimeState({
+        taskId: task.id,
+        status: "completed",
+        backendThreadId,
+        updatedAt: completedAt,
+        completedAt,
+      });
+      await this.emitEvent({
+        type: "task.completed",
+        taskId: task.id,
+        summary: "Run completed",
+        ts: completedAt,
+      });
+    }
   }
 
   private async failTask(
@@ -570,26 +932,86 @@ export class Orchestrator {
   ): Promise<void> {
     const failedAt = new Date().toISOString();
     const message = error instanceof Error ? error.message : String(error);
-    this.db.updateTaskRuntimeState({
-      taskId,
-      status: markInterrupted ? "interrupted" : "failed",
-      backendThreadId,
-      updatedAt: failedAt,
-      ...(markInterrupted ? {} : { completedAt: failedAt }),
-    });
-    await this.eventStore.append({
-      type: "task.failed",
-      taskId,
-      error: message,
-      ts: failedAt,
-    });
+    const task = this.db.getTask(taskId);
+    if (!task) {
+      return;
+    }
+    const event: AgentEvent = markInterrupted
+      ? {
+          type: "task.interrupted",
+          taskId,
+          error: message,
+          ts: failedAt,
+        }
+      : {
+          type: "task.failed",
+          taskId,
+          error: message,
+          ts: failedAt,
+        };
+    await this.emitAndProjectEvent(task, event);
+  }
+
+  private async continueTaskAfterApproval(taskId: string, prompt?: string | undefined): Promise<void> {
+    if (this.closed) {
+      return;
+    }
+    const task = this.db.getTask(taskId);
+    if (!task) {
+      return;
+    }
+    if (this.db.listPendingApprovals(task.id).length > 0) {
+      return;
+    }
+
+    const latestTurn = this.db.getLatestTurn(task.id);
+    if (this.canResumeTask(task, latestTurn)) {
+      await this.resumeTask({ taskId: task.id, prompt });
+      return;
+    }
+
+    if (this.closed) {
+      return;
+    }
+    if (task.status === "queued") {
+      const turnPrompt = prompt ?? latestTurn?.promptRedacted;
+      if (turnPrompt) {
+        await this.runTask({ taskId: task.id, prompt: turnPrompt });
+      }
+    }
+  }
+
+  private decideApprovalContinuation(input: {
+    approval: ReturnType<AppDatabase["listApprovals"]>[number];
+    task: Task;
+    latestTurn: ReturnType<AppDatabase["getLatestTurn"]>;
+    remainingPendingApprovals: number;
+  }): ApprovalContinuation {
+    if (input.remainingPendingApprovals > 0) {
+      return { kind: "resolve_only" };
+    }
+
+    if (input.approval.kind === "cross_harness_delegation") {
+      return { kind: "requeue" };
+    }
+
+    if (input.approval.kind === "budget_increase") {
+      return this.canResumeTask(input.task, input.latestTurn)
+        ? { kind: "auto_resume" }
+        : { kind: "requeue" };
+    }
+
+    return this.canResumeTask(input.task, input.latestTurn)
+      ? { kind: "auto_resume" }
+      : { kind: "requeue" };
   }
 
   private canResumeTask(task: Task, latestTurn: ReturnType<AppDatabase["getLatestTurn"]>): boolean {
     if (!task.backendThreadId) {
       return false;
     }
-    if (task.status !== "interrupted" && task.status !== "reconcile_required") {
+    const resumableStatuses: Task["status"][] = ["interrupted", "reconcile_required", "queued", "awaiting_approval"];
+    if (!resumableStatuses.includes(task.status)) {
       return false;
     }
     if (!fs.existsSync(task.cwd)) {
@@ -601,12 +1023,18 @@ export class Orchestrator {
     if (task.status === "reconcile_required") {
       return latestTurn?.status === "failed" || latestTurn?.status === "completed";
     }
+    if (latestTurn?.status === "running") {
+      return false;
+    }
     return true;
   }
 
-  private async recordEvent(task: Task, event: AgentEvent): Promise<void> {
+  private async emitEvent(event: AgentEvent): Promise<void> {
     await this.eventStore.append(event);
+    this.eventStream.publish(event);
+  }
 
+  private async projectEvent(task: Task, event: AgentEvent): Promise<void> {
     if (event.type === "file.changed") {
       this.db.insertFileChange({
         taskId: task.id,
@@ -618,15 +1046,59 @@ export class Orchestrator {
       return;
     }
 
+    if (event.type === "task.backend_thread") {
+      const current = this.db.getTask(task.id);
+      this.db.updateTaskRuntimeState({
+        taskId: task.id,
+        status: current?.status ?? "running",
+        backendThreadId: event.backendThreadId,
+        updatedAt: event.ts,
+      });
+      return;
+    }
+
+    if (event.type === "task.interrupted") {
+      const current = this.db.getTask(task.id);
+      this.db.updateTaskRuntimeState({
+        taskId: task.id,
+        status: "interrupted",
+        backendThreadId: current?.backendThreadId ?? task.backendThreadId,
+        updatedAt: event.ts,
+      });
+      return;
+    }
+
     if (event.type === "task.failed") {
+      const current = this.db.getTask(task.id);
       this.db.updateTaskRuntimeState({
         taskId: task.id,
         status: "failed",
+        backendThreadId: current?.backendThreadId ?? task.backendThreadId,
         updatedAt: event.ts,
         completedAt: event.ts,
       });
+      return;
+    }
+
+    if (event.type === "approval.requested") {
+      this.db.updateTaskRuntimeState({
+        taskId: task.id,
+        status: "awaiting_approval",
+        backendThreadId: task.backendThreadId,
+        updatedAt: event.ts,
+      });
     }
   }
+
+  private async emitAndProjectEvent(task: Task, event: AgentEvent): Promise<void> {
+    await this.emitEvent(event);
+    await this.projectEvent(task, event);
+  }
+
+}
+
+function usageToRateLimitTokens(usage: TurnUsage): number {
+  return (usage.inputTokens ?? 0) + (usage.outputTokens ?? 0);
 }
 
 function toBudgetSnapshot(policy: Policy): BudgetSnapshot {
@@ -637,4 +1109,33 @@ function toBudgetSnapshot(policy: Policy): BudgetSnapshot {
     outputTokens: 0,
     estimatedCostUsd: 0,
   };
+}
+
+async function waitForCompletion(run: Promise<void>, timeoutMs: number): Promise<boolean> {
+  if (timeoutMs <= 0) {
+    return false;
+  }
+
+  let timer: NodeJS.Timeout | undefined;
+  try {
+    return await Promise.race([
+      run.then(() => true),
+      new Promise<boolean>((resolve) => {
+        timer = setTimeout(() => resolve(false), timeoutMs);
+      }),
+    ]);
+  } finally {
+    if (timer) {
+      clearTimeout(timer);
+    }
+  }
+}
+
+function toArtifactRefs(artifacts: StoredArtifact[]): ArtifactRef[] {
+  return artifacts.map((artifact) => ({
+    id: artifact.id,
+    kind: artifact.kind,
+    ref: artifact.ref,
+    ...(artifact.description ? { description: artifact.description } : {}),
+  }));
 }

@@ -1,4 +1,4 @@
-import type { PermissionMode, Profile, RuntimeKind, Task } from "../core/types.js";
+import type { PermissionMode, Profile, RuntimeKind, Task, TaskReference } from "../core/types.js";
 
 export interface DelegateTaskInput {
   targetProfileId?: string | undefined;
@@ -9,6 +9,7 @@ export interface DelegateTaskInput {
   requestedPermissionMode?: PermissionMode | undefined;
   workspaceMode?: "share" | "new-worktree" | undefined;
   timeoutMs?: number | undefined;
+  references?: TaskReference[] | undefined;
 }
 
 export function resolveDelegationTargetProfile(config: { profiles: Record<string, Profile> }, parentTask: Task, input: DelegateTaskInput): Profile {

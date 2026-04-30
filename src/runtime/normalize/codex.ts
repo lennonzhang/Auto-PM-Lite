@@ -5,8 +5,15 @@ export function normalizeCodexEvent(taskId: string, event: ThreadEvent, turnId: 
   const ts = new Date().toISOString();
 
   switch (event.type) {
+    case "thread.started":
+      return [{ type: "task.backend_thread", taskId, backendThreadId: event.thread_id, ts }];
     case "turn.started":
       return [{ type: "turn.started", taskId, turnId, ts }];
+    case "item.started":
+      if (event.item.type === "mcp_tool_call") {
+        return [{ type: "tool.call", taskId, tool: `${event.item.server}.${event.item.tool}`, input: event.item.arguments, ts }];
+      }
+      return [];
     case "item.completed": {
       const item = event.item;
       switch (item.type) {

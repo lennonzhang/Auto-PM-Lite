@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import Database from "better-sqlite3";
-import type { AppConfig, Task, TaskStatus, TurnRecord, Workspace } from "../core/types.js";
+import type { AppConfig, ApprovalKind, Task, TaskStatus, TurnRecord, Workspace } from "../core/types.js";
 
 export type SqliteDatabase = InstanceType<typeof Database>;
 
@@ -40,7 +40,7 @@ export interface StoredApproval {
   id: string;
   taskId: string;
   parentTaskId?: string | undefined;
-  kind: "tool" | "network" | "filesystem" | "delegation" | "workspace_merge" | "budget_increase" | "reference_access";
+  kind: ApprovalKind;
   payload: Record<string, unknown>;
   status: "pending" | "approved" | "denied" | "expired";
   requestedAt: string;
@@ -156,8 +156,8 @@ export class AppDatabase {
 
   createTaskRecord(input: CreateTaskRecordInput): void {
     const insertWorkspace = this.db.prepare(`
-      INSERT INTO workspaces (id, repo_root, path, branch, base_ref, parent_workspace_id, status, unsafe_direct_cwd, created_at)
-      VALUES (@id, @repo_root, @path, @branch, @base_ref, @parent_workspace_id, @status, @unsafe_direct_cwd, @created_at)
+      INSERT INTO workspaces (id, repo_root, path, branch, head, dirty, base_ref, parent_workspace_id, status, unsafe_direct_cwd, created_at)
+      VALUES (@id, @repo_root, @path, @branch, @head, @dirty, @base_ref, @parent_workspace_id, @status, @unsafe_direct_cwd, @created_at)
     `);
 
     const insertTask = this.db.prepare(`
@@ -171,6 +171,8 @@ export class AppDatabase {
         repo_root: input.workspace.repoRoot ?? null,
         path: input.workspace.path,
         branch: input.workspace.branch ?? null,
+        head: input.workspace.head ?? null,
+        dirty: input.workspace.dirty === undefined ? null : input.workspace.dirty ? 1 : 0,
         base_ref: input.workspace.baseRef ?? null,
         parent_workspace_id: input.workspace.parentWorkspaceId ?? null,
         status: input.workspace.status,
@@ -278,6 +280,19 @@ export class AppDatabase {
       backend_thread_id: input.backendThreadId ?? null,
       updated_at: input.updatedAt,
       completed_at: input.completedAt ?? null,
+    });
+  }
+
+  updateTaskBudget(taskId: string, budget: Task["budget"]): void {
+    this.db.prepare(`
+      UPDATE tasks
+      SET budget_json = @budget_json,
+          updated_at = @updated_at
+      WHERE id = @task_id
+    `).run({
+      task_id: taskId,
+      budget_json: JSON.stringify(budget),
+      updated_at: new Date().toISOString(),
     });
   }
 
@@ -403,6 +418,20 @@ export class AppDatabase {
     });
   }
 
+  expireApprovals(approvalIds: string[], now: string): void {
+    if (approvalIds.length === 0) {
+      return;
+    }
+
+    const placeholders = approvalIds.map(() => "?").join(",");
+    this.db.prepare(`
+      UPDATE approvals
+      SET status = 'expired',
+          resolved_at = ?
+      WHERE id IN (${placeholders}) AND status = 'pending'
+    `).run(now, ...approvalIds);
+  }
+
   listApprovals(taskId?: string): StoredApproval[] {
     const baseQuery = `
       SELECT id, task_id, parent_task_id, kind, payload_json, status, requested_at, resolved_at, resolution_reason, expires_at
@@ -497,6 +526,37 @@ export class AppDatabase {
     return typeof payload.text === "string" ? payload.text : undefined;
   }
 
+  listEvents(input: { taskId?: string | undefined; afterId?: number | undefined; limit?: number | undefined }): Array<{ id: number; taskId: string; turnId: string | null; type: string; payload: Record<string, unknown>; ts: string }> {
+    const filters: string[] = [];
+    const params: Array<string | number> = [];
+    if (input.taskId) {
+      filters.push("task_id = ?");
+      params.push(input.taskId);
+    }
+    if (input.afterId !== undefined) {
+      filters.push("id > ?");
+      params.push(input.afterId);
+    }
+    const where = filters.length > 0 ? `WHERE ${filters.join(" AND ")}` : "";
+    const limit = input.limit && input.limit > 0 ? input.limit : 1000;
+    const rows = this.db.prepare(`
+      SELECT id, task_id, turn_id, type, payload_json, ts
+      FROM events
+      ${where}
+      ORDER BY id ASC
+      LIMIT ${limit}
+    `).all(...params) as Array<Record<string, unknown>>;
+
+    return rows.map((row) => ({
+      id: Number(row.id),
+      taskId: String(row.task_id),
+      turnId: row.turn_id === null ? null : String(row.turn_id),
+      type: String(row.type),
+      payload: JSON.parse(String(row.payload_json)) as Record<string, unknown>,
+      ts: String(row.ts),
+    }));
+  }
+
   insertFileChange(input: {
     taskId: string;
     workspaceId: string;
@@ -514,6 +574,32 @@ export class AppDatabase {
       change_kind: input.changeKind,
       ts: input.ts,
     });
+  }
+
+  getWorkspace(workspaceId: string): Workspace | null {
+    const row = this.db.prepare(`
+      SELECT id, repo_root, path, branch, head, dirty, base_ref, parent_workspace_id, status, unsafe_direct_cwd, created_at
+      FROM workspaces
+      WHERE id = ?
+    `).get(workspaceId) as Record<string, unknown> | undefined;
+
+    if (!row) {
+      return null;
+    }
+
+    return {
+      id: String(row.id),
+      path: String(row.path),
+      ...(row.repo_root === null ? {} : { repoRoot: String(row.repo_root) }),
+      ...(row.branch === null ? {} : { branch: String(row.branch) }),
+      ...(row.head === null ? {} : { head: String(row.head) }),
+      ...(row.dirty === null ? {} : { dirty: Boolean(row.dirty) }),
+      ...(row.base_ref === null ? {} : { baseRef: String(row.base_ref) }),
+      ...(row.parent_workspace_id === null ? {} : { parentWorkspaceId: String(row.parent_workspace_id) }),
+      status: String(row.status) as Workspace["status"],
+      unsafeDirectCwd: Boolean(row.unsafe_direct_cwd),
+      createdAt: String(row.created_at),
+    };
   }
 
   getProfile(profileId: string): { id: string; runtime: string; policyId: string } | null {
@@ -579,6 +665,8 @@ export class AppDatabase {
         repo_root TEXT,
         path TEXT NOT NULL,
         branch TEXT,
+        head TEXT,
+        dirty INTEGER,
         base_ref TEXT,
         parent_workspace_id TEXT REFERENCES workspaces(id),
         status TEXT NOT NULL,
@@ -660,5 +748,14 @@ export class AppDatabase {
         ts TEXT NOT NULL
       );
     `);
+    this.ensureColumn("workspaces", "head", "TEXT");
+    this.ensureColumn("workspaces", "dirty", "INTEGER");
+  }
+
+  private ensureColumn(tableName: string, columnName: string, type: string): void {
+    const columns = this.db.prepare(`PRAGMA table_info(${tableName})`).all() as Array<{ name: string }>;
+    if (!columns.some((column) => column.name === columnName)) {
+      this.db.exec(`ALTER TABLE ${tableName} ADD COLUMN ${columnName} ${type}`);
+    }
   }
 }
