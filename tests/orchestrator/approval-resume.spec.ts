@@ -391,9 +391,13 @@ describe("event replay", () => {
       await orchestrator.runTask({ taskId: task.id, prompt: "go" });
 
       const seenTypes: string[] = [];
+      const durableIds: number[] = [];
       const { unsubscribe } = await orchestrator.replayAndSubscribe({
         taskId: task.id,
-        listener: (event) => {
+        listener: (event, metadata) => {
+          expect(metadata.durable).toBe(true);
+          expect(metadata.id).toEqual(expect.any(Number));
+          durableIds.push(metadata.id!);
           seenTypes.push(event.type);
         },
       });
@@ -407,6 +411,7 @@ describe("event replay", () => {
       expect(completedCount).toBe(1);
       const rows = db.listEvents({ taskId: task.id });
       expect(rows.length).toBe(seenTypes.length);
+      expect(durableIds).toEqual(rows.map((row) => row.id));
     } finally {
       await orchestrator.close();
     }

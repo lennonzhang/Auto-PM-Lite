@@ -122,9 +122,50 @@ export interface Workspace {
   dirty?: boolean | undefined;
   baseRef?: string | undefined;
   parentWorkspaceId?: string | undefined;
-  status: "active" | "merged" | "discarded";
+  status: "active" | "merge_requested" | "merging" | "merged" | "merge_failed" | "discarded";
   unsafeDirectCwd: boolean;
   createdAt: string;
+  mergeRequestedAt?: string | undefined;
+  mergeApprovalId?: string | undefined;
+  mergedAt?: string | undefined;
+  discardedAt?: string | undefined;
+  mergeError?: WorkspaceMergeError | undefined;
+}
+
+export interface WorkspaceMergeError {
+  code: "parent_dirty" | "merge_conflict" | "workspace_not_mergeable" | "git_error";
+  message: string;
+  parentHead?: string | undefined;
+  childHead?: string | undefined;
+  changes?: WorkspaceChange[] | undefined;
+}
+
+export interface WorkspaceChange {
+  path: string;
+  oldPath?: string | undefined;
+  changeKind: "create" | "modify" | "delete" | "rename";
+  binary: boolean;
+}
+
+export interface WorkspaceDiff {
+  taskId: string;
+  workspaceId: string;
+  baseRef: string;
+  head?: string | undefined;
+  changes: WorkspaceChange[];
+  patch: string;
+  truncated: boolean;
+}
+
+export interface WorkspaceMergeResult {
+  taskId: string;
+  workspaceId: string;
+  status: Workspace["status"];
+  parentAdvanced: boolean;
+  parentHead?: string | undefined;
+  childHead?: string | undefined;
+  changes: WorkspaceChange[];
+  error?: WorkspaceMergeError | undefined;
 }
 
 export interface Task {
@@ -205,6 +246,7 @@ export interface DelegateToResult {
   approvalId?: string | undefined;
   finalResponse?: string | undefined;
   artifactRefs?: ArtifactRef[] | undefined;
+  denialCode?: string | undefined;
   message: string;
 }
 
@@ -224,6 +266,11 @@ export type AgentEvent =
   | { type: "delegation.started"; taskId: string; childTaskId: string; ts: string }
   | { type: "delegation.completed"; taskId: string; childTaskId: string; ts: string }
   | { type: "reference.expanded"; taskId: string; sourceTaskId: string; requestedByTaskId: string; ts: string }
+  | { type: "workspace.merge_requested"; taskId: string; workspaceId: string; approvalId: string; ts: string }
+  | { type: "workspace.merge_started"; taskId: string; workspaceId: string; parentAdvanced: boolean; ts: string }
+  | { type: "workspace.merged"; taskId: string; workspaceId: string; parentAdvanced: boolean; ts: string }
+  | { type: "workspace.merge_failed"; taskId: string; workspaceId: string; error: WorkspaceMergeError; ts: string }
+  | { type: "workspace.discarded"; taskId: string; workspaceId: string; ts: string }
   | { type: "file.changed"; taskId: string; path: string; changeKind: "create" | "modify" | "delete"; ts: string }
   | { type: "budget.warning"; taskId: string; message: string; ts: string }
   | { type: "budget.exceeded"; taskId: string; message: string; ts: string }

@@ -121,33 +121,41 @@ describe("WorkspaceManager resolveWorkspacePlan", () => {
     expect(plan.unsafeDirectCwd).toBe(false);
   });
 
-  it("rejects child-worktree execution in the current phase", () => {
+  it("creates child worktrees for isolated child workspaces", () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "auto-pm-lite-ws-child-"));
+    tempPaths.push(root);
+
+    execFileSync("git", ["init", root], { stdio: "ignore" });
+    execFileSync("git", ["-C", root, "config", "user.name", "Test User"], { stdio: "ignore" });
+    execFileSync("git", ["-C", root, "config", "user.email", "test@example.com"], { stdio: "ignore" });
+    fs.writeFileSync(path.join(root, "README.md"), "hello\n", "utf8");
+    execFileSync("git", ["-C", root, "add", "README.md"], { stdio: "ignore" });
+    execFileSync("git", ["-C", root, "commit", "-m", "init"], { stdio: "ignore" });
+
     const manager = new WorkspaceManager({
-      rootDir: "D:/tmp/auto-pm-workspaces",
+      rootDir: path.join(root, ".worktrees"),
       topLevelUseWorktree: true,
     });
+    const parent = manager.createTopLevelWorkspace({
+      taskId: "task-parent",
+      cwd: root,
+    });
 
-    expect(() => manager.createChildWorkspace({
+    const workspace = manager.createChildWorkspace({
       taskId: "task-child",
-      cwd: "D:/Code/Auto-PM-Lite",
-      parentWorkspace: {
-        id: "ws_parent",
-        path: "D:/Code/Auto-PM-Lite/.worktrees/parent",
-        repoRoot: "D:/Code/Auto-PM-Lite",
-        branch: "main",
-        head: "abc123",
-        dirty: false,
-        baseRef: "abc123",
-        status: "active",
-        unsafeDirectCwd: false,
-        createdAt: new Date().toISOString(),
-      },
+      cwd: parent.path,
+      parentWorkspace: parent,
       plan: {
         kind: "child-worktree",
-        repoRoot: "D:/Code/Auto-PM-Lite",
-        basePath: "D:/Code/Auto-PM-Lite/.worktrees/parent",
+        repoRoot: root,
+        basePath: parent.path,
         unsafeDirectCwd: false,
       },
-    })).toThrowError("child_workspace_isolation_not_supported");
+    });
+
+    expect(workspace.parentWorkspaceId).toBe(parent.id);
+    expect(workspace.baseRef).toBe(parent.head);
+    expect(workspace.path).toBe(path.join(root, ".worktrees", "task-child"));
+    expect(fs.existsSync(path.join(workspace.path, ".git"))).toBe(true);
   });
 });

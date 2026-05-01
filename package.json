@@ -14,6 +14,9 @@
     "typecheck": "tsc --noEmit",
     "test": "vitest run",
     "test:watch": "vitest",
+    "desktop:build": "vite build --config src/desktop/renderer/vite.config.ts && tsup --config tsup.desktop.config.ts",
+    "desktop:dev": "vite --config src/desktop/renderer/vite.config.ts",
+    "desktop:smoke": "tsx spikes/desktop-smoke.ts",
     "spike:claude:permissions": "tsx spikes/claude-permissions.ts",
     "spike:claude:mcp": "tsx spikes/claude-delegate-mcp.ts",
     "spike:codex:stream": "tsx spikes/codex-stream.ts",
@@ -31,19 +34,27 @@
     "better-sqlite3": "^12.1.1",
     "commander": "^14.0.0",
     "pino": "^10.0.0",
+    "react": "^19.2.5",
+    "react-dom": "^19.2.5",
     "zod": "^4.1.5"
   },
   "devDependencies": {
     "@types/better-sqlite3": "^7.6.13",
     "@types/node": "^24.6.0",
+    "@types/react": "^19.2.7",
+    "@types/react-dom": "^19.2.3",
+    "@vitejs/plugin-react": "^6.0.1",
+    "electron": "^41.4.0",
     "tsup": "^8.5.0",
     "tsx": "^4.20.5",
     "typescript": "^5.9.3",
+    "vite": "^8.0.10",
     "vitest": "^3.2.4"
   },
   "pnpm": {
     "onlyBuiltDependencies": [
       "better-sqlite3",
+      "electron",
       "esbuild"
     ]
   }

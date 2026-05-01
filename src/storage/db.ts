@@ -156,8 +156,16 @@ export class AppDatabase {
 
   createTaskRecord(input: CreateTaskRecordInput): void {
     const insertWorkspace = this.db.prepare(`
-      INSERT INTO workspaces (id, repo_root, path, branch, head, dirty, base_ref, parent_workspace_id, status, unsafe_direct_cwd, created_at)
-      VALUES (@id, @repo_root, @path, @branch, @head, @dirty, @base_ref, @parent_workspace_id, @status, @unsafe_direct_cwd, @created_at)
+      INSERT INTO workspaces (
+        id, repo_root, path, branch, head, dirty, base_ref, parent_workspace_id,
+        status, unsafe_direct_cwd, created_at, merge_requested_at, merge_approval_id,
+        merged_at, discarded_at, merge_error_json
+      )
+      VALUES (
+        @id, @repo_root, @path, @branch, @head, @dirty, @base_ref, @parent_workspace_id,
+        @status, @unsafe_direct_cwd, @created_at, @merge_requested_at, @merge_approval_id,
+        @merged_at, @discarded_at, @merge_error_json
+      )
     `);
 
     const insertTask = this.db.prepare(`
@@ -178,6 +186,11 @@ export class AppDatabase {
         status: input.workspace.status,
         unsafe_direct_cwd: input.workspace.unsafeDirectCwd ? 1 : 0,
         created_at: input.workspace.createdAt,
+        merge_requested_at: input.workspace.mergeRequestedAt ?? null,
+        merge_approval_id: input.workspace.mergeApprovalId ?? null,
+        merged_at: input.workspace.mergedAt ?? null,
+        discarded_at: input.workspace.discardedAt ?? null,
+        merge_error_json: input.workspace.mergeError ? JSON.stringify(input.workspace.mergeError) : null,
       });
 
       insertTask.run({
@@ -578,7 +591,7 @@ export class AppDatabase {
 
   getWorkspace(workspaceId: string): Workspace | null {
     const row = this.db.prepare(`
-      SELECT id, repo_root, path, branch, head, dirty, base_ref, parent_workspace_id, status, unsafe_direct_cwd, created_at
+      SELECT id, repo_root, path, branch, head, dirty, base_ref, parent_workspace_id, status, unsafe_direct_cwd, created_at, merge_requested_at, merge_approval_id, merged_at, discarded_at, merge_error_json
       FROM workspaces
       WHERE id = ?
     `).get(workspaceId) as Record<string, unknown> | undefined;
@@ -599,7 +612,52 @@ export class AppDatabase {
       status: String(row.status) as Workspace["status"],
       unsafeDirectCwd: Boolean(row.unsafe_direct_cwd),
       createdAt: String(row.created_at),
+      ...(row.merge_requested_at === null ? {} : { mergeRequestedAt: String(row.merge_requested_at) }),
+      ...(row.merge_approval_id === null ? {} : { mergeApprovalId: String(row.merge_approval_id) }),
+      ...(row.merged_at === null ? {} : { mergedAt: String(row.merged_at) }),
+      ...(row.discarded_at === null ? {} : { discardedAt: String(row.discarded_at) }),
+      ...(row.merge_error_json === null ? {} : { mergeError: JSON.parse(String(row.merge_error_json)) as Workspace["mergeError"] }),
     };
+  }
+
+  updateWorkspaceLifecycle(input: {
+    workspaceId: string;
+    status: Workspace["status"];
+    head?: string | undefined;
+    dirty?: boolean | undefined;
+    mergeRequestedAt?: string | null | undefined;
+    mergeApprovalId?: string | null | undefined;
+    mergedAt?: string | null | undefined;
+    discardedAt?: string | null | undefined;
+    mergeError?: Workspace["mergeError"] | null | undefined;
+  }): void {
+    this.db.prepare(`
+      UPDATE workspaces
+      SET status = @status,
+          head = COALESCE(@head, head),
+          dirty = COALESCE(@dirty, dirty),
+          merge_requested_at = CASE WHEN @merge_requested_at_set THEN @merge_requested_at ELSE merge_requested_at END,
+          merge_approval_id = CASE WHEN @merge_approval_id_set THEN @merge_approval_id ELSE merge_approval_id END,
+          merged_at = CASE WHEN @merged_at_set THEN @merged_at ELSE merged_at END,
+          discarded_at = CASE WHEN @discarded_at_set THEN @discarded_at ELSE discarded_at END,
+          merge_error_json = CASE WHEN @merge_error_set THEN @merge_error_json ELSE merge_error_json END
+      WHERE id = @workspace_id
+    `).run({
+      workspace_id: input.workspaceId,
+      status: input.status,
+      head: input.head ?? null,
+      dirty: input.dirty === undefined ? null : input.dirty ? 1 : 0,
+      merge_requested_at_set: input.mergeRequestedAt !== undefined ? 1 : 0,
+      merge_requested_at: input.mergeRequestedAt ?? null,
+      merge_approval_id_set: input.mergeApprovalId !== undefined ? 1 : 0,
+      merge_approval_id: input.mergeApprovalId ?? null,
+      merged_at_set: input.mergedAt !== undefined ? 1 : 0,
+      merged_at: input.mergedAt ?? null,
+      discarded_at_set: input.discardedAt !== undefined ? 1 : 0,
+      discarded_at: input.discardedAt ?? null,
+      merge_error_set: input.mergeError !== undefined ? 1 : 0,
+      merge_error_json: input.mergeError ? JSON.stringify(input.mergeError) : null,
+    });
   }
 
   getProfile(profileId: string): { id: string; runtime: string; policyId: string } | null {
@@ -631,6 +689,13 @@ export class AppDatabase {
   }
 
   private migrate(): void {
+    this.db.exec(`
+      CREATE TABLE IF NOT EXISTS schema_migrations (
+        id TEXT PRIMARY KEY,
+        applied_at TEXT NOT NULL
+      );
+    `);
+
     this.db.exec(`
       CREATE TABLE IF NOT EXISTS accounts (
         id TEXT PRIMARY KEY,
@@ -750,6 +815,13 @@ export class AppDatabase {
     `);
     this.ensureColumn("workspaces", "head", "TEXT");
     this.ensureColumn("workspaces", "dirty", "INTEGER");
+    this.ensureColumn("workspaces", "merge_requested_at", "TEXT");
+    this.ensureColumn("workspaces", "merge_approval_id", "TEXT");
+    this.ensureColumn("workspaces", "merged_at", "TEXT");
+    this.ensureColumn("workspaces", "discarded_at", "TEXT");
+    this.ensureColumn("workspaces", "merge_error_json", "TEXT");
+    this.recordMigration("001_initial");
+    this.recordMigration("002_workspace_lifecycle");
   }
 
   private ensureColumn(tableName: string, columnName: string, type: string): void {
@@ -757,5 +829,12 @@ export class AppDatabase {
     if (!columns.some((column) => column.name === columnName)) {
       this.db.exec(`ALTER TABLE ${tableName} ADD COLUMN ${columnName} ${type}`);
     }
+  }
+
+  private recordMigration(id: string): void {
+    this.db.prepare(`
+      INSERT OR IGNORE INTO schema_migrations (id, applied_at)
+      VALUES (?, ?)
+    `).run(id, new Date().toISOString());
   }
 }

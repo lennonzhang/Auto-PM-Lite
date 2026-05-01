@@ -1,7 +1,8 @@
 import fs from "node:fs";
+import os from "node:os";
 import path from "node:path";
 import { execFileSync } from "node:child_process";
-import type { AppConfig, Workspace } from "../core/types.js";
+import type { AppConfig, Workspace, WorkspaceChange } from "../core/types.js";
 
 export type WorkspacePlanKind = "direct-cwd" | "top-level-worktree" | "shared-child" | "child-worktree";
 
@@ -33,6 +34,17 @@ export interface CreateChildWorkspaceInput {
   parentWorkspace: Workspace;
   plan: WorkspacePlan;
   createdAt?: string | undefined;
+}
+
+export interface WorkspaceInspection {
+  head?: string | undefined;
+  dirty?: boolean | undefined;
+}
+
+export interface ApplyPatchResult {
+  parentAdvanced: boolean;
+  parentHead?: string | undefined;
+  childHead?: string | undefined;
 }
 
 export class WorkspaceManager {
@@ -143,10 +155,120 @@ export class WorkspaceManager {
           createdAt,
         };
       case "child-worktree":
-        throw new Error("child_workspace_isolation_not_supported");
+        return this.createChildWorktree(input);
       default:
         throw new Error(`invalid_child_workspace_plan:${input.plan.kind}`);
     }
+  }
+
+  inspectWorkspace(workspace: Workspace): WorkspaceInspection {
+    if (!workspace.repoRoot) {
+      return {};
+    }
+    return {
+      head: readGitHead(workspace.path),
+      dirty: isGitDirty(workspace.path),
+    };
+  }
+
+  listChanges(workspace: Workspace): WorkspaceChange[] {
+    if (!workspace.baseRef) {
+      throw new Error("workspace_missing_base_ref");
+    }
+    const baseRef = workspace.baseRef;
+    return withTemporaryIndex(workspace.path, () => {
+      execGit(workspace.path, ["add", "-A"]);
+      const output = execGit(workspace.path, ["diff", "--cached", "--name-status", "--find-renames", baseRef]);
+      const binaryPaths = findBinaryChangedPaths(workspace, baseRef);
+      return output
+      .split(/\r?\n/)
+      .map((line) => line.trim())
+      .filter(Boolean)
+      .map((line) => parseNameStatusLine(line, binaryPaths));
+    });
+  }
+
+  getDiffPatch(workspace: Workspace): string {
+    if (!workspace.baseRef) {
+      throw new Error("workspace_missing_base_ref");
+    }
+    const baseRef = workspace.baseRef;
+    return withTemporaryIndex(workspace.path, () => {
+      execGit(workspace.path, ["add", "-A"]);
+      return execGitRaw(workspace.path, ["diff", "--cached", "--binary", baseRef]);
+    });
+  }
+
+  applyPatchToParent(input: { parentWorkspace: Workspace; childWorkspace: Workspace; patch: string }): ApplyPatchResult {
+    if (!input.childWorkspace.baseRef) {
+      throw new Error("workspace_missing_base_ref");
+    }
+    if (isGitDirty(input.parentWorkspace.path)) {
+      throw new Error("parent_workspace_dirty");
+    }
+    const parentHead = readGitHead(input.parentWorkspace.path);
+    const childHead = readGitHead(input.childWorkspace.path);
+    execGit(input.parentWorkspace.path, ["apply", "--3way", "--index", "-"], input.patch);
+    execGit(input.parentWorkspace.path, ["reset"]);
+    return {
+      parentAdvanced: Boolean(parentHead && parentHead !== input.childWorkspace.baseRef),
+      parentHead,
+      childHead,
+    };
+  }
+
+  discardWorkspace(workspace: Workspace): void {
+    if (!workspace.parentWorkspaceId) {
+      throw new Error("cannot_discard_top_level_workspace");
+    }
+    if (fs.existsSync(workspace.path)) {
+      try {
+        execGit(workspace.path, ["worktree", "remove", "--force", workspace.path]);
+      } catch {
+        fs.rmSync(workspace.path, { recursive: true, force: true });
+      }
+    }
+  }
+
+  private createChildWorktree(input: CreateChildWorkspaceInput): Workspace {
+    const parent = input.parentWorkspace;
+    if (!parent.repoRoot) {
+      throw new Error("workspace_not_isolatable:not_git");
+    }
+    if (parent.unsafeDirectCwd) {
+      throw new Error("workspace_not_isolatable:unsafe_direct_cwd");
+    }
+    if (parent.status !== "active") {
+      throw new Error("workspace_not_isolatable:parent_not_active");
+    }
+    if (isGitDirty(parent.path)) {
+      throw new Error("workspace_not_isolatable:parent_dirty");
+    }
+
+    const parentHead = readGitHead(parent.path);
+    if (!parentHead) {
+      throw new Error("workspace_not_isolatable:missing_parent_head");
+    }
+
+    const workspacePath = path.join(this.config.rootDir, input.taskId);
+    fs.mkdirSync(this.config.rootDir, { recursive: true });
+    if (!fs.existsSync(workspacePath)) {
+      execGit(parent.path, ["worktree", "add", "--detach", workspacePath, parentHead], undefined, "ignore");
+    }
+
+    return {
+      id: `ws_${input.taskId}`,
+      path: workspacePath,
+      repoRoot: parent.repoRoot,
+      branch: readGitBranch(workspacePath),
+      head: readGitHead(workspacePath) ?? parentHead,
+      dirty: isGitDirty(workspacePath),
+      baseRef: parentHead,
+      parentWorkspaceId: parent.id,
+      status: "active",
+      unsafeDirectCwd: false,
+      createdAt: input.createdAt ?? new Date().toISOString(),
+    };
   }
 }
 
@@ -202,4 +324,77 @@ function isGitDirty(repoRoot: string): boolean {
   } catch {
     return false;
   }
+}
+
+function execGit(cwd: string, args: string[], input?: string | undefined, stderr: "pipe" | "ignore" = "pipe", env?: NodeJS.ProcessEnv | undefined): string {
+  return execGitRaw(cwd, args, input, stderr, env).trim();
+}
+
+function execGitRaw(cwd: string, args: string[], input?: string | undefined, stderr: "pipe" | "ignore" = "pipe", env?: NodeJS.ProcessEnv | undefined): string {
+  return execFileSync("git", ["-C", cwd, ...args], {
+    env: env ?? process.env,
+    input,
+    encoding: "utf8",
+    stdio: ["pipe", "pipe", stderr],
+  });
+}
+
+function findBinaryChangedPaths(workspace: Workspace, baseRef: string): Set<string> {
+  const binaryPaths = new Set<string>();
+  const output = execGit(workspace.path, ["diff", "--cached", "--numstat", baseRef]);
+  for (const line of output.split(/\r?\n/)) {
+    const parts = line.split("\t");
+    if (parts.length >= 3 && parts[0] === "-" && parts[1] === "-") {
+      binaryPaths.add(parts[2]!);
+    }
+  }
+  return binaryPaths;
+}
+
+function withTemporaryIndex<T>(cwd: string, run: () => T): T {
+  const tempDir = fs.mkdtempSync(path.join(os.tmpdir(), "auto-pm-lite-index-"));
+  const tempIndex = path.join(tempDir, "index");
+  const originalIndex = execGit(cwd, ["rev-parse", "--git-path", "index"]);
+  if (fs.existsSync(originalIndex)) {
+    fs.copyFileSync(originalIndex, tempIndex);
+  }
+  const previousIndex = process.env.GIT_INDEX_FILE;
+  process.env.GIT_INDEX_FILE = tempIndex;
+  try {
+    return run();
+  } finally {
+    if (previousIndex === undefined) {
+      delete process.env.GIT_INDEX_FILE;
+    } else {
+      process.env.GIT_INDEX_FILE = previousIndex;
+    }
+    fs.rmSync(tempDir, { recursive: true, force: true });
+  }
+}
+
+function parseNameStatusLine(line: string, binaryPaths: Set<string>): WorkspaceChange {
+  const parts = line.split("\t");
+  const status = parts[0] ?? "";
+  if (status.startsWith("R")) {
+    const oldPath = parts[1] ?? "";
+    const newPath = parts[2] ?? oldPath;
+    return {
+      path: newPath,
+      oldPath,
+      changeKind: "rename",
+      binary: binaryPaths.has(newPath) || binaryPaths.has(oldPath),
+    };
+  }
+
+  const filePath = parts[1] ?? "";
+  const changeKind = status === "A"
+    ? "create"
+    : status === "D"
+      ? "delete"
+      : "modify";
+  return {
+    path: filePath,
+    changeKind,
+    binary: binaryPaths.has(filePath),
+  };
 }

@@ -1,0 +1,244 @@
+:root {
+  color-scheme: light;
+  font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+  color: #1d2430;
+  background: #f5f6f8;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+}
+
+button {
+  font: inherit;
+}
+
+.shell {
+  display: grid;
+  grid-template-columns: 280px minmax(420px, 1fr) 340px;
+  min-height: 100vh;
+  background: #f5f6f8;
+}
+
+.sidebar,
+.inspector {
+  background: #ffffff;
+  border-color: #d9dee7;
+  border-style: solid;
+}
+
+.sidebar {
+  border-width: 0 1px 0 0;
+}
+
+.inspector {
+  border-width: 0 0 0 1px;
+}
+
+.center {
+  display: flex;
+  min-width: 0;
+  flex-direction: column;
+}
+
+.paneHeader {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  height: 44px;
+  padding: 0 14px;
+  border-bottom: 1px solid #e4e7ed;
+  color: #5f6b7a;
+  font-size: 12px;
+  font-weight: 700;
+  text-transform: uppercase;
+}
+
+.paneHeader button,
+.approvalActions button {
+  border: 1px solid #c9d1de;
+  background: #ffffff;
+  color: #283443;
+  border-radius: 6px;
+  padding: 4px 8px;
+}
+
+.taskList,
+.approvalList,
+.eventList {
+  overflow: auto;
+}
+
+.taskRow {
+  display: grid;
+  width: 100%;
+  grid-template-columns: 10px minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 10px;
+  padding: 10px 14px;
+  border: 0;
+  border-bottom: 1px solid #eef1f5;
+  background: transparent;
+  color: #263241;
+  text-align: left;
+}
+
+.taskRow.selected {
+  background: #eef4ff;
+}
+
+.statusDot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #9aa4b2;
+}
+
+.statusDot.running {
+  background: #2563eb;
+}
+
+.statusDot.completed {
+  background: #1b8a5a;
+}
+
+.statusDot.failed,
+.statusDot.interrupted {
+  background: #c2410c;
+}
+
+.statusDot.awaiting_approval {
+  background: #b7791f;
+}
+
+.taskName,
+.taskRuntime {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.taskRuntime {
+  color: #6d7888;
+  font-size: 12px;
+}
+
+.topbar {
+  display: flex;
+  justify-content: space-between;
+  gap: 18px;
+  padding: 18px 22px;
+  border-bottom: 1px solid #dfe4ec;
+  background: #ffffff;
+}
+
+.topbar h1 {
+  margin: 0 0 4px;
+  font-size: 20px;
+  font-weight: 700;
+}
+
+.topbar p {
+  margin: 0;
+  color: #657183;
+  font-size: 13px;
+  overflow-wrap: anywhere;
+}
+
+.apiBadge {
+  align-self: start;
+  border: 1px solid #ccd5e2;
+  border-radius: 6px;
+  padding: 5px 8px;
+  color: #4d5b6c;
+  background: #f8fafc;
+  font-size: 12px;
+}
+
+.transcript {
+  min-height: 0;
+  flex: 1;
+}
+
+.eventRow {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto;
+  gap: 12px;
+  padding: 9px 14px;
+  border-bottom: 1px solid #e8ecf2;
+  background: #ffffff;
+}
+
+.eventRow code,
+.eventRow time {
+  color: #6c7787;
+  font-size: 12px;
+}
+
+.approvalRow {
+  padding: 12px 14px;
+  border-bottom: 1px solid #e8ecf2;
+}
+
+.approvalRow strong {
+  display: block;
+  margin-bottom: 3px;
+  font-size: 13px;
+}
+
+.approvalRow p {
+  margin: 0;
+  color: #6c7787;
+  font-size: 12px;
+}
+
+.approvalActions {
+  display: flex;
+  gap: 8px;
+  margin-top: 10px;
+}
+
+.metaGrid {
+  display: grid;
+  grid-template-columns: 88px minmax(0, 1fr);
+  gap: 10px;
+  padding: 14px;
+  margin: 0;
+  font-size: 13px;
+}
+
+.metaGrid dt {
+  color: #687487;
+}
+
+.metaGrid dd {
+  margin: 0;
+  overflow-wrap: anywhere;
+}
+
+.empty,
+.errorLine {
+  padding: 16px 14px;
+  color: #687487;
+  font-size: 13px;
+}
+
+.errorLine {
+  color: #9a3412;
+  background: #fff7ed;
+  border-bottom: 1px solid #fed7aa;
+}
+
+@media (max-width: 1040px) {
+  .shell {
+    grid-template-columns: 240px minmax(0, 1fr);
+  }
+
+  .inspector {
+    display: none;
+  }
+}

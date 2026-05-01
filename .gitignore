@@ -7,6 +7,9 @@ coverage/
 .env
 .env.*
 !.env.example
+launcher.env
+launcher.env.local
+launcher.env.example
 
 .claude/*
 !.claude/settings.json

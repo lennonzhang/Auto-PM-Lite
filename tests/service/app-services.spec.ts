@@ -1,0 +1,306 @@
+import fs from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
+import { execFileSync } from "node:child_process";
+import { afterEach, describe, expect, it } from "vitest";
+import { AppDatabase } from "../../src/storage/db.js";
+import { Orchestrator } from "../../src/orchestrator/orchestrator.js";
+import { createAppServices } from "../../src/service/app-services.js";
+import { apiVersion, toErrorEnvelope } from "../../src/api/types.js";
+import {
+  approvalViewSchema,
+  configMetadataSchema,
+  createTaskRequestSchema,
+  eventEnvelopeSchema,
+  eventSubscriptionRequestSchema,
+  requestWorkspaceMergeSchema,
+  resolveApprovalRequestSchema,
+  runtimeHealthSchema,
+  taskDetailSchema,
+  taskSummarySchema,
+  workspaceChangeSchema,
+  workspaceDiffSchema,
+  workspaceMergeResultSchema,
+} from "../../src/api/schemas.js";
+import type { AgentEvent, AppConfig } from "../../src/core/types.js";
+import type { RuntimeAdapter, RuntimeTaskHandle, RunTurnInput, StartRuntimeTaskInput, ResumeRuntimeTaskInput } from "../../src/runtime/adapter.js";
+
+const tempPaths: string[] = [];
+
+class FakeRuntime implements RuntimeAdapter {
+  constructor(readonly runtime: RuntimeAdapter["runtime"] = "claude") {}
+
+  async startTask(input: StartRuntimeTaskInput): Promise<RuntimeTaskHandle> {
+    return { taskId: input.taskId, backendThreadId: `thread-${input.taskId}` };
+  }
+
+  async *runTurn(input: RunTurnInput): AsyncIterable<AgentEvent> {
+    const ts = new Date().toISOString();
+    yield { type: "turn.started", taskId: input.taskId, turnId: "turn-1", ts };
+    yield { type: "message.completed", taskId: input.taskId, turnId: "turn-1", text: input.prompt, ts };
+    yield { type: "turn.completed", taskId: input.taskId, turnId: "turn-1", usage: { inputTokens: 1, outputTokens: 1 }, ts };
+  }
+
+  async resumeTask(input: ResumeRuntimeTaskInput): Promise<RuntimeTaskHandle> {
+    return { taskId: input.taskId, backendThreadId: input.backendThreadId };
+  }
+
+  async cancelTask(_taskId: string): Promise<void> {}
+  async closeTask(_taskId: string): Promise<void> {}
+}
+
+afterEach(async () => {
+  await Promise.all(tempPaths.splice(0).map(async (target) => {
+    await fs.rm(target, { recursive: true, force: true });
+  }));
+});
+
+describe("AppServices", () => {
+  it("exposes versioned config metadata and task DTOs", async () => {
+    const { services } = await buildServices();
+
+    try {
+      expect(services.config.getMetadata().apiVersion).toBe(apiVersion);
+      expect(configMetadataSchema.parse(services.config.getMetadata()).apiVersion).toBe(apiVersion);
+
+      const task = await services.tasks.createTask({
+        profileId: "claude_main",
+        cwd: services.config.getMetadata().workspace.rootDir,
+        name: "service-task",
+      });
+
+      expect(taskDetailSchema.parse(task).id).toBe(task.id);
+      expect(task.workspace).toBeDefined();
+      expect(task.turns).toEqual([]);
+      expect(services.tasks.listTasks()).toHaveLength(1);
+      expect(taskSummarySchema.parse(services.tasks.listTasks()[0]!).id).toBe(task.id);
+      expect(services.tasks.getTask(task.id).name).toBe("service-task");
+      const runtimeHealth = services.runtime.getHealth();
+      expect(runtimeHealth.map((entry) => runtimeHealthSchema.parse(entry).runtime)).toEqual(["claude", "codex"]);
+      expect(runtimeHealth.find((entry) => entry.runtime === "claude")?.profiles).toEqual(["claude_main"]);
+    } finally {
+      await services.close();
+    }
+  });
+
+  it("wraps replayed events in event envelopes", async () => {
+    const { services } = await buildServices();
+
+    try {
+      const task = await services.tasks.createTask({
+        profileId: "claude_main",
+        cwd: services.config.getMetadata().workspace.rootDir,
+      });
+
+      const seen: string[] = [];
+      const replay = await services.events.replayAndSubscribe({
+        taskId: task.id,
+        listener: (event) => {
+          expect(event.eventEnvelopeVersion).toBe(1);
+          expect(event.durable).toBe(true);
+          expect(event.id).toEqual(expect.any(Number));
+          expect(eventEnvelopeSchema.parse(event).id).toBe(event.id);
+          seen.push(event.event.type);
+        },
+      });
+      replay.unsubscribe();
+
+      expect(seen).toContain("task.queued");
+    } finally {
+      await services.close();
+    }
+  });
+
+  it("uses sinceId as an exclusive event cursor", async () => {
+    const { db, services } = await buildServices();
+
+    try {
+      const first = await services.tasks.createTask({
+        profileId: "claude_main",
+        cwd: services.config.getMetadata().workspace.rootDir,
+      });
+      const second = await services.tasks.createTask({
+        profileId: "claude_main",
+        cwd: services.config.getMetadata().workspace.rootDir,
+      });
+      const firstEvent = db.listEvents({ taskId: first.id })[0]!;
+
+      const seen: string[] = [];
+      const replay = await services.events.replayAndSubscribe({
+        sinceId: firstEvent.id,
+        listener: (event) => {
+          seen.push(event.event.taskId);
+        },
+      });
+      replay.unsubscribe();
+
+      expect(seen).not.toContain(first.id);
+      expect(seen).toContain(second.id);
+    } finally {
+      await services.close();
+    }
+  });
+
+  it("validates workspace use cases at the service contract layer", async () => {
+    const { repoRoot, services } = await buildServices({ editableWorkspace: true });
+
+    try {
+      const parent = await services.tasks.createTask({
+        profileId: "claude_main",
+        cwd: repoRoot,
+      });
+      const delegated = await services.orchestrator.delegateTask({
+        parentTaskId: parent.id,
+        targetProfileId: "codex_child",
+        taskType: "edit",
+        prompt: "edit",
+        reason: "service contract",
+      });
+      const childTaskId = delegated.childTaskId!;
+      const childTask = services.tasks.getTask(childTaskId);
+      const workspacePath = childTask.workspace?.path ?? childTask.cwd;
+      await fs.writeFile(path.join(workspacePath, "service-change.txt"), "service\n", "utf8");
+
+      const changes = services.workspaces.listChanges(childTaskId);
+      expect(changes.map((change) => workspaceChangeSchema.parse(change).path)).toEqual(["service-change.txt"]);
+
+      const diff = services.workspaces.getDiff(childTaskId);
+      expect(workspaceDiffSchema.parse(diff).patch).toContain("service");
+
+      const mergeRequest = await services.workspaces.requestMerge({
+        taskId: childTaskId,
+        reason: "service contract",
+      });
+      await services.approvals.resolveApproval({ approvalId: mergeRequest.approvalId, approved: true });
+      const merged = await services.workspaces.applyMerge({
+        taskId: childTaskId,
+        approvalId: mergeRequest.approvalId,
+      });
+      expect(workspaceMergeResultSchema.parse(merged).status).toBe("merged");
+    } finally {
+      await services.close();
+    }
+  });
+
+  it("keeps API schemas and error envelopes stable", () => {
+    expect(createTaskRequestSchema.parse({ profileId: "p", cwd: "c" })).toEqual({ profileId: "p", cwd: "c" });
+    expect(resolveApprovalRequestSchema.parse({ approvalId: "a", approved: true })).toEqual({ approvalId: "a", approved: true });
+    expect(requestWorkspaceMergeSchema.parse({ taskId: "t", reason: "ready" })).toEqual({ taskId: "t", reason: "ready" });
+    expect(eventSubscriptionRequestSchema.parse({ sinceId: 10 })).toEqual({ sinceId: 10 });
+    expect(approvalViewSchema.parse({
+      id: "a",
+      taskId: "t",
+      kind: "workspace_merge",
+      payload: {},
+      status: "pending",
+      requestedAt: new Date().toISOString(),
+      category: "capability_request",
+    }).id).toBe("a");
+
+    expect(toErrorEnvelope(new Error("workspace_not_mergeable:invalid_status"))).toEqual({
+      apiVersion,
+      error: {
+        code: "workspace_not_mergeable",
+        message: "workspace_not_mergeable:invalid_status",
+      },
+    });
+  });
+});
+
+async function buildServices(options?: { editableWorkspace?: boolean }) {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "auto-pm-lite-service-"));
+  tempPaths.push(root);
+  const repoRoot = options?.editableWorkspace ? path.join(root, "repo") : root;
+  const workspaceRoot = options?.editableWorkspace ? path.join(root, "workspaces") : root;
+  if (options?.editableWorkspace) {
+    initializeGitRepo(repoRoot);
+  }
+  const config: AppConfig = {
+    accounts: {
+      anthropic: { id: "anthropic", vendor: "anthropic", secretRef: "env:ANTHROPIC_API_KEY" },
+    },
+    policies: {
+      readonly: {
+        id: "readonly",
+        permissionMode: "read-only",
+        sandboxMode: "read-only",
+        networkAllowed: false,
+        approvalPolicy: "orchestrator",
+        requireApprovalFor: [],
+        maxDepth: options?.editableWorkspace ? 2 : 1,
+        allowCrossHarnessDelegation: Boolean(options?.editableWorkspace),
+        allowChildEdit: Boolean(options?.editableWorkspace),
+        allowChildNetwork: false,
+        unsafeDirectCwd: !options?.editableWorkspace,
+      },
+      ...(options?.editableWorkspace
+        ? {
+            child_edit: {
+              id: "child_edit",
+              permissionMode: "edit" as const,
+              sandboxMode: "workspace-write" as const,
+              networkAllowed: false,
+              approvalPolicy: "orchestrator" as const,
+              requireApprovalFor: [],
+              maxDepth: 2,
+              allowCrossHarnessDelegation: false,
+              allowChildEdit: false,
+              allowChildNetwork: false,
+            },
+          }
+        : {}),
+    },
+    profiles: {
+      claude_main: {
+        id: "claude_main",
+        runtime: "claude",
+        accountId: "anthropic",
+        policyId: "readonly",
+        model: "claude-opus-4-7",
+      },
+      ...(options?.editableWorkspace
+        ? {
+            codex_child: {
+              id: "codex_child",
+              runtime: "codex" as const,
+              accountId: "anthropic",
+              policyId: "child_edit",
+              model: "gpt-5-codex",
+            },
+          }
+        : {}),
+    },
+    redaction: { additionalPatterns: [] },
+    transcript: { storeRawEncrypted: false },
+    storage: {
+      dbPath: path.join(root, "db.sqlite"),
+      busyTimeoutMs: 1000,
+      maxQueueSize: 100,
+      flushBatchSize: 10,
+    },
+    workspace: {
+      rootDir: workspaceRoot,
+      topLevelUseWorktree: Boolean(options?.editableWorkspace),
+    },
+    scheduler: {
+      maxConcurrentTasksGlobal: 5,
+      maxConcurrentTasksPerAccount: 2,
+    },
+    rateLimit: { enabled: false },
+  };
+  const db = new AppDatabase({ dbPath: config.storage.dbPath, busyTimeoutMs: config.storage.busyTimeoutMs });
+  const orchestrator = new Orchestrator(config, db, {
+    claude: new FakeRuntime("claude"),
+    ...(options?.editableWorkspace ? { codex: new FakeRuntime("codex") } : {}),
+  });
+  orchestrator.syncConfig();
+  return { db, repoRoot, services: createAppServices(config, orchestrator) };
+}
+
+function initializeGitRepo(root: string): void {
+  execFileSync("git", ["init", root], { stdio: "ignore" });
+  execFileSync("git", ["-C", root, "config", "user.name", "Test User"], { stdio: "ignore" });
+  execFileSync("git", ["-C", root, "config", "user.email", "test@example.com"], { stdio: "ignore" });
+  execFileSync("git", ["-C", root, "config", "core.autocrlf", "false"], { stdio: "ignore" });
+  execFileSync("git", ["-C", root, "commit", "--allow-empty", "-m", "init"], { stdio: "ignore" });
+}
