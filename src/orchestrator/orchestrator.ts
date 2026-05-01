@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto";
 import fs from "node:fs";
-import type { AppConfig, AgentEvent, ApprovalKind, ArtifactRef, BudgetSnapshot, DelegateToResult, PermissionMode, Policy, Task, TaskReference, TurnUsage, Workspace } from "../core/types.js";
+import type { AppConfig, AgentEvent, ApprovalKind, ArtifactRef, BudgetSnapshot, DelegateToResult, Policy, Task, TaskReference, TurnUsage, Workspace, WorkspaceDiff, WorkspaceMergeError, WorkspaceMergeResult } from "../core/types.js";
 import type { AutoPmMcpHandlers, McpToolResult } from "../mcp/auto-pm-service.js";
 import { redactText } from "../core/redaction.js";
 import { canAccessReference, policyTrustLevel } from "../core/reference.js";
@@ -9,7 +9,7 @@ import { AppDatabase, type StoredArtifact } from "../storage/db.js";
 import { EventStore } from "../storage/event-store.js";
 import type { RuntimeAdapter } from "../runtime/adapter.js";
 import { shouldRequireApproval } from "./policy.js";
-import { assertReadOnlyDelegation, canAccessTaskLineage, exceedsDelegationDepth, resolveDelegationTargetProfile, type DelegateTaskInput as DelegateTaskRequest, wouldCreateDelegationCycle } from "./delegation.js";
+import { canAccessTaskLineage, evaluateDelegationPolicy, exceedsDelegationDepth, resolveDelegationTargetProfile, type DelegateTaskInput as DelegateTaskRequest, wouldCreateDelegationCycle } from "./delegation.js";
 import { buildDelegationChain, nextDelegationDepth } from "./task-tree.js";
 import { WorkspaceManager } from "./workspace.js";
 import { checkBudget, updateBudget } from "./budget.js";
@@ -166,6 +166,176 @@ export class Orchestrator {
     return this.db.listArtifacts(taskId);
   }
 
+  getWorkspace(workspaceId: string): ReturnType<AppDatabase["getWorkspace"]> {
+    return this.db.getWorkspace(workspaceId);
+  }
+
+  listWorkspaceChanges(taskId: string): WorkspaceDiff["changes"] {
+    const task = this.requireTask(taskId);
+    const workspace = this.requireWorkspace(task.workspaceId);
+    return this.workspaceManager.listChanges(workspace);
+  }
+
+  getWorkspaceDiff(taskId: string): WorkspaceDiff {
+    const task = this.requireTask(taskId);
+    const workspace = this.requireWorkspace(task.workspaceId);
+    if (!workspace.baseRef) {
+      throw new Error("workspace_missing_base_ref");
+    }
+    const inspected = this.workspaceManager.inspectWorkspace(workspace);
+    const patch = redactText(this.workspaceManager.getDiffPatch(workspace), {
+      additionalPatterns: this.config.redaction.additionalPatterns,
+    });
+    return {
+      taskId,
+      workspaceId: workspace.id,
+      baseRef: workspace.baseRef,
+      head: inspected.head,
+      changes: this.workspaceManager.listChanges(workspace),
+      patch,
+      truncated: false,
+    };
+  }
+
+  async requestWorkspaceMerge(input: { taskId: string; reason: string }): Promise<{ approvalId: string; workspaceId: string }> {
+    const task = this.requireTask(input.taskId);
+    const workspace = this.requireWorkspace(task.workspaceId);
+    const parentWorkspace = this.requireParentWorkspace(workspace);
+    this.assertWorkspaceMergeable(workspace, parentWorkspace);
+    const parentInspection = this.workspaceManager.inspectWorkspace(parentWorkspace);
+    if (parentInspection.dirty) {
+      throw new Error("parent_workspace_dirty");
+    }
+
+    const approvalId = this.createApproval({
+      taskId: task.id,
+      kind: "workspace_merge",
+      payload: {
+        reason: input.reason,
+        workspaceId: workspace.id,
+        changes: this.workspaceManager.listChanges(workspace),
+      },
+    });
+    const now = new Date().toISOString();
+    this.db.updateWorkspaceLifecycle({
+      workspaceId: workspace.id,
+      status: "merge_requested",
+      mergeRequestedAt: now,
+      mergeApprovalId: approvalId,
+      mergeError: null,
+    });
+    await this.emitEvent({
+      type: "workspace.merge_requested",
+      taskId: task.id,
+      workspaceId: workspace.id,
+      approvalId,
+      ts: now,
+    });
+    return { approvalId, workspaceId: workspace.id };
+  }
+
+  async applyApprovedWorkspaceMerge(input: { taskId: string; approvalId: string }): Promise<WorkspaceMergeResult> {
+    const task = this.requireTask(input.taskId);
+    const workspace = this.requireWorkspace(task.workspaceId);
+    const parentWorkspace = this.requireParentWorkspace(workspace);
+    this.assertWorkspaceMergeable(workspace, parentWorkspace, true);
+    const approval = this.db.listApprovals(task.id).find((entry) => entry.id === input.approvalId);
+    if (!approval || approval.kind !== "workspace_merge" || approval.status !== "approved") {
+      throw new Error("workspace_merge_approval_required");
+    }
+
+    const changes = this.workspaceManager.listChanges(workspace);
+    const parentInspection = this.workspaceManager.inspectWorkspace(parentWorkspace);
+    const childInspection = this.workspaceManager.inspectWorkspace(workspace);
+    const parentAdvanced = Boolean(parentInspection.head && parentInspection.head !== workspace.baseRef);
+    const startedAt = new Date().toISOString();
+    this.db.updateWorkspaceLifecycle({ workspaceId: workspace.id, status: "merging", mergeError: null });
+    await this.emitEvent({
+      type: "workspace.merge_started",
+      taskId: task.id,
+      workspaceId: workspace.id,
+      parentAdvanced,
+      ts: startedAt,
+    });
+
+    if (parentInspection.dirty) {
+      const error: WorkspaceMergeError = {
+        code: "parent_dirty",
+        message: "parent_workspace_dirty",
+        parentHead: parentInspection.head,
+        childHead: childInspection.head,
+      };
+      return this.recordWorkspaceMergeFailure(task, workspace, changes, parentAdvanced, error);
+    }
+
+    try {
+      const patch = this.workspaceManager.getDiffPatch(workspace);
+      const applyResult = this.workspaceManager.applyPatchToParent({
+        parentWorkspace,
+        childWorkspace: workspace,
+        patch,
+      });
+      const mergedAt = new Date().toISOString();
+      this.db.updateWorkspaceLifecycle({
+        workspaceId: workspace.id,
+        status: "merged",
+        head: applyResult.childHead,
+        dirty: false,
+        mergedAt,
+        mergeError: null,
+      });
+      await this.emitEvent({
+        type: "workspace.merged",
+        taskId: task.id,
+        workspaceId: workspace.id,
+        parentAdvanced: applyResult.parentAdvanced,
+        ts: mergedAt,
+      });
+      return {
+        taskId: task.id,
+        workspaceId: workspace.id,
+        status: "merged",
+        parentAdvanced: applyResult.parentAdvanced,
+        parentHead: applyResult.parentHead,
+        childHead: applyResult.childHead,
+        changes,
+      };
+    } catch (error) {
+      const mergeError: WorkspaceMergeError = {
+        code: "merge_conflict",
+        message: error instanceof Error ? error.message : String(error),
+        parentHead: parentInspection.head,
+        childHead: childInspection.head,
+      };
+      return this.recordWorkspaceMergeFailure(task, workspace, changes, parentAdvanced, mergeError);
+    }
+  }
+
+  async discardWorkspace(taskId: string): Promise<{ taskId: string; workspaceId: string; status: Workspace["status"] }> {
+    const task = this.requireTask(taskId);
+    const workspace = this.requireWorkspace(task.workspaceId);
+    if (!workspace.parentWorkspaceId) {
+      throw new Error("cannot_discard_top_level_workspace");
+    }
+    if (workspace.status === "merged" || workspace.status === "discarded") {
+      throw new Error("workspace_not_discardable");
+    }
+    this.workspaceManager.discardWorkspace(workspace);
+    const discardedAt = new Date().toISOString();
+    this.db.updateWorkspaceLifecycle({
+      workspaceId: workspace.id,
+      status: "discarded",
+      discardedAt,
+    });
+    await this.emitEvent({
+      type: "workspace.discarded",
+      taskId: task.id,
+      workspaceId: workspace.id,
+      ts: discardedAt,
+    });
+    return { taskId: task.id, workspaceId: workspace.id, status: "discarded" };
+  }
+
   createApproval(input: {
     taskId: string;
     kind: ApprovalKind;
@@ -292,13 +462,7 @@ export class Orchestrator {
     const parentPolicy = this.requirePolicy(parentProfile.policyId);
 
     if (!parentPolicy.allowCrossHarnessDelegation) {
-      return { status: "denied", message: "cross_harness_delegation_disabled" };
-    }
-
-    try {
-      assertReadOnlyDelegation(input);
-    } catch (error) {
-      return { status: "denied", message: error instanceof Error ? error.message : String(error) };
+      return deniedDelegation("cross_harness_delegation_disabled");
     }
 
     let targetProfile;
@@ -308,21 +472,33 @@ export class Orchestrator {
       return { status: "failed", message: error instanceof Error ? error.message : String(error) };
     }
     if (targetProfile.runtime === parentTask.runtime) {
-      return { status: "denied", message: "cross_harness_delegation_required" };
+      return deniedDelegation("cross_harness_delegation_required");
     }
 
     const targetPolicy = this.requirePolicy(targetProfile.policyId);
+    const parentWorkspace = this.requireWorkspace(parentTask.workspaceId);
+    const inspectedParentWorkspace = {
+      ...parentWorkspace,
+      ...this.workspaceManager.inspectWorkspace(parentWorkspace),
+    };
+    const delegationPolicy = evaluateDelegationPolicy({
+      request: input,
+      parentPolicy,
+      targetPolicy,
+      parentWorkspace: inspectedParentWorkspace,
+    });
+    if (!delegationPolicy.allowed) {
+      return deniedDelegation(delegationPolicy.denialCode, delegationPolicy.message);
+    }
+
     const nextDepth = nextDelegationDepth(parentTask.delegationDepth);
     if (exceedsDelegationDepth(parentTask.delegationDepth, parentPolicy.maxDepth) || exceedsDelegationDepth(parentTask.delegationDepth, targetPolicy.maxDepth)) {
-      return { status: "max_depth", message: "max_depth" };
-    }
-    if (targetPolicy.permissionMode !== "read-only" || targetPolicy.sandboxMode !== "read-only" || targetPolicy.networkAllowed) {
-      return { status: "denied", message: "target_profile_not_readonly" };
+      return { status: "max_depth", denialCode: "max_depth", message: "max_depth" };
     }
 
     const lineage = this.getTaskLineage(parentTask);
     if (wouldCreateDelegationCycle(lineage, targetProfile)) {
-      return { status: "cycle_detected", message: "cycle_detected" };
+      return { status: "cycle_detected", denialCode: "cycle_detected", message: "cycle_detected" };
     }
 
     if (input.references && input.references.length > 0) {
@@ -333,7 +509,7 @@ export class Orchestrator {
         references: input.references,
       });
       if (denied) {
-        return { status: "denied", message: denied };
+        return deniedDelegation(denied);
       }
     }
 
@@ -368,13 +544,13 @@ export class Orchestrator {
     const childWorkspacePlan = this.workspaceManager.resolveWorkspacePlan({
       taskKind: "child",
       cwd: parentTask.cwd,
-      parentWorkspace: this.requireWorkspace(parentTask.workspaceId),
-      requestedWorkspaceMode: input.workspaceMode,
+      parentWorkspace: inspectedParentWorkspace,
+      requestedWorkspaceMode: delegationPolicy.workspaceMode,
     });
     const workspace = this.workspaceManager.createChildWorkspace({
       taskId: childTaskId,
       cwd: parentTask.cwd,
-      parentWorkspace: this.requireWorkspace(parentTask.workspaceId),
+      parentWorkspace: inspectedParentWorkspace,
       plan: childWorkspacePlan,
       createdAt: now,
     });
@@ -383,7 +559,7 @@ export class Orchestrator {
       name: `${input.taskType}:${targetProfile.runtime}`,
       profileId: targetProfile.id,
       runtime: targetProfile.runtime,
-      cwd: parentTask.cwd,
+      cwd: workspace.path,
       workspaceId: workspace.id,
       parentTaskId: parentTask.id,
       delegationDepth: nextDepth,
@@ -659,7 +835,7 @@ export class Orchestrator {
   async replayAndSubscribe(input: {
     taskId?: string | undefined;
     sinceId?: number | undefined;
-    listener: (event: AgentEvent) => void;
+    listener: (event: AgentEvent, metadata: { id?: number | undefined; durable: boolean }) => void;
   }): Promise<{ unsubscribe: () => void; lastReplayedId: number }> {
     await this.eventStore.flush();
     let cursor = input.sinceId ?? 0;
@@ -670,7 +846,7 @@ export class Orchestrator {
         break;
       }
       for (const row of batch) {
-        input.listener(row.payload as AgentEvent);
+        input.listener(row.payload as AgentEvent, { id: row.id, durable: true });
         cursor = row.id;
       }
     }
@@ -679,7 +855,7 @@ export class Orchestrator {
       if (input.taskId && event.taskId !== input.taskId) {
         return;
       }
-      input.listener(event);
+      input.listener(event, { durable: false });
     });
 
     return { unsubscribe, lastReplayedId: cursor };
@@ -716,6 +892,64 @@ export class Orchestrator {
       throw new Error(`Unknown workspace: ${workspaceId}`);
     }
     return workspace;
+  }
+
+  private requireParentWorkspace(workspace: Workspace): Workspace {
+    if (!workspace.parentWorkspaceId) {
+      throw new Error("workspace_not_mergeable:missing_parent");
+    }
+    return this.requireWorkspace(workspace.parentWorkspaceId);
+  }
+
+  private assertWorkspaceMergeable(workspace: Workspace, parentWorkspace: Workspace, allowFailedRetry = false): void {
+    if (!workspace.parentWorkspaceId) {
+      throw new Error("workspace_not_mergeable:top_level");
+    }
+    if (!workspace.baseRef) {
+      throw new Error("workspace_not_mergeable:missing_base_ref");
+    }
+    const allowedStatuses: Workspace["status"][] = allowFailedRetry
+      ? ["merge_requested", "merge_failed"]
+      : ["active", "merge_failed"];
+    if (!allowedStatuses.includes(workspace.status)) {
+      throw new Error("workspace_not_mergeable:invalid_status");
+    }
+    if (!parentWorkspace.repoRoot || !workspace.repoRoot) {
+      throw new Error("workspace_not_mergeable:not_git");
+    }
+  }
+
+  private async recordWorkspaceMergeFailure(
+    task: Task,
+    workspace: Workspace,
+    changes: WorkspaceMergeResult["changes"],
+    parentAdvanced: boolean,
+    error: WorkspaceMergeError,
+  ): Promise<WorkspaceMergeResult> {
+    const failedAt = new Date().toISOString();
+    const storedError: WorkspaceMergeError = { ...error, changes };
+    this.db.updateWorkspaceLifecycle({
+      workspaceId: workspace.id,
+      status: "merge_failed",
+      mergeError: storedError,
+    });
+    await this.emitEvent({
+      type: "workspace.merge_failed",
+      taskId: task.id,
+      workspaceId: workspace.id,
+      error: storedError,
+      ts: failedAt,
+    });
+    return {
+      taskId: task.id,
+      workspaceId: workspace.id,
+      status: "merge_failed",
+      parentAdvanced,
+      parentHead: error.parentHead,
+      childHead: error.childHead,
+      changes,
+      error: storedError,
+    };
   }
 
   private getTaskLineage(task: Task): Task[] {
@@ -1129,6 +1363,14 @@ async function waitForCompletion(run: Promise<void>, timeoutMs: number): Promise
       clearTimeout(timer);
     }
   }
+}
+
+function deniedDelegation(denialCode: string, message = denialCode): DelegateToResult {
+  return {
+    status: "denied",
+    denialCode,
+    message,
+  };
 }
 
 function toArtifactRefs(artifacts: StoredArtifact[]): ArtifactRef[] {

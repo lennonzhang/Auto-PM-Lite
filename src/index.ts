@@ -2,10 +2,10 @@
 
 import process from "node:process";
 import { Command } from "commander";
-import { defaultConfigPath, loadConfig } from "./core/config.js";
-import { openOrchestrator } from "./app.js";
+import { defaultConfigPath } from "./core/config.js";
+import { openAppServices } from "./service/app-services.js";
 import { runStdioMcpServer } from "./mcp/stdio-server.js";
-import { categorizeApproval } from "./core/types.js";
+import { toErrorEnvelope } from "./api/types.js";
 
 const program = new Command();
 
@@ -19,17 +19,27 @@ program
   .description("Load and print config metadata")
   .option("-c, --config <path>", "Path to config TOML", defaultConfigPath())
   .action(async ({ config }) => {
-    const loaded = await loadConfig(config);
-    const summary = {
-      accounts: Object.keys(loaded.accounts),
-      policies: Object.keys(loaded.policies),
-      profiles: Object.keys(loaded.profiles),
-      storage: loaded.storage,
-      workspace: loaded.workspace,
-      transcript: loaded.transcript,
-    };
+    const services = await openAppServices(config);
 
-    process.stdout.write(`${JSON.stringify(summary, null, 2)}\n`);
+    try {
+      process.stdout.write(`${JSON.stringify(services.config.getMetadata(), null, 2)}\n`);
+    } finally {
+      await services.close();
+    }
+  });
+
+program
+  .command("runtime:health")
+  .description("Print static runtime health metadata")
+  .option("-c, --config <path>", "Path to config TOML", defaultConfigPath())
+  .action(async ({ config }) => {
+    const services = await openAppServices(config);
+
+    try {
+      process.stdout.write(`${JSON.stringify(services.runtime.getHealth(), null, 2)}\n`);
+    } finally {
+      await services.close();
+    }
   });
 
 program
@@ -40,10 +50,10 @@ program
   .option("--cwd <path>", "Task working directory", process.cwd())
   .option("-n, --name <name>", "Optional task name")
   .action(async ({ config, cwd, name, profile }) => {
-    const orchestrator = await openOrchestrator(config);
+    const services = await openAppServices(config);
 
     try {
-      const task = await orchestrator.createTask({
+      const task = await services.tasks.createTask({
         profileId: profile,
         cwd,
         name,
@@ -51,7 +61,7 @@ program
 
       process.stdout.write(`${JSON.stringify(task, null, 2)}\n`);
     } finally {
-      await orchestrator.close();
+      await services.close();
     }
   });
 
@@ -60,12 +70,12 @@ program
   .description("List persisted tasks")
   .option("-c, --config <path>", "Path to config TOML", defaultConfigPath())
   .action(async ({ config }) => {
-    const orchestrator = await openOrchestrator(config);
+    const services = await openAppServices(config);
 
     try {
-      process.stdout.write(`${JSON.stringify(orchestrator.listTasks(), null, 2)}\n`);
+      process.stdout.write(`${JSON.stringify(services.tasks.listTasks(), null, 2)}\n`);
     } finally {
-      await orchestrator.close();
+      await services.close();
     }
   });
 
@@ -75,12 +85,12 @@ program
   .requiredOption("-t, --task <id>", "Task ID")
   .option("-c, --config <path>", "Path to config TOML", defaultConfigPath())
   .action(async ({ config, task }) => {
-    const orchestrator = await openOrchestrator(config);
+    const services = await openAppServices(config);
 
     try {
-      process.stdout.write(`${JSON.stringify(orchestrator.getTask(task), null, 2)}\n`);
+      process.stdout.write(`${JSON.stringify(services.tasks.getTask(task), null, 2)}\n`);
     } finally {
-      await orchestrator.close();
+      await services.close();
     }
   });
 
@@ -90,12 +100,12 @@ program
   .requiredOption("-t, --task <id>", "Task ID")
   .option("-c, --config <path>", "Path to config TOML", defaultConfigPath())
   .action(async ({ config, task }) => {
-    const orchestrator = await openOrchestrator(config);
+    const services = await openAppServices(config);
 
     try {
-      process.stdout.write(`${JSON.stringify(orchestrator.listTurns(task), null, 2)}\n`);
+      process.stdout.write(`${JSON.stringify(services.tasks.listTurns(task), null, 2)}\n`);
     } finally {
-      await orchestrator.close();
+      await services.close();
     }
   });
 
@@ -105,12 +115,92 @@ program
   .requiredOption("-t, --task <id>", "Task ID")
   .option("-c, --config <path>", "Path to config TOML", defaultConfigPath())
   .action(async ({ config, task }) => {
-    const orchestrator = await openOrchestrator(config);
+    const services = await openAppServices(config);
 
     try {
-      process.stdout.write(`${JSON.stringify(orchestrator.listArtifacts(task), null, 2)}\n`);
+      process.stdout.write(`${JSON.stringify(services.tasks.listArtifacts(task), null, 2)}\n`);
     } finally {
-      await orchestrator.close();
+      await services.close();
+    }
+  });
+
+program
+  .command("workspace:changes")
+  .description("List file changes for a task workspace")
+  .requiredOption("-t, --task <id>", "Task ID")
+  .option("-c, --config <path>", "Path to config TOML", defaultConfigPath())
+  .action(async ({ config, task }) => {
+    const services = await openAppServices(config);
+
+    try {
+      process.stdout.write(`${JSON.stringify(services.workspaces.listChanges(task), null, 2)}\n`);
+    } finally {
+      await services.close();
+    }
+  });
+
+program
+  .command("workspace:diff")
+  .description("Get a redacted git diff for a task workspace")
+  .requiredOption("-t, --task <id>", "Task ID")
+  .option("-c, --config <path>", "Path to config TOML", defaultConfigPath())
+  .action(async ({ config, task }) => {
+    const services = await openAppServices(config);
+
+    try {
+      process.stdout.write(`${JSON.stringify(services.workspaces.getDiff(task), null, 2)}\n`);
+    } finally {
+      await services.close();
+    }
+  });
+
+program
+  .command("workspace:merge-request")
+  .description("Request approval to merge a child workspace back to its parent")
+  .requiredOption("-t, --task <id>", "Task ID")
+  .requiredOption("-r, --reason <text>", "Merge reason")
+  .option("-c, --config <path>", "Path to config TOML", defaultConfigPath())
+  .action(async ({ config, reason, task }) => {
+    const services = await openAppServices(config);
+
+    try {
+      const result = await services.workspaces.requestMerge({ taskId: task, reason });
+      process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
+    } finally {
+      await services.close();
+    }
+  });
+
+program
+  .command("workspace:merge-apply")
+  .description("Apply an approved child workspace merge")
+  .requiredOption("-t, --task <id>", "Task ID")
+  .requiredOption("-a, --approval <id>", "Approved workspace_merge approval ID")
+  .option("-c, --config <path>", "Path to config TOML", defaultConfigPath())
+  .action(async ({ approval, config, task }) => {
+    const services = await openAppServices(config);
+
+    try {
+      const result = await services.workspaces.applyMerge({ taskId: task, approvalId: approval });
+      process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
+    } finally {
+      await services.close();
+    }
+  });
+
+program
+  .command("workspace:discard")
+  .description("Discard a child workspace")
+  .requiredOption("-t, --task <id>", "Task ID")
+  .option("-c, --config <path>", "Path to config TOML", defaultConfigPath())
+  .action(async ({ config, task }) => {
+    const services = await openAppServices(config);
+
+    try {
+      const result = await services.workspaces.discard(task);
+      process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
+    } finally {
+      await services.close();
     }
   });
 
@@ -121,17 +211,14 @@ program
   .option("--category <category>", "Filter by category: tool_approval | privilege_escalation | clarification | capability_request")
   .option("-c, --config <path>", "Path to config TOML", defaultConfigPath())
   .action(async ({ category, config, task }) => {
-    const orchestrator = await openOrchestrator(config);
+    const services = await openAppServices(config);
 
     try {
-      const annotated = orchestrator.listApprovals(task).map((approval) => ({
-        ...approval,
-        category: categorizeApproval(approval.kind),
-      }));
+      const annotated = services.approvals.listApprovals(task);
       const filtered = category ? annotated.filter((entry) => entry.category === category) : annotated;
       process.stdout.write(`${JSON.stringify(filtered, null, 2)}\n`);
     } finally {
-      await orchestrator.close();
+      await services.close();
     }
   });
 
@@ -143,17 +230,17 @@ program
   .option("-r, --reason <text>", "Optional resolution reason")
   .option("-c, --config <path>", "Path to config TOML", defaultConfigPath())
   .action(async ({ approval, config, decision, reason }) => {
-    const orchestrator = await openOrchestrator(config);
+    const services = await openAppServices(config);
 
     try {
-      await orchestrator.resolveApproval({
+      const result = await services.approvals.resolveApproval({
         approvalId: approval,
         approved: decision === "approved",
         reason,
       });
-      process.stdout.write(`${JSON.stringify({ ok: true, approvalId: approval, decision }, null, 2)}\n`);
+      process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
     } finally {
-      await orchestrator.close();
+      await services.close();
     }
   });
 
@@ -164,12 +251,12 @@ program
   .requiredOption("-r, --requester <id>", "Requester task ID")
   .option("-c, --config <path>", "Path to config TOML", defaultConfigPath())
   .action(async ({ config, requester, task }) => {
-    const orchestrator = await openOrchestrator(config);
+    const services = await openAppServices(config);
 
     try {
-      process.stdout.write(`${JSON.stringify(orchestrator.getTaskResult(requester, task), null, 2)}\n`);
+      process.stdout.write(`${JSON.stringify(services.tasks.getTaskResult(requester, task), null, 2)}\n`);
     } finally {
-      await orchestrator.close();
+      await services.close();
     }
   });
 
@@ -180,16 +267,16 @@ program
   .requiredOption("-m, --message <prompt>", "Prompt to send to the runtime")
   .option("-c, --config <path>", "Path to config TOML", defaultConfigPath())
   .action(async ({ config, message, task }) => {
-    const orchestrator = await openOrchestrator(config);
+    const services = await openAppServices(config);
 
     try {
-      await orchestrator.runTask({
+      const result = await services.tasks.runTask({
         taskId: task,
         prompt: message,
       });
-      process.stdout.write(`${JSON.stringify({ ok: true, taskId: task }, null, 2)}\n`);
+      process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
     } finally {
-      await orchestrator.close();
+      await services.close();
     }
   });
 
@@ -200,16 +287,16 @@ program
   .option("-m, --message <prompt>", "Optional prompt override")
   .option("-c, --config <path>", "Path to config TOML", defaultConfigPath())
   .action(async ({ config, message, task }) => {
-    const orchestrator = await openOrchestrator(config);
+    const services = await openAppServices(config);
 
     try {
-      await orchestrator.resumeTask({
+      const result = await services.tasks.resumeTask({
         taskId: task,
         prompt: message,
       });
-      process.stdout.write(`${JSON.stringify({ ok: true, taskId: task, resumed: true }, null, 2)}\n`);
+      process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
     } finally {
-      await orchestrator.close();
+      await services.close();
     }
   });
 
@@ -219,13 +306,13 @@ program
   .requiredOption("-t, --task <id>", "Task ID")
   .option("-c, --config <path>", "Path to config TOML", defaultConfigPath())
   .action(async ({ config, task }) => {
-    const orchestrator = await openOrchestrator(config);
+    const services = await openAppServices(config);
 
     try {
-      await orchestrator.cancelTask(task);
-      process.stdout.write(`${JSON.stringify({ ok: true, taskId: task, cancelled: true }, null, 2)}\n`);
+      const result = await services.tasks.cancelTask(task);
+      process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
     } finally {
-      await orchestrator.close();
+      await services.close();
     }
   });
 
@@ -246,22 +333,22 @@ program
   .option("--since-id <number>", "Resume after a given event id (defaults to 0 = full history)")
   .option("--no-replay", "Skip historical replay and only stream live events")
   .action(async ({ config, task, sinceId, replay }) => {
-    const orchestrator = await openOrchestrator(config);
+    const services = await openAppServices(config);
 
     try {
       const writer = (event: unknown) => process.stdout.write(`${JSON.stringify(event)}\n`);
       let unsubscribe: () => void;
 
       if (replay !== false) {
-        const result = await orchestrator.replayAndSubscribe({
+        const result = await services.events.replayAndSubscribe({
           taskId: task,
           sinceId: sinceId ? Number(sinceId) : undefined,
           listener: writer,
         });
         unsubscribe = result.unsubscribe;
       } else {
-        unsubscribe = orchestrator.subscribeToEvents((event) => {
-          if (!task || event.taskId === task) {
+        unsubscribe = services.events.subscribe((event) => {
+          if (!task || event.event.taskId === task) {
             writer(event);
           }
         });
@@ -269,18 +356,17 @@ program
 
       process.on("SIGINT", () => {
         unsubscribe();
-        orchestrator.close().then(() => process.exit(0));
+        services.close().then(() => process.exit(0));
       });
 
       await new Promise(() => {});
     } catch (error) {
-      await orchestrator.close();
+      await services.close();
       throw error;
     }
   });
 
 program.parseAsync(process.argv).catch((error: unknown) => {
-  const message = error instanceof Error ? error.message : String(error);
-  process.stderr.write(`${message}\n`);
+  process.stderr.write(`${JSON.stringify(toErrorEnvelope(error), null, 2)}\n`);
   process.exitCode = 1;
 });
