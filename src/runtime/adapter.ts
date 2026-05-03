@@ -31,6 +31,7 @@ export interface RuntimeAdapter {
   startTask(input: StartRuntimeTaskInput): Promise<RuntimeTaskHandle>;
   runTurn(input: RunTurnInput): AsyncIterable<AgentEvent>;
   resumeTask(input: ResumeRuntimeTaskInput): Promise<RuntimeTaskHandle>;
+  pauseTask(taskId: string): Promise<void>;
   cancelTask(taskId: string): Promise<void>;
   closeTask(taskId: string): Promise<void>;
 }

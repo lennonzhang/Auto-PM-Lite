@@ -1,6 +1,7 @@
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { describe, expect, it } from "vitest";
 import { ensureDefaultConfig } from "../../src/service/app-services.js";
 import { ipcChannels } from "../../src/desktop/shared/ipc.js";
@@ -29,21 +30,37 @@ describe("desktop foundation", () => {
     const config = await loadConfig(configPath);
     expect(config.policies.edit?.sandboxMode).toBe("workspace-write");
     expect(config.accounts.anthropic_env?.secretRef).toBe("env:ANTHROPIC_API_KEY");
+    expect(config.accounts.openai_env?.vendor).toBe("openai-compatible");
   });
 
   it("keeps IPC channels typed, supports replay subscriptions, and avoids raw secret/env channels", () => {
     expect(Object.values(ipcChannels)).toEqual(expect.arrayContaining([
       "config:get",
       "tasks:list",
+      "tasks:get",
+      "tasks:result",
       "tasks:run",
+      "tasks:pause",
       "runtime:health",
+      "runtime:probe-live",
       "workspace:diff",
+      "logs:open",
       "events:replay-subscribe",
       "events:unsubscribe",
       "events:push",
     ]));
     expect(Object.values(ipcChannels).some((channel) => channel.includes("secret"))).toBe(false);
     expect(Object.values(ipcChannels).some((channel) => channel.includes("env"))).toBe(false);
+  });
+
+  it("keeps desktop dev script launching the full Electron app", async () => {
+    const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..");
+    const manifest = JSON.parse(await fs.readFile(path.join(repoRoot, "package.json"), "utf8")) as {
+      scripts?: Record<string, string>;
+    };
+
+    expect(manifest.scripts?.["desktop:dev"]).toBe("tsx spikes/desktop-dev.ts");
+    expect(manifest.scripts?.["desktop:renderer:dev"]).toBe("vite --config src/desktop/renderer/vite.config.ts");
   });
 
   it("routes replay event IPC through service without exposing env or secrets", async () => {
@@ -55,7 +72,14 @@ describe("desktop foundation", () => {
       apiVersion: 1,
       accounts: ["anthropic_env"],
       policies: ["readonly"],
-      profiles: ["claude_readonly"],
+      profileIds: ["claude_readonly"],
+      profiles: [{
+        id: "claude_readonly",
+        runtime: "claude",
+        model: "claude-opus-4-7",
+        policyId: "readonly",
+        claudePermissionMode: "dontAsk",
+      }],
       storage: {
         dbPath: "D:/tmp/auto-pm-lite.db",
         busyTimeoutMs: 5000,
@@ -71,11 +95,23 @@ describe("desktop foundation", () => {
       },
       tasks: {
         listTasks: () => [],
+        getTask: () => {
+          throw new Error("not used");
+        },
+        getTaskResult: () => ({
+          taskId: "task-1",
+          status: "completed",
+          runtime: "claude",
+          profileId: "claude_readonly",
+          artifacts: [],
+          pendingApprovalIds: [],
+        }),
         createTask: async () => {
           throw new Error("not used");
         },
         runTask: async () => ({ ok: true, taskId: "task-1" }),
         resumeTask: async () => ({ ok: true, taskId: "task-1", resumed: true }),
+        pauseTask: async () => ({ ok: true, taskId: "task-1", paused: true }),
         cancelTask: async () => ({ ok: true, taskId: "task-1", cancelled: true }),
       },
       approvals: {
@@ -94,7 +130,21 @@ describe("desktop foundation", () => {
         discard: async () => ({ ok: true }),
       },
       runtime: {
-        getHealth: () => [{ runtime: "claude", profiles: ["claude_readonly"], available: true }],
+        getHealth: () => [{
+          runtime: "claude",
+          profiles: ["claude_readonly"],
+          available: true,
+          staticChecks: [],
+          capabilityChecks: [],
+        }],
+        assertCanRunTask: () => {},
+        probeLive: async () => [{
+          runtime: "claude",
+          profiles: ["claude_readonly"],
+          available: true,
+          staticChecks: [],
+          capabilityChecks: [],
+        }],
       },
       events: {
         replayAndSubscribe: async (input: { listener: (event: EventEnvelope) => void }) => {
@@ -146,6 +196,10 @@ describe("desktop foundation", () => {
 
     const configResult = await handlers.get(ipcChannels.configGet)!(fakeEvent, undefined);
     expect(JSON.stringify(configResult)).not.toContain("API_KEY=");
+    const taskResult = await handlers.get(ipcChannels.tasksResult)!(fakeEvent, { requesterTaskId: "task-1", taskId: "task-1" });
+    expect(taskResult).toMatchObject({ taskId: "task-1", pendingApprovalIds: [] });
+    const probeResult = await handlers.get(ipcChannels.runtimeProbeLive)!(fakeEvent);
+    expect(probeResult).toHaveLength(1);
 
     await handlers.get(ipcChannels.eventsUnsubscribe)!(fakeEvent, 7);
     expect(unsubscribed).toBe(true);
@@ -174,6 +228,52 @@ describe("desktop foundation", () => {
     const result = await handlers.get(ipcChannels.configGet)!({} as IpcMainInvokeEvent);
     expect((result as ErrorEnvelope).apiVersion).toBe(1);
     expect((result as ErrorEnvelope).error.code).toBe("task_not_found");
+  });
+
+  it("registers a handler for every request channel", () => {
+    const handlers = new Map<string, Parameters<Pick<IpcMain, "handle">["handle"]>[1]>();
+    const services = {
+      config: { getMetadata: () => ({}) },
+      tasks: {
+        listTasks: () => [],
+        getTask: () => ({}),
+        getTaskResult: () => ({}),
+        createTask: async () => ({}),
+        runTask: async () => ({}),
+        resumeTask: async () => ({}),
+        pauseTask: async () => ({}),
+        cancelTask: async () => ({}),
+      },
+      approvals: {
+        listApprovals: () => [],
+        resolveApproval: async () => ({}),
+      },
+      workspaces: {
+        listChanges: () => [],
+        getDiff: () => ({}),
+        requestMerge: async () => ({}),
+        applyMerge: async () => ({}),
+        discard: async () => ({}),
+      },
+      runtime: { getHealth: () => [], assertCanRunTask: () => {}, probeLive: async () => [] },
+      events: {
+        replayAndSubscribe: async () => ({ lastReplayedId: 0, unsubscribe: () => {} }),
+      },
+      close: async () => {},
+    } as unknown as AppServices;
+
+    registerIpcHandlers({
+      handle: (channel, handler) => {
+        handlers.set(channel, handler);
+      },
+    }, {
+      getServices: async () => services,
+      getNextSubscriptionId: () => 1,
+      getLogDir: () => "D:/tmp/logs",
+    });
+
+    const requestChannels = Object.values(ipcChannels).filter((channel) => channel !== ipcChannels.eventsPush);
+    expect(Array.from(handlers.keys()).sort()).toEqual(requestChannels.sort());
   });
 
   it("cleans up replay subscriptions when renderer webContents is destroyed", async () => {
@@ -232,7 +332,7 @@ describe("desktop foundation", () => {
     expect(unsubscribeCount).toBe(2);
   });
 
-  it("keeps active runtime jobs running when renderer subscriptions are destroyed", async () => {
+  it("accepts runtime jobs without waiting for completion and keeps them running after renderer destruction", async () => {
     const handlers = new Map<string, Parameters<Pick<IpcMain, "handle">["handle"]>[1]>();
     const destroyedListeners: Array<() => void> = [];
     let jobCompleted = false;
@@ -246,6 +346,9 @@ describe("desktop foundation", () => {
     const services = {
       tasks: {
         runTask: async () => runningJob,
+      },
+      runtime: {
+        assertCanRunTask: () => {},
       },
       events: {
         replayAndSubscribe: async () => ({
@@ -284,9 +387,55 @@ describe("desktop foundation", () => {
     await handlers.get(ipcChannels.eventsReplaySubscribe)!(fakeEvent, {});
     destroyedListeners[0]!();
 
-    await expect(runPromise).resolves.toEqual({ ok: true, taskId: "task-1" });
+    const accepted = await runPromise;
+    expect(accepted).toMatchObject({ ok: true, accepted: true, taskId: "task-1", action: "run" });
+    expect(jobCompleted).toBe(false);
     expect(unsubscribed).toBe(true);
+    await runningJob;
     expect(jobCompleted).toBe(true);
+  });
+
+  it("accepts pause actions through the desktop job runner", async () => {
+    const handlers = new Map<string, Parameters<Pick<IpcMain, "handle">["handle"]>[1]>();
+    let paused = false;
+    const services = {
+      tasks: {
+        pauseTask: async () => {
+          paused = true;
+          return { ok: true, taskId: "task-1", paused: true };
+        },
+      },
+      close: async () => {},
+    } as unknown as AppServices;
+
+    registerIpcHandlers({
+      handle: (channel, handler) => {
+        handlers.set(channel, handler);
+      },
+    }, {
+      getServices: async () => services,
+      getNextSubscriptionId: () => 1,
+    });
+
+    const accepted = await handlers.get(ipcChannels.tasksPause)!({} as IpcMainInvokeEvent, "task-1");
+    expect(accepted).toMatchObject({ ok: true, accepted: true, taskId: "task-1", action: "pause" });
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(paused).toBe(true);
+  });
+
+  it("keeps renderer source isolated from Node, Electron, services, and runtime imports", async () => {
+    const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..", "..");
+    const rendererRoot = path.join(repoRoot, "src", "desktop", "renderer", "src");
+    const files = await fs.readdir(rendererRoot);
+    const source = await Promise.all(files.filter((file) => file.endsWith(".ts") || file.endsWith(".tsx")).map(async (file) => ({
+      file,
+      text: await fs.readFile(path.join(rendererRoot, file), "utf8"),
+    })));
+
+    for (const entry of source) {
+      expect(entry.text, entry.file).not.toMatch(/from ["'](?:node:|electron|fs|path|child_process)/);
+      expect(entry.text, entry.file).not.toMatch(/from ["'].*(?:service|runtime|storage|orchestrator)\//);
+    }
   });
 
   it("initializes desktop log paths under userData", async () => {
@@ -301,6 +450,8 @@ describe("desktop foundation", () => {
 
     expect(paths).toEqual(resolveDesktopLogPaths(root));
     expect(configuredLogPath).toBe(paths.logDir);
+    expect(paths.runtimeLogPath).toBe(path.join(paths.logDir, "runtime.log"));
+    expect(paths.auditLogPath).toBe(path.join(paths.logDir, "audit.log"));
     expect(await fs.readFile(paths.mainLogPath, "utf8")).toContain("desktop.logging_initialized");
   });
 });

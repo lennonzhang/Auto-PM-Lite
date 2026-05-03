@@ -11,6 +11,9 @@ export type VendorKind =
 
 export type PermissionMode = "read-only" | "edit" | "full";
 export type SandboxMode = "read-only" | "workspace-write" | "danger-full-access";
+export type ClaudePermissionMode = "default" | "acceptEdits" | "bypassPermissions" | "plan" | "dontAsk" | "auto";
+export type CodexSandboxMode = "read-only" | "workspace-write" | "danger-full-access";
+export type CodexApprovalPolicy = "never" | "on-request" | "on-failure" | "untrusted";
 export type ApprovalKind =
   | "shell"
   | "file_edit"
@@ -84,9 +87,8 @@ export interface Policy {
   unsafeDirectCwd?: boolean | undefined;
 }
 
-export interface Profile {
+interface BaseProfile {
   id: string;
-  runtime: RuntimeKind;
   accountId: string;
   policyId: string;
   model: string;
@@ -94,6 +96,20 @@ export interface Profile {
   systemPromptOverride?: string | undefined;
   tags?: string[] | undefined;
 }
+
+export interface ClaudeProfile extends BaseProfile {
+  runtime: "claude";
+  claudePermissionMode: ClaudePermissionMode;
+}
+
+export interface CodexProfile extends BaseProfile {
+  runtime: "codex";
+  codexSandboxMode: CodexSandboxMode;
+  codexApprovalPolicy: CodexApprovalPolicy;
+  codexNetworkAccessEnabled: boolean;
+}
+
+export type Profile = ClaudeProfile | CodexProfile;
 
 export interface BudgetSnapshot {
   maxTokens?: number | undefined;
@@ -106,6 +122,7 @@ export interface BudgetSnapshot {
 export type TaskStatus =
   | "queued"
   | "running"
+  | "paused"
   | "awaiting_approval"
   | "interrupted"
   | "reconcile_required"
@@ -202,7 +219,7 @@ export interface TurnRecord {
   promptRedacted: string;
   promptRawEncrypted?: string | undefined;
   promptRawTtlAt?: string | undefined;
-  status: "running" | "completed" | "failed";
+  status: "running" | "paused" | "completed" | "failed";
   usage?: TurnUsage | undefined;
   startedAt: string;
   completedAt?: string | undefined;
@@ -275,8 +292,9 @@ export type AgentEvent =
   | { type: "budget.warning"; taskId: string; message: string; ts: string }
   | { type: "budget.exceeded"; taskId: string; message: string; ts: string }
   | { type: "task.completed"; taskId: string; summary: string; ts: string }
-  | { type: "task.interrupted"; taskId: string; error: string; ts: string }
-  | { type: "task.failed"; taskId: string; error: string; ts: string }
+  | { type: "task.paused"; taskId: string; ts: string }
+  | { type: "task.interrupted"; taskId: string; error: string; code?: string | undefined; details?: unknown | undefined; action?: string | undefined; ts: string }
+  | { type: "task.failed"; taskId: string; error: string; code?: string | undefined; details?: unknown | undefined; action?: string | undefined; ts: string }
   | { type: "task.cancelled"; taskId: string; ts: string };
 
 export interface AppConfig {

@@ -145,6 +145,12 @@ export class AppDatabase {
           config_json: JSON.stringify({
             systemPromptOverride: profile.systemPromptOverride,
             tags: profile.tags ?? [],
+            ...(profile.runtime === "claude" ? { claudePermissionMode: profile.claudePermissionMode } : {}),
+            ...(profile.runtime === "codex" ? {
+              codexSandboxMode: profile.codexSandboxMode,
+              codexApprovalPolicy: profile.codexApprovalPolicy,
+              codexNetworkAccessEnabled: profile.codexNetworkAccessEnabled,
+            } : {}),
           }),
           updated_at: updatedAt,
         });
@@ -223,10 +229,13 @@ export class AppDatabase {
     runtime: string;
     status: string;
     cwd: string;
+    parentTaskId?: string | undefined;
+    delegationDepth: number;
+    triggeredBy: string;
     createdAt: string;
   }> {
     const rows = this.db.prepare(`
-      SELECT id, name, profile_id, runtime, status, cwd, created_at
+      SELECT id, name, profile_id, runtime, parent_task_id, delegation_depth, status, cwd, triggered_by, created_at
       FROM tasks
       ORDER BY created_at DESC
     `).all() as Array<Record<string, unknown>>;
@@ -238,8 +247,24 @@ export class AppDatabase {
       runtime: String(row.runtime),
       status: String(row.status),
       cwd: String(row.cwd),
+      ...(row.parent_task_id === null ? {} : { parentTaskId: String(row.parent_task_id) }),
+      delegationDepth: Number(row.delegation_depth),
+      triggeredBy: String(row.triggered_by),
       createdAt: String(row.created_at),
     }));
+  }
+
+  listTasksByStatus(status: TaskStatus): StoredTask[] {
+    const rows = this.db.prepare(`
+      SELECT id
+      FROM tasks
+      WHERE status = ?
+      ORDER BY updated_at ASC
+    `).all(status) as Array<{ id: string }>;
+
+    return rows
+      .map((row) => this.getTask(row.id))
+      .filter((task): task is StoredTask => Boolean(task));
   }
 
   getTask(taskId: string): StoredTask | null {

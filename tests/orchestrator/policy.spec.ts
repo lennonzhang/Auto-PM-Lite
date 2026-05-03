@@ -1,7 +1,7 @@
 import { describe, expect, it } from "vitest";
 import { sanitizeEnvKey } from "../../src/core/credentials.js";
 import { canAccessReference, parseTaskReference } from "../../src/core/reference.js";
-import { allowedClaudeTools, canExpandReference, mapClaudePermissionMode } from "../../src/orchestrator/policy.js";
+import { allowedClaudeTools, canExpandReference } from "../../src/orchestrator/policy.js";
 import type { Policy } from "../../src/core/types.js";
 
 const basePolicy: Policy = {
@@ -18,14 +18,12 @@ const basePolicy: Policy = {
 };
 
 describe("policy", () => {
-  it("maps read-only Claude mode to dontAsk with static tool allowlist", () => {
-    expect(mapClaudePermissionMode(basePolicy)).toBe("dontAsk");
+  it("uses a static read-only Claude tool allowlist for read-only policy", () => {
     expect(allowedClaudeTools(basePolicy)).toEqual(["Read", "Glob", "Grep"]);
   });
 
-  it("maps editable Claude mode to default without static allowlist", () => {
+  it("does not use a static Claude tool allowlist for editable policy", () => {
     const policy: Policy = { ...basePolicy, permissionMode: "edit" };
-    expect(mapClaudePermissionMode(policy)).toBe("default");
     expect(allowedClaudeTools(policy)).toBeUndefined();
   });
 

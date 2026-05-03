@@ -22,6 +22,9 @@ const codexProfile: Profile = {
   accountId: "openai_personal",
   policyId: "readonly_policy",
   model: "gpt-5-codex",
+  codexSandboxMode: "read-only",
+  codexApprovalPolicy: "on-request",
+  codexNetworkAccessEnabled: false,
 };
 
 const config: AppConfig = {

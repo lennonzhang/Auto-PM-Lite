@@ -55,6 +55,10 @@ class FakeRuntimeAdapter implements RuntimeAdapter {
     this.cancelCalls += 1;
   }
 
+  async pauseTask(_taskId: string): Promise<void> {
+    this.cancelCalls += 1;
+  }
+
   async closeTask(_taskId: string): Promise<void> {}
 }
 
@@ -103,6 +107,9 @@ runtime = "codex"
 account = "openai_main"
 policy = "readonly"
 model = "gpt-5-codex"
+codex_sandbox_mode = "read-only"
+codex_approval_policy = "on-request"
+codex_network_access_enabled = false
 `, "utf8");
 
     const config = await loadConfig(configPath);
@@ -151,6 +158,7 @@ runtime = "claude"
 accountId = "anthropic_personal"
 policyId = "local_readonly"
 model = "claude-opus-4-7"
+claude_permission_mode = "dontAsk"
 `, "utf8");
 
     const config = await loadConfig(configPath);
@@ -207,6 +215,7 @@ runtime = "claude"
 accountId = "anthropic_personal"
 policyId = "local_readonly"
 model = "claude-opus-4-7"
+claude_permission_mode = "dontAsk"
 `, "utf8");
 
     const config = await loadConfig(configPath);
@@ -299,6 +308,7 @@ runtime = "claude"
 accountId = "anthropic_personal"
 policyId = "local_readonly"
 model = "claude-opus-4-7"
+claude_permission_mode = "dontAsk"
 `, "utf8");
 
     const config = await loadConfig(configPath);
@@ -402,12 +412,16 @@ runtime = "claude"
 accountId = "anthropic_personal"
 policyId = "delegating_readonly"
 model = "claude-opus-4-7"
+claude_permission_mode = "dontAsk"
 
 [profile.codex_child]
 runtime = "codex"
 accountId = "openai_personal"
 policyId = "child_readonly"
 model = "gpt-5-codex"
+codex_sandbox_mode = "read-only"
+codex_approval_policy = "on-request"
+codex_network_access_enabled = false
 `, "utf8");
 
     const config = await loadConfig(configPath);
@@ -513,12 +527,16 @@ runtime = "claude"
 accountId = "anthropic_personal"
 policyId = "parent"
 model = "claude-opus-4-7"
+claude_permission_mode = "dontAsk"
 
 [profile.codex_child]
 runtime = "codex"
 accountId = "openai_personal"
 policyId = "child"
 model = "gpt-5-codex"
+codex_sandbox_mode = "read-only"
+codex_approval_policy = "on-request"
+codex_network_access_enabled = false
 `, "utf8");
 
     const config = await loadConfig(configPath);
@@ -591,12 +609,16 @@ runtime = "claude"
 accountId = "anthropic_personal"
 policyId = "readonly"
 model = "claude-opus-4-7"
+claude_permission_mode = "dontAsk"
 
 [profile.codex_child]
 runtime = "codex"
 accountId = "openai_personal"
 policyId = "readonly"
 model = "gpt-5-codex"
+codex_sandbox_mode = "read-only"
+codex_approval_policy = "on-request"
+codex_network_access_enabled = false
 `, "utf8");
 
     const config = await loadConfig(configPath);
@@ -686,12 +708,16 @@ runtime = "claude"
 accountId = "anthropic_personal"
 policyId = "strict_parent"
 model = "claude-opus-4-7"
+claude_permission_mode = "dontAsk"
 
 [profile.codex_child]
 runtime = "codex"
 accountId = "openai_personal"
 policyId = "strict_child"
 model = "gpt-5-codex"
+codex_sandbox_mode = "read-only"
+codex_approval_policy = "on-request"
+codex_network_access_enabled = false
 `, "utf8");
 
     const config = await loadConfig(configPath);
@@ -780,6 +806,7 @@ runtime = "claude"
 accountId = "anthropic_personal"
 policyId = "delegating_readonly"
 model = "claude-opus-4-7"
+claude_permission_mode = "dontAsk"
 `, "utf8");
 
     const config = await loadConfig(configPath);

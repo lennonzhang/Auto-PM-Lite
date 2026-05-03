@@ -4,5 +4,8 @@
       "Bash(pnpm test)",
       "Bash(pnpm typecheck)"
     ]
+  },
+  "enabledPlugins": {
+    "frontend-design@claude-plugins-official": true
   }
 }

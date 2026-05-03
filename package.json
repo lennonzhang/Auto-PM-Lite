@@ -15,8 +15,11 @@
     "test": "vitest run",
     "test:watch": "vitest",
     "desktop:build": "vite build --config src/desktop/renderer/vite.config.ts && tsup --config tsup.desktop.config.ts",
-    "desktop:dev": "vite --config src/desktop/renderer/vite.config.ts",
-    "desktop:smoke": "tsx spikes/desktop-smoke.ts",
+    "desktop:dev": "tsx spikes/desktop-dev.ts",
+    "desktop:renderer:dev": "vite --config src/desktop/renderer/vite.config.ts",
+    "desktop:prepare-smoke": "tsx spikes/prepare-desktop-package-smoke.ts",
+    "desktop:package:portable": "pnpm run desktop:build && pnpm run desktop:prepare-smoke && tsx spikes/prepare-desktop-portable-smoke.ts",
+    "desktop:smoke": "pnpm run desktop:package:portable && tsx spikes/desktop-smoke.ts",
     "spike:claude:permissions": "tsx spikes/claude-permissions.ts",
     "spike:claude:mcp": "tsx spikes/claude-delegate-mcp.ts",
     "spike:codex:stream": "tsx spikes/codex-stream.ts",
@@ -28,9 +31,9 @@
     "node": ">=22.0.0"
   },
   "dependencies": {
-    "@anthropic-ai/claude-agent-sdk": "^0.1.12",
+    "@anthropic-ai/claude-agent-sdk": "^0.2.126",
     "@iarna/toml": "^2.2.5",
-    "@openai/codex-sdk": "^0.125.0",
+    "@openai/codex-sdk": "^0.128.0",
     "better-sqlite3": "^12.1.1",
     "commander": "^14.0.0",
     "pino": "^10.0.0",
@@ -39,6 +42,7 @@
     "zod": "^4.1.5"
   },
   "devDependencies": {
+    "@electron/rebuild": "^4.0.4",
     "@types/better-sqlite3": "^7.6.13",
     "@types/node": "^24.6.0",
     "@types/react": "^19.2.7",

@@ -2,6 +2,7 @@ import { tool } from "@anthropic-ai/claude-agent-sdk";
 import { z } from "zod";
 
 export interface McpToolResult {
+  [key: string]: unknown;
   content: Array<{
     type: "text";
     text: string;
