@@ -29,6 +29,7 @@ class FakeRuntime implements RuntimeAdapter {
     return { taskId: input.taskId, backendThreadId: input.backendThreadId };
   }
 
+  async pauseTask(_taskId: string): Promise<void> {}
   async cancelTask(_taskId: string): Promise<void> {}
   async closeTask(_taskId: string): Promise<void> {}
 }
@@ -555,6 +556,7 @@ async function buildEnv(options?: { initializeGit?: boolean; topLevelUseWorktree
         accountId: "anthropic",
         policyId: "parent_edit",
         model: "claude-opus-4-7",
+        claudePermissionMode: "dontAsk",
       },
       codex_child: {
         id: "codex_child",
@@ -562,6 +564,9 @@ async function buildEnv(options?: { initializeGit?: boolean; topLevelUseWorktree
         accountId: "openai",
         policyId: "child_edit",
         model: "gpt-5-codex",
+        codexSandboxMode: "workspace-write",
+        codexApprovalPolicy: "on-request",
+        codexNetworkAccessEnabled: false,
       },
       ...(options?.includeReadonlyCodex
         ? {
@@ -571,6 +576,9 @@ async function buildEnv(options?: { initializeGit?: boolean; topLevelUseWorktree
               accountId: "openai",
               policyId: "codex_readonly",
               model: "gpt-5-codex",
+              codexSandboxMode: "read-only" as const,
+              codexApprovalPolicy: "on-request" as const,
+              codexNetworkAccessEnabled: false,
             },
           }
         : {}),

@@ -20,6 +20,10 @@ export const resumeTaskRequestSchema = z.object({
   prompt: z.string().optional(),
 });
 
+export const pauseTaskRequestSchema = z.object({
+  taskId: taskIdSchema,
+});
+
 export const resolveApprovalRequestSchema = z.object({
   approvalId: z.string().min(1),
   approved: z.boolean(),
@@ -49,9 +53,17 @@ export const errorEnvelopeSchema = z.object({
       "task_not_found",
       "policy_denied",
       "approval_required",
+      "config_unavailable",
+      "storage_unavailable",
       "workspace_not_isolatable",
+      "workspace_unavailable",
       "workspace_not_mergeable",
       "merge_conflict",
+      "git_unavailable",
+      "mcp_unavailable",
+      "sdk_unavailable",
+      "logs_unavailable",
+      "runtime_probe_failed",
       "runtime_unavailable",
       "unknown_error",
     ]),
@@ -67,6 +79,9 @@ export const taskSummarySchema = z.object({
   runtime: z.string(),
   status: z.string(),
   cwd: z.string(),
+  parentTaskId: z.string().optional(),
+  delegationDepth: z.number().int().nonnegative(),
+  triggeredBy: z.string(),
   createdAt: z.string(),
 });
 
@@ -76,7 +91,7 @@ export const turnViewSchema = z.object({
   promptRedacted: z.string(),
   promptRawEncrypted: z.string().optional(),
   promptRawTtlAt: z.string().optional(),
-  status: z.enum(["running", "completed", "failed"]),
+  status: z.enum(["running", "paused", "completed", "failed"]),
   usage: z.object({
     inputTokens: z.number().optional(),
     outputTokens: z.number().optional(),
@@ -195,18 +210,67 @@ export const workspaceMergeResultSchema = z.object({
   error: workspaceMergeErrorSchema.optional(),
 });
 
+export const runtimeHealthCheckSchema = z.object({
+  id: z.string(),
+  label: z.string(),
+  status: z.enum(["ok", "warning", "error", "unknown"]),
+  message: z.string().optional(),
+  action: z.string().optional(),
+});
+
 export const runtimeHealthSchema = z.object({
   runtime: z.string(),
   available: z.boolean(),
   profiles: z.array(z.string()),
   message: z.string().optional(),
+  staticChecks: z.array(runtimeHealthCheckSchema),
+  capabilityChecks: z.array(runtimeHealthCheckSchema),
+});
+
+const configProfileMetadataSchema = z.discriminatedUnion("runtime", [
+  z.object({
+    id: z.string(),
+    runtime: z.literal("claude"),
+    model: z.string(),
+    policyId: z.string(),
+    claudePermissionMode: z.enum(["default", "acceptEdits", "bypassPermissions", "plan", "dontAsk", "auto"]),
+  }),
+  z.object({
+    id: z.string(),
+    runtime: z.literal("codex"),
+    model: z.string(),
+    policyId: z.string(),
+    codexSandboxMode: z.enum(["read-only", "workspace-write", "danger-full-access"]),
+    codexApprovalPolicy: z.enum(["never", "on-request", "on-failure", "untrusted"]),
+    codexNetworkAccessEnabled: z.boolean(),
+  }),
+]);
+
+export const taskActionAcceptedSchema = z.object({
+  ok: z.literal(true),
+  accepted: z.literal(true),
+  taskId: z.string(),
+  actionId: z.string(),
+  action: z.enum(["run", "resume", "pause"]),
+});
+
+export const taskResultViewSchema = z.object({
+  taskId: z.string(),
+  parentTaskId: z.string().optional(),
+  status: z.string(),
+  runtime: z.string(),
+  profileId: z.string(),
+  latestMessage: z.string().optional(),
+  artifacts: z.array(artifactViewSchema),
+  pendingApprovalIds: z.array(z.string()),
 });
 
 export const configMetadataSchema = z.object({
   apiVersion: apiVersionSchema,
   accounts: z.array(z.string()),
   policies: z.array(z.string()),
-  profiles: z.array(z.string()),
+  profileIds: z.array(z.string()),
+  profiles: z.array(configProfileMetadataSchema),
   storage: z.object({
     dbPath: z.string(),
     busyTimeoutMs: z.number(),
@@ -215,6 +279,7 @@ export const configMetadataSchema = z.object({
     rootDir: z.string(),
     topLevelUseWorktree: z.boolean(),
   }),
+  launcherEnvFiles: z.array(z.string()).optional(),
 });
 
 export const eventEnvelopeSchema = z.object({

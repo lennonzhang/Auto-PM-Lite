@@ -1,4 +1,17 @@
-import type { AgentEvent, ArtifactRef, ApprovalKind, Task, TurnRecord, Workspace, WorkspaceChange, WorkspaceDiff, WorkspaceMergeResult } from "../core/types.js";
+import type {
+  AgentEvent,
+  ArtifactRef,
+  ApprovalKind,
+  ClaudePermissionMode,
+  CodexApprovalPolicy,
+  CodexSandboxMode,
+  Task,
+  TurnRecord,
+  Workspace,
+  WorkspaceChange,
+  WorkspaceDiff,
+  WorkspaceMergeResult,
+} from "../core/types.js";
 import type { StoredApproval, StoredArtifact } from "../storage/db.js";
 
 export const apiVersion = 1;
@@ -9,9 +22,17 @@ export type AppErrorCode =
   | "task_not_found"
   | "policy_denied"
   | "approval_required"
+  | "config_unavailable"
+  | "storage_unavailable"
   | "workspace_not_isolatable"
+  | "workspace_unavailable"
   | "workspace_not_mergeable"
   | "merge_conflict"
+  | "git_unavailable"
+  | "mcp_unavailable"
+  | "sdk_unavailable"
+  | "logs_unavailable"
+  | "runtime_probe_failed"
   | "runtime_unavailable"
   | "unknown_error";
 
@@ -29,6 +50,7 @@ export class AppError extends Error {
     readonly code: AppErrorCode,
     message: string,
     readonly details?: unknown | undefined,
+    readonly action?: string | undefined,
   ) {
     super(message);
     this.name = "AppError";
@@ -42,6 +64,9 @@ export interface TaskSummary {
   runtime: string;
   status: string;
   cwd: string;
+  parentTaskId?: string | undefined;
+  delegationDepth: number;
+  triggeredBy: string;
   createdAt: string;
 }
 
@@ -65,11 +90,60 @@ export interface WorkspaceDiffView extends WorkspaceDiff {}
 
 export interface WorkspaceMergeView extends WorkspaceMergeResult {}
 
+export type RuntimeHealthStatus = "ok" | "warning" | "error" | "unknown";
+
+export interface RuntimeHealthCheck {
+  id: string;
+  label: string;
+  status: RuntimeHealthStatus;
+  message?: string | undefined;
+  action?: string | undefined;
+}
+
 export interface RuntimeHealth {
   runtime: string;
   available: boolean;
   profiles: string[];
   message?: string | undefined;
+  staticChecks: RuntimeHealthCheck[];
+  capabilityChecks: RuntimeHealthCheck[];
+}
+
+export type ConfigProfileMetadata =
+  | {
+      id: string;
+      runtime: "claude";
+      model: string;
+      policyId: string;
+      claudePermissionMode: ClaudePermissionMode;
+    }
+  | {
+      id: string;
+      runtime: "codex";
+      model: string;
+      policyId: string;
+      codexSandboxMode: CodexSandboxMode;
+      codexApprovalPolicy: CodexApprovalPolicy;
+      codexNetworkAccessEnabled: boolean;
+    };
+
+export interface TaskActionAccepted {
+  ok: true;
+  accepted: true;
+  taskId: string;
+  actionId: string;
+  action: "run" | "resume" | "pause";
+}
+
+export interface TaskResultView {
+  taskId: string;
+  parentTaskId?: string | undefined;
+  status: string;
+  runtime: string;
+  profileId: string;
+  latestMessage?: string | undefined;
+  artifacts: ArtifactView[];
+  pendingApprovalIds: string[];
 }
 
 export interface EventEnvelope {
@@ -84,7 +158,8 @@ export interface ConfigMetadata {
   apiVersion: number;
   accounts: string[];
   policies: string[];
-  profiles: string[];
+  profileIds: string[];
+  profiles: ConfigProfileMetadata[];
   storage: {
     dbPath: string;
     busyTimeoutMs: number;
@@ -93,6 +168,7 @@ export interface ConfigMetadata {
     rootDir: string;
     topLevelUseWorktree: boolean;
   };
+  launcherEnvFiles?: string[] | undefined;
 }
 
 export type WorkspaceChangesView = WorkspaceChange[];
@@ -105,7 +181,7 @@ export function toErrorEnvelope(error: unknown): ErrorEnvelope {
       error: {
         code: error.code,
         message: error.message,
-        details: error.details,
+        details: error.action ? { ...(isRecord(error.details) ? error.details : { details: error.details }), action: error.action } : error.details,
       },
     };
   }
@@ -129,6 +205,10 @@ export function toErrorEnvelope(error: unknown): ErrorEnvelope {
       message,
     },
   };
+}
+
+function isRecord(value: unknown): value is Record<string, unknown> {
+  return Boolean(value && typeof value === "object" && !Array.isArray(value));
 }
 
 export function isErrorEnvelope(value: unknown): value is ErrorEnvelope {
@@ -162,11 +242,35 @@ function inferErrorCode(message: string): AppErrorCode {
   if (message.includes("workspace_not_isolatable")) {
     return "workspace_not_isolatable";
   }
+  if (message.includes("workspace_unavailable")) {
+    return "workspace_unavailable";
+  }
   if (message.includes("workspace_not_mergeable")) {
     return "workspace_not_mergeable";
   }
   if (message.includes("merge_conflict")) {
     return "merge_conflict";
+  }
+  if (message.includes("config_unavailable")) {
+    return "config_unavailable";
+  }
+  if (message.includes("storage_unavailable")) {
+    return "storage_unavailable";
+  }
+  if (message.includes("git_unavailable")) {
+    return "git_unavailable";
+  }
+  if (message.includes("mcp_unavailable")) {
+    return "mcp_unavailable";
+  }
+  if (message.includes("sdk_unavailable")) {
+    return "sdk_unavailable";
+  }
+  if (message.includes("logs_unavailable")) {
+    return "logs_unavailable";
+  }
+  if (message.includes("runtime_probe_failed")) {
+    return "runtime_probe_failed";
   }
   if (message.includes("Runtime adapter not configured")) {
     return "runtime_unavailable";

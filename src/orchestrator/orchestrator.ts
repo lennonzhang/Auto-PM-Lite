@@ -6,6 +6,7 @@ import { redactText } from "../core/redaction.js";
 import { canAccessReference, policyTrustLevel } from "../core/reference.js";
 import { buildRawTranscriptCipher } from "../core/transcript.js";
 import { AppDatabase, type StoredArtifact } from "../storage/db.js";
+import { AppError } from "../api/types.js";
 import { EventStore } from "../storage/event-store.js";
 import type { RuntimeAdapter } from "../runtime/adapter.js";
 import { shouldRequireApproval } from "./policy.js";
@@ -64,6 +65,7 @@ export class Orchestrator {
   private readonly workspaceManager: WorkspaceManager;
   private readonly eventStore: EventStore;
   private readonly activeRuns = new Map<string, Promise<void>>();
+  private readonly pauseRequests = new Set<string>();
   private readonly scheduler: DefaultTaskScheduler;
   private readonly rateLimiter: RateLimiter;
   private readonly eventStream: InMemoryEventStream;
@@ -93,6 +95,24 @@ export class Orchestrator {
 
   syncConfig(): void {
     this.db.syncConfig(this.config);
+  }
+
+  configRedactionPatterns(): string[] {
+    return this.config.redaction.additionalPatterns;
+  }
+
+  recoverStaleRunningTasks(): { recoveredTaskIds: string[] } {
+    const now = new Date().toISOString();
+    const runningTasks = this.db.listTasksByStatus("running");
+    for (const task of runningTasks) {
+      this.db.updateTaskRuntimeState({
+        taskId: task.id,
+        status: "reconcile_required",
+        backendThreadId: task.backendThreadId,
+        updatedAt: now,
+      });
+    }
+    return { recoveredTaskIds: runningTasks.map((task) => task.id) };
   }
 
   async createTask(input: CreateTaskInput): Promise<Task> {
@@ -656,6 +676,16 @@ export class Orchestrator {
     };
   }
 
+  createDiagnosticMcpHandlers(taskId = "__diagnostic__"): AutoPmMcpHandlers {
+    return {
+      delegateTo: async () => this.toMcpToolResult({ status: "diagnostic" }),
+      requestCapability: async () => this.toMcpToolResult({ approvalId: `diagnostic-${taskId}`, status: "pending" }),
+      waitForTask: async () => this.toMcpToolResult({ taskId, status: "completed", artifacts: [], pendingApprovalIds: [] }),
+      getTaskResult: async () => this.toMcpToolResult({ taskId, status: "completed", artifacts: [], pendingApprovalIds: [] }),
+      reportArtifact: async () => this.toMcpToolResult({ id: `diagnostic-${taskId}`, taskId, kind: "file", ref: "diagnostic" }),
+    };
+  }
+
   async runTask(input: RunTaskInput): Promise<void> {
     const task = this.db.getTask(input.taskId);
     if (!task) {
@@ -714,11 +744,16 @@ export class Orchestrator {
         prompt: input.prompt,
       }, turnId, handle.backendThreadId);
     } catch (error) {
+      if (this.pauseRequests.has(task.id)) {
+        await this.markTaskPaused(task);
+        return;
+      }
       await this.failTask(task.id, handle.backendThreadId, error, true);
       throw error;
     } finally {
       this.scheduler.recordComplete(task.id);
       await runtime.closeTask(task.id);
+      this.pauseRequests.delete(task.id);
     }
   }
 
@@ -785,11 +820,35 @@ export class Orchestrator {
         prompt: turnPrompt,
       }, turnId, handle.backendThreadId);
     } catch (error) {
+      if (this.pauseRequests.has(task.id)) {
+        await this.markTaskPaused(task);
+        return;
+      }
       await this.failTask(task.id, handle.backendThreadId, error, false);
       throw error;
     } finally {
       await runtime.closeTask(task.id);
+      this.pauseRequests.delete(task.id);
     }
+  }
+
+  async pauseTask(taskId: string): Promise<void> {
+    const task = this.db.getTask(taskId);
+    if (!task) {
+      throw new Error(`Unknown task: ${taskId}`);
+    }
+    if (task.status !== "running") {
+      throw new AppError("validation_failed", `Task ${task.id} is not running and cannot be paused`);
+    }
+
+    const runtime = this.runtimes[task.runtime];
+    if (!runtime) {
+      throw new Error(`Runtime adapter not configured for ${task.runtime}`);
+    }
+
+    this.pauseRequests.add(task.id);
+    await runtime.pauseTask(task.id);
+    await this.markTaskPaused(task);
   }
 
   async cancelTask(taskId: string): Promise<void> {
@@ -803,6 +862,7 @@ export class Orchestrator {
       throw new Error(`Runtime adapter not configured for ${task.runtime}`);
     }
 
+    this.pauseRequests.delete(task.id);
     await runtime.cancelTask(task.id);
     const now = new Date().toISOString();
     this.db.updateTaskRuntimeState({
@@ -1141,6 +1201,9 @@ export class Orchestrator {
     }
 
     const currentTask = this.db.getTask(task.id);
+    if (currentTask?.status === "paused") {
+      return;
+    }
     if (currentTask?.status !== "awaiting_approval") {
       this.db.updateTaskRuntimeState({
         taskId: task.id,
@@ -1184,6 +1247,29 @@ export class Orchestrator {
           ts: failedAt,
         };
     await this.emitAndProjectEvent(task, event);
+  }
+
+  private async markTaskPaused(task: Task): Promise<void> {
+    const pausedAt = new Date().toISOString();
+    const current = this.db.getTask(task.id);
+    if (!current || current.status === "paused") {
+      return;
+    }
+
+    const latestTurn = this.db.getLatestTurn(task.id);
+    if (latestTurn?.status === "running") {
+      this.db.updateTurn({
+        turnId: latestTurn.id,
+        status: "paused",
+        completedAt: pausedAt,
+      });
+    }
+
+    await this.emitAndProjectEvent(current, {
+      type: "task.paused",
+      taskId: task.id,
+      ts: pausedAt,
+    });
   }
 
   private async continueTaskAfterApproval(taskId: string, prompt?: string | undefined): Promise<void> {
@@ -1244,7 +1330,7 @@ export class Orchestrator {
     if (!task.backendThreadId) {
       return false;
     }
-    const resumableStatuses: Task["status"][] = ["interrupted", "reconcile_required", "queued", "awaiting_approval"];
+    const resumableStatuses: Task["status"][] = ["paused", "interrupted", "reconcile_required", "queued", "awaiting_approval"];
     if (!resumableStatuses.includes(task.status)) {
       return false;
     }
@@ -1256,6 +1342,9 @@ export class Orchestrator {
     }
     if (task.status === "reconcile_required") {
       return latestTurn?.status === "failed" || latestTurn?.status === "completed";
+    }
+    if (task.status === "paused") {
+      return latestTurn?.status === "paused" || latestTurn?.status === "failed" || latestTurn?.status === "completed";
     }
     if (latestTurn?.status === "running") {
       return false;
@@ -1296,6 +1385,17 @@ export class Orchestrator {
       this.db.updateTaskRuntimeState({
         taskId: task.id,
         status: "interrupted",
+        backendThreadId: current?.backendThreadId ?? task.backendThreadId,
+        updatedAt: event.ts,
+      });
+      return;
+    }
+
+    if (event.type === "task.paused") {
+      const current = this.db.getTask(task.id);
+      this.db.updateTaskRuntimeState({
+        taskId: task.id,
+        status: "paused",
         backendThreadId: current?.backendThreadId ?? task.backendThreadId,
         updatedAt: event.ts,
       });

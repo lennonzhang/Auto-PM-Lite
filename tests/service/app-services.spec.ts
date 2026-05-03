@@ -5,8 +5,10 @@ import { execFileSync } from "node:child_process";
 import { afterEach, describe, expect, it } from "vitest";
 import { AppDatabase } from "../../src/storage/db.js";
 import { Orchestrator } from "../../src/orchestrator/orchestrator.js";
-import { createAppServices } from "../../src/service/app-services.js";
-import { apiVersion, toErrorEnvelope } from "../../src/api/types.js";
+import { createAppServices, ensureDefaultConfig, openAppServices } from "../../src/service/app-services.js";
+import { apiVersion, toErrorEnvelope, type RuntimeHealth } from "../../src/api/types.js";
+import { loadConfig } from "../../src/core/config.js";
+import { applyLauncherEnvToConfig, loadProjectLauncherEnv } from "../../src/core/launcher-env.js";
 import {
   approvalViewSchema,
   configMetadataSchema,
@@ -45,6 +47,7 @@ class FakeRuntime implements RuntimeAdapter {
     return { taskId: input.taskId, backendThreadId: input.backendThreadId };
   }
 
+  async pauseTask(_taskId: string): Promise<void> {}
   async cancelTask(_taskId: string): Promise<void> {}
   async closeTask(_taskId: string): Promise<void> {}
 }
@@ -78,6 +81,212 @@ describe("AppServices", () => {
       const runtimeHealth = services.runtime.getHealth();
       expect(runtimeHealth.map((entry) => runtimeHealthSchema.parse(entry).runtime)).toEqual(["claude", "codex"]);
       expect(runtimeHealth.find((entry) => entry.runtime === "claude")?.profiles).toEqual(["claude_main"]);
+      expect(runtimeHealth.find((entry) => entry.runtime === "claude")?.staticChecks.length).toBeGreaterThan(0);
+    } finally {
+      await services.close();
+    }
+  });
+
+  it("guards task runs when runtime health is blocked", async () => {
+    const { services } = await buildServices({
+      secretRef: "env:AUTO_PM_LITE_MISSING_SECRET_FOR_TEST",
+    });
+
+    try {
+      const task = await services.tasks.createTask({
+        profileId: "claude_main",
+        cwd: services.config.getMetadata().workspace.rootDir,
+      });
+
+      await expect(services.tasks.runTask({ taskId: task.id, prompt: "go" })).rejects.toMatchObject({
+        code: "runtime_unavailable",
+      });
+    } finally {
+      await services.close();
+    }
+  });
+
+  it("uses project launcher env as the local secret source for runtime health", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "auto-pm-lite-launcher-env-"));
+    tempPaths.push(root);
+    const configPath = path.join(root, "config.toml");
+    const dbPath = path.join(root, "db.sqlite");
+    const workspaceRoot = path.join(root, "workspaces");
+    await fs.mkdir(workspaceRoot, { recursive: true });
+    await fs.writeFile(configPath, `
+[storage]
+db_path = "${dbPath.replace(/\\/g, "/")}"
+busy_timeout_ms = 1000
+
+[workspace]
+root_dir = "${workspaceRoot.replace(/\\/g, "/")}"
+top_level_use_worktree = false
+
+[policy.edit]
+permission_mode = "edit"
+sandbox_mode = "workspace-write"
+network_allowed = false
+approval_policy = "orchestrator"
+require_approval_for = []
+max_depth = 1
+allow_cross_harness_delegation = false
+allow_child_edit = false
+allow_child_network = false
+
+[account.codex_local]
+vendor = "openai-compatible"
+secret_ref = "env:OPENAI_API_KEY"
+
+[profile.codex_edit]
+runtime = "codex"
+account = "codex_local"
+policy = "edit"
+model = "placeholder"
+codex_sandbox_mode = "workspace-write"
+codex_approval_policy = "on-request"
+codex_network_access_enabled = false
+`, "utf8");
+    await fs.writeFile(path.join(root, "launcher.env"), `
+CODEX_PLATFORM=AUTO_CODE_VIP
+CODEX_KEY=CX_PRO
+CODEX_ENV_KEY=OPENAI_API_KEY
+CODEX__AUTO_CODE_VIP__PROVIDER=OpenAI
+CODEX__AUTO_CODE_VIP__BASE_URL=https://codex.example/v1
+CODEX__AUTO_CODE_VIP__MODEL=gpt-5.5
+CODEX__AUTO_CODE_VIP__KEY__CX_PRO=sk-codex
+`, "utf8");
+
+    const services = await openAppServices(configPath);
+
+    try {
+      const metadata = services.config.getMetadata();
+      const codexHealth = services.runtime.getHealth().find((entry: RuntimeHealth) => entry.runtime === "codex");
+      expect(metadata.launcherEnvFiles).toEqual([path.join(root, "launcher.env")]);
+      expect(codexHealth?.staticChecks).not.toContainEqual(expect.objectContaining({
+        id: "secret:env:OPENAI_API_KEY",
+        status: "error",
+      }));
+    } finally {
+      await services.close();
+    }
+  });
+
+  it("applies launcher codex provider settings to the generated default config", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "auto-pm-lite-default-launcher-"));
+    tempPaths.push(root);
+    const configPath = path.join(root, "config.toml");
+    await fs.writeFile(path.join(root, "launcher.env"), `
+CODEX_PLATFORM=AUTO_CODE_VIP
+CODEX_KEY=CX_PRO
+CODEX_ENV_KEY=OPENAI_API_KEY
+CODEX__AUTO_CODE_VIP__PROVIDER=OpenAI
+CODEX__AUTO_CODE_VIP__BASE_URL=https://codex.example/v1
+CODEX__AUTO_CODE_VIP__MODEL=gpt-5.5
+CODEX__AUTO_CODE_VIP__MODEL_CONTEXT_WINDOW=258000
+CODEX__AUTO_CODE_VIP__MODEL_AUTO_COMPACT_TOKEN_LIMIT=250000
+CODEX__AUTO_CODE_VIP__REQUIRES_OPENAI_AUTH=true
+CODEX__AUTO_CODE_VIP__WIRE_API=responses
+CODEX__AUTO_CODE_VIP__KEY__CX_PRO=sk-codex
+`, "utf8");
+
+    await ensureDefaultConfig(configPath);
+    const launcherEnv = await loadProjectLauncherEnv({ configPath });
+    const config = applyLauncherEnvToConfig(await loadConfig(configPath), launcherEnv);
+    const account = config.accounts.openai_env;
+    const profile = config.profiles.codex_edit;
+
+    expect(account?.vendor).toBe("openai-compatible");
+    expect(account?.baseUrl).toBe("https://codex.example/v1");
+    expect(account?.extraConfig).toMatchObject({
+      provider: "OpenAI",
+      wire_api: "responses",
+      requires_openai_auth: true,
+      model_context_window: 258000,
+      model_auto_compact_token_limit: 250000,
+    });
+    expect(profile?.model).toBe("gpt-5.5");
+  });
+
+  it("allows launcher local auth mode without requiring env secrets", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "auto-pm-lite-local-auth-"));
+    tempPaths.push(root);
+    const configPath = path.join(root, "config.toml");
+    const dbPath = path.join(root, "db.sqlite");
+    const workspaceRoot = path.join(root, "workspaces");
+    await fs.mkdir(workspaceRoot, { recursive: true });
+    await fs.writeFile(configPath, `
+[storage]
+db_path = "${dbPath.replace(/\\/g, "/")}"
+busy_timeout_ms = 1000
+
+[workspace]
+root_dir = "${workspaceRoot.replace(/\\/g, "/")}"
+top_level_use_worktree = false
+
+[policy.edit]
+permission_mode = "edit"
+sandbox_mode = "workspace-write"
+network_allowed = false
+approval_policy = "orchestrator"
+require_approval_for = []
+max_depth = 1
+allow_cross_harness_delegation = false
+allow_child_edit = false
+allow_child_network = false
+
+[account.codex_local]
+vendor = "openai-compatible"
+secret_ref = "env:OPENAI_API_KEY"
+
+[profile.codex_edit]
+runtime = "codex"
+account = "codex_local"
+policy = "edit"
+model = "gpt-5-codex"
+codex_sandbox_mode = "workspace-write"
+codex_approval_policy = "on-request"
+codex_network_access_enabled = false
+`, "utf8");
+    await fs.writeFile(path.join(root, "launcher.env"), `
+CODEX_AUTH_MODE=local
+CODEX_PLATFORM=AUTO_CODE_VIP
+CODEX_KEY=CX_PRO
+CODEX__AUTO_CODE_VIP__PROVIDER=OpenAI
+CODEX__AUTO_CODE_VIP__BASE_URL=https://codex.example/v1
+CODEX__AUTO_CODE_VIP__KEY__CX_PRO=sk-codex
+`, "utf8");
+
+    const services = await openAppServices(configPath);
+
+    try {
+      const codexHealth = services.runtime.getHealth().find((entry: RuntimeHealth) => entry.runtime === "codex");
+      expect(codexHealth?.staticChecks).not.toContainEqual(expect.objectContaining({
+        id: "secret:env:OPENAI_API_KEY",
+        status: "error",
+      }));
+    } finally {
+      await services.close();
+    }
+  });
+
+  it("recovers stale running tasks to reconcile_required", async () => {
+    const { db, services } = await buildServices();
+
+    try {
+      const task = await services.tasks.createTask({
+        profileId: "claude_main",
+        cwd: services.config.getMetadata().workspace.rootDir,
+      });
+      db.updateTaskRuntimeState({
+        taskId: task.id,
+        status: "running",
+        backendThreadId: "thread-stale",
+        updatedAt: new Date().toISOString(),
+      });
+
+      const recovered = services.orchestrator.recoverStaleRunningTasks();
+      expect(recovered.recoveredTaskIds).toEqual([task.id]);
+      expect(services.tasks.getTask(task.id).status).toBe("reconcile_required");
     } finally {
       await services.close();
     }
@@ -207,7 +416,7 @@ describe("AppServices", () => {
   });
 });
 
-async function buildServices(options?: { editableWorkspace?: boolean }) {
+async function buildServices(options?: { editableWorkspace?: boolean; secretRef?: string }) {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "auto-pm-lite-service-"));
   tempPaths.push(root);
   const repoRoot = options?.editableWorkspace ? path.join(root, "repo") : root;
@@ -217,7 +426,7 @@ async function buildServices(options?: { editableWorkspace?: boolean }) {
   }
   const config: AppConfig = {
     accounts: {
-      anthropic: { id: "anthropic", vendor: "anthropic", secretRef: "env:ANTHROPIC_API_KEY" },
+      anthropic: { id: "anthropic", vendor: "anthropic", secretRef: options?.secretRef ?? "env:ANTHROPIC_API_KEY" },
     },
     policies: {
       readonly: {
@@ -257,6 +466,7 @@ async function buildServices(options?: { editableWorkspace?: boolean }) {
         accountId: "anthropic",
         policyId: "readonly",
         model: "claude-opus-4-7",
+        claudePermissionMode: "dontAsk",
       },
       ...(options?.editableWorkspace
         ? {
@@ -266,6 +476,9 @@ async function buildServices(options?: { editableWorkspace?: boolean }) {
               accountId: "anthropic",
               policyId: "child_edit",
               model: "gpt-5-codex",
+              codexSandboxMode: "workspace-write" as const,
+              codexApprovalPolicy: "on-request" as const,
+              codexNetworkAccessEnabled: false,
             },
           }
         : {}),

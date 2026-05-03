@@ -52,9 +52,8 @@ const policySchema = z.object({
   unsafeDirectCwd: z.boolean().optional(),
 });
 
-const profileSchema = z.object({
+const baseProfileSchema = z.object({
   id: z.string().min(1),
-  runtime: z.enum(["claude", "codex"]),
   accountId: z.string().min(1),
   policyId: z.string().min(1),
   model: z.string().min(1),
@@ -62,6 +61,20 @@ const profileSchema = z.object({
   systemPromptOverride: z.string().optional(),
   tags: z.array(z.string()).optional(),
 });
+
+const claudeProfileSchema = baseProfileSchema.extend({
+  runtime: z.literal("claude"),
+  claudePermissionMode: z.enum(["default", "acceptEdits", "bypassPermissions", "plan", "dontAsk", "auto"]),
+}).strict();
+
+const codexProfileSchema = baseProfileSchema.extend({
+  runtime: z.literal("codex"),
+  codexSandboxMode: z.enum(["read-only", "workspace-write", "danger-full-access"]),
+  codexApprovalPolicy: z.enum(["never", "on-request", "on-failure", "untrusted"]),
+  codexNetworkAccessEnabled: z.boolean(),
+}).strict();
+
+const profileSchema = z.discriminatedUnion("runtime", [claudeProfileSchema, codexProfileSchema]);
 
 const configSchema = z.object({
   accounts: z.record(z.string(), accountSchema).default({}),
@@ -198,9 +211,11 @@ function normalizeKeys(input: Record<string, unknown>): Record<string, unknown> 
 
   if ("account" in output && !("accountId" in output)) {
     output.accountId = output.account;
+    delete output.account;
   }
   if ("policy" in output && !("policyId" in output)) {
     output.policyId = output.policy;
+    delete output.policy;
   }
 
   return output;
@@ -220,6 +235,14 @@ function normalizeKey(key: string): string {
       return "permissionMode";
     case "sandbox_mode":
       return "sandboxMode";
+    case "claude_permission_mode":
+      return "claudePermissionMode";
+    case "codex_sandbox_mode":
+      return "codexSandboxMode";
+    case "codex_approval_policy":
+      return "codexApprovalPolicy";
+    case "codex_network_access_enabled":
+      return "codexNetworkAccessEnabled";
     case "network_allowed":
       return "networkAllowed";
     case "approval_policy":

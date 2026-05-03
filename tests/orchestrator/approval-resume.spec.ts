@@ -33,6 +33,7 @@ class FakeAdapter implements RuntimeAdapter {
     return { taskId: input.taskId, backendThreadId: input.backendThreadId };
   }
 
+  async pauseTask(_taskId: string): Promise<void> {}
   async cancelTask(_taskId: string): Promise<void> {}
   async closeTask(_taskId: string): Promise<void> {}
 }
@@ -57,6 +58,7 @@ class FakeCodexAdapter implements RuntimeAdapter {
     return { taskId: input.taskId, backendThreadId: input.backendThreadId };
   }
 
+  async pauseTask(_taskId: string): Promise<void> {}
   async cancelTask(_taskId: string): Promise<void> {}
   async closeTask(_taskId: string): Promise<void> {}
 }
@@ -151,12 +153,16 @@ runtime = "claude"
 accountId = "anthropic_personal"
 policyId = "basic"
 model = "claude-opus-4-7"
+claude_permission_mode = "dontAsk"
 
 [profile.codex_child]
 runtime = "codex"
 accountId = "openai_personal"
 policyId = "child"
 model = "gpt-5-codex"
+codex_sandbox_mode = "read-only"
+codex_approval_policy = "on-request"
+codex_network_access_enabled = false
 `, "utf8");
 
   const config = await loadConfig(configPath);

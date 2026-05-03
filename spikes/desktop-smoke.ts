@@ -7,25 +7,23 @@ import electronPath from "electron";
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const mainPath = path.join(repoRoot, "dist", "desktop", "main", "index.js");
+const portableExe = path.join(repoRoot, "dist", "desktop-portable", "Auto-PM-Lite", "Auto-PM-Lite.exe");
 const tempRoot = await fs.mkdtemp(path.join(os.tmpdir(), "auto-pm-lite-desktop-smoke-"));
 const configPath = path.join(tempRoot, "config.toml");
 const userDataPath = path.join(tempRoot, "user-data");
 
-try {
-  await fs.access(mainPath);
-} catch {
-  throw new Error("desktop build missing; run pnpm run desktop:build before pnpm run desktop:smoke");
-}
+const smokeTarget = await resolveSmokeTarget();
 
 await fs.mkdir(userDataPath, { recursive: true });
 
-const child = spawn(String(electronPath), ["--no-sandbox", mainPath], {
+const child = spawn(smokeTarget.command, smokeTarget.args, {
   cwd: repoRoot,
   env: {
     ...process.env,
     AUTO_PM_CONFIG_PATH: configPath,
     AUTO_PM_DESKTOP_USER_DATA: userDataPath,
     AUTO_PM_DESKTOP_SMOKE: "1",
+    AUTO_PM_DESKTOP_FAKE_RUNTIME: "1",
   },
   stdio: ["ignore", "pipe", "pipe"],
 });
@@ -61,3 +59,17 @@ if (exitCode !== 0) {
 }
 
 process.stdout.write("desktop smoke passed\n");
+
+async function resolveSmokeTarget(): Promise<{ command: string; args: string[] }> {
+  try {
+    await fs.access(portableExe);
+    return { command: portableExe, args: ["--no-sandbox"] };
+  } catch {}
+
+  try {
+    await fs.access(mainPath);
+    return { command: String(electronPath), args: ["--no-sandbox", mainPath] };
+  } catch {
+    throw new Error("desktop build missing; run pnpm run desktop:build before pnpm run desktop:smoke");
+  }
+}

@@ -1,18 +1,21 @@
 import type { Account, AppConfig, Policy, Profile } from "../core/types.js";
-import { sanitizeEnvKey } from "../core/credentials.js";
-import { EnvSecretBackend, type SecretBackend } from "../orchestrator/secrets.js";
+import { redactText } from "../core/redaction.js";
+import { EnvSecretBackend, isLocalSecretRef, sourceEnvAuthMode, type SecretBackend } from "../orchestrator/secrets.js";
+import { buildRuntimeEnv } from "./env.js";
 
 export interface RuntimeDependencies {
   config: AppConfig;
   configPath?: string | undefined;
   secretBackend?: SecretBackend;
+  sourceEnv?: NodeJS.ProcessEnv | undefined;
+  runtimeLog?: ((message: string) => void | Promise<void>) | undefined;
 }
 
 export abstract class BaseRuntimeAdapter {
   protected readonly secretBackend: SecretBackend;
 
   constructor(protected readonly deps: RuntimeDependencies) {
-    this.secretBackend = deps.secretBackend ?? new EnvSecretBackend();
+    this.secretBackend = deps.secretBackend ?? new EnvSecretBackend(deps.sourceEnv);
   }
 
   protected getProfile(profileId: string): Profile {
@@ -50,10 +53,32 @@ export abstract class BaseRuntimeAdapter {
     return this.deps.configPath;
   }
 
-  protected async resolveSecretEnv(account: Account): Promise<Record<string, string>> {
+  protected async resolveSecretEnv(account: Account, runtime: Profile["runtime"]): Promise<Record<string, string>> {
+    if (isLocalSecretRef(account.secretRef, runtime) || sourceEnvAuthMode(this.deps.sourceEnv, runtime) === "local") {
+      this.writeRuntimeLog(`runtime.local_auth runtime=${runtime} account=${account.id} secretRef=${account.secretRef}`);
+      return buildRuntimeEnv({
+        runtime,
+        account,
+        sourceEnv: this.deps.sourceEnv,
+        authMode: "local",
+      });
+    }
+
     const secret = await this.secretBackend.resolve(account.secretRef);
-    return {
-      [sanitizeEnvKey(account.id)]: secret,
-    };
+    this.writeRuntimeLog(`runtime.secret_resolved runtime=${runtime} account=${account.id} secretRef=${account.secretRef}`);
+    return buildRuntimeEnv({
+      runtime,
+      account,
+      secret,
+      sourceEnv: this.deps.sourceEnv,
+    });
+  }
+
+  protected writeRuntimeLog(message: string): void {
+    if (!this.deps.runtimeLog) {
+      return;
+    }
+    const redacted = redactText(message, { additionalPatterns: this.deps.config.redaction.additionalPatterns });
+    void Promise.resolve(this.deps.runtimeLog(redacted)).catch(() => {});
   }
 }

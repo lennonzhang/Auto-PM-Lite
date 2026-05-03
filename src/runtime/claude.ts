@@ -3,7 +3,7 @@ import { query, type CanUseTool, type Options, type Query } from "@anthropic-ai/
 import type { AgentEvent } from "../core/types.js";
 import { createClaudeMcpServer } from "../mcp/claude-binding.js";
 import { AutoPmMcpService } from "../mcp/auto-pm-service.js";
-import { allowedClaudeTools, classifyClaudeTool, isClaudeEditTool, mapClaudePermissionMode } from "../orchestrator/policy.js";
+import { allowedClaudeTools, classifyClaudeTool, isClaudeEditTool } from "../orchestrator/policy.js";
 import { BaseRuntimeAdapter, type RuntimeDependencies } from "./base.js";
 import type { ResumeRuntimeTaskInput, RunTurnInput, RuntimeAdapter, RuntimeTaskHandle, StartRuntimeTaskInput } from "./adapter.js";
 import { normalizeClaudeMessage } from "./normalize/claude.js";
@@ -32,6 +32,7 @@ export class ClaudeRuntimeAdapter extends BaseRuntimeAdapter implements RuntimeA
   }
 
   async startTask(input: StartRuntimeTaskInput): Promise<RuntimeTaskHandle> {
+    this.writeRuntimeLog(`runtime.task.start runtime=claude taskId=${input.taskId} profileId=${input.profileId}`);
     return {
       taskId: input.taskId,
       backendThreadId: input.taskId,
@@ -39,7 +40,11 @@ export class ClaudeRuntimeAdapter extends BaseRuntimeAdapter implements RuntimeA
   }
 
   async *runTurn(input: RunTurnInput): AsyncIterable<AgentEvent> {
+    this.writeRuntimeLog(`runtime.turn.start runtime=claude taskId=${input.taskId} profileId=${input.profileId}`);
     const profile = this.getProfile(input.profileId);
+    if (profile.runtime !== "claude") {
+      throw new Error(`Profile ${profile.id} is not a Claude profile`);
+    }
     const account = this.getAccount(profile.accountId);
     const policy = this.getPolicy(profile.policyId);
     const turnId = randomUUID();
@@ -49,8 +54,9 @@ export class ClaudeRuntimeAdapter extends BaseRuntimeAdapter implements RuntimeA
     const options: Options = {
       cwd: input.cwd,
       model: profile.model,
-      env: await this.resolveSecretEnv(account),
-      permissionMode: mapClaudePermissionMode(policy),
+      env: await this.resolveSecretEnv(account, this.runtime),
+      permissionMode: profile.claudePermissionMode,
+      ...(profile.claudePermissionMode === "bypassPermissions" ? { allowDangerouslySkipPermissions: true } : {}),
     };
     const resume = this.resumeIds.get(input.taskId);
     if (resume) {
@@ -88,6 +94,7 @@ export class ClaudeRuntimeAdapter extends BaseRuntimeAdapter implements RuntimeA
   }
 
   async resumeTask(input: ResumeRuntimeTaskInput): Promise<RuntimeTaskHandle> {
+    this.writeRuntimeLog(`runtime.task.resume runtime=claude taskId=${input.taskId} profileId=${input.profileId}`);
     this.resumeIds.set(input.taskId, input.backendThreadId);
     return {
       taskId: input.taskId,
@@ -96,11 +103,17 @@ export class ClaudeRuntimeAdapter extends BaseRuntimeAdapter implements RuntimeA
   }
 
   async cancelTask(taskId: string): Promise<void> {
+    this.writeRuntimeLog(`runtime.task.cancel runtime=claude taskId=${taskId}`);
     const session = this.sessions.get(taskId);
     if (session) {
       await session.interrupt();
       this.sessions.delete(taskId);
     }
+  }
+
+  async pauseTask(taskId: string): Promise<void> {
+    this.writeRuntimeLog(`runtime.task.pause runtime=claude taskId=${taskId}`);
+    await this.cancelTask(taskId);
   }
 
   async closeTask(taskId: string): Promise<void> {
