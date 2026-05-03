@@ -190,6 +190,7 @@ export interface Task {
   name?: string | undefined;
   profileId: string;
   runtime: RuntimeKind;
+  model: string;
   cwd: string;
   workspaceId: string;
   parentTaskId?: string | undefined;

@@ -108,7 +108,7 @@ describe("CodexRuntimeAdapter", () => {
 
     const options = (
       adapter as unknown as {
-        toThreadOptions(profile: AppConfig["profiles"][string], cwd?: string): Record<string, unknown>;
+        toThreadOptions(profile: AppConfig["profiles"][string], model: string, cwd?: string): Record<string, unknown>;
       }
     ).toThreadOptions({
       id: "codex_plan",
@@ -119,7 +119,7 @@ describe("CodexRuntimeAdapter", () => {
       codexSandboxMode: "danger-full-access",
       codexApprovalPolicy: "never",
       codexNetworkAccessEnabled: true,
-    }, "D:/Code/Auto-PM-Lite");
+    }, "gpt-5-codex", "D:/Code/Auto-PM-Lite");
 
     expect(options).toMatchObject({
       model: "gpt-5-codex",

@@ -87,7 +87,7 @@ describe("workspace merge lifecycle", () => {
         "workspace.merged",
       ]));
       const migrations = db.db.prepare(`SELECT id FROM schema_migrations ORDER BY id`).all() as Array<{ id: string }>;
-      expect(migrations.map((row) => row.id)).toEqual(["001_initial", "002_workspace_lifecycle"]);
+      expect(migrations.map((row) => row.id)).toEqual(["001_initial", "002_workspace_lifecycle", "003_task_model"]);
     } finally {
       await orchestrator.close();
     }

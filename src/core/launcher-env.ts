@@ -119,7 +119,7 @@ export function applyLauncherEnvToConfig(config: AppConfig, launcherEnv: Launche
 }
 
 function launcherEnvCandidates(cwd: string, configPath?: string | undefined): string[] {
-  const directories = configPath ? [path.dirname(path.resolve(configPath))] : [cwd];
+  const directories = configPath ? [path.dirname(path.resolve(configPath)), cwd] : [cwd];
   const seen = new Set<string>();
   const candidates: string[] = [];
 

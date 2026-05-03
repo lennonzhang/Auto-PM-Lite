@@ -20,6 +20,7 @@ export interface StoredTask {
   name?: string | undefined;
   profileId: string;
   runtime: Task["runtime"];
+  model: string;
   cwd: string;
   workspaceId: string;
   parentTaskId?: string | undefined;
@@ -175,8 +176,8 @@ export class AppDatabase {
     `);
 
     const insertTask = this.db.prepare(`
-      INSERT INTO tasks (id, name, profile_id, runtime, parent_task_id, delegation_depth, delegation_chain_json, backend_thread_id, workspace_id, cwd, status, budget_json, triggered_by, created_at, updated_at, completed_at)
-      VALUES (@id, @name, @profile_id, @runtime, @parent_task_id, @delegation_depth, @delegation_chain_json, @backend_thread_id, @workspace_id, @cwd, @status, @budget_json, @triggered_by, @created_at, @updated_at, @completed_at)
+      INSERT INTO tasks (id, name, profile_id, runtime, model, parent_task_id, delegation_depth, delegation_chain_json, backend_thread_id, workspace_id, cwd, status, budget_json, triggered_by, created_at, updated_at, completed_at)
+      VALUES (@id, @name, @profile_id, @runtime, @model, @parent_task_id, @delegation_depth, @delegation_chain_json, @backend_thread_id, @workspace_id, @cwd, @status, @budget_json, @triggered_by, @created_at, @updated_at, @completed_at)
     `);
 
     const tx = this.db.transaction(() => {
@@ -204,6 +205,7 @@ export class AppDatabase {
         name: input.task.name ?? null,
         profile_id: input.task.profileId,
         runtime: input.task.runtime,
+        model: input.task.model,
         parent_task_id: input.task.parentTaskId ?? null,
         delegation_depth: input.task.delegationDepth,
         delegation_chain_json: JSON.stringify(input.task.delegationChain),
@@ -227,31 +229,40 @@ export class AppDatabase {
     name: string | null;
     profileId: string;
     runtime: string;
+    model: string;
     status: string;
     cwd: string;
     parentTaskId?: string | undefined;
     delegationDepth: number;
     triggeredBy: string;
     createdAt: string;
+    latestMessage?: string | undefined;
+    terminalError?: string | undefined;
   }> {
     const rows = this.db.prepare(`
-      SELECT id, name, profile_id, runtime, parent_task_id, delegation_depth, status, cwd, triggered_by, created_at
+      SELECT id, name, profile_id, runtime, model, parent_task_id, delegation_depth, status, cwd, triggered_by, created_at
       FROM tasks
       ORDER BY created_at DESC
     `).all() as Array<Record<string, unknown>>;
 
-    return rows.map((row) => ({
-      id: String(row.id),
-      name: row.name === null ? null : String(row.name),
-      profileId: String(row.profile_id),
-      runtime: String(row.runtime),
-      status: String(row.status),
-      cwd: String(row.cwd),
-      ...(row.parent_task_id === null ? {} : { parentTaskId: String(row.parent_task_id) }),
-      delegationDepth: Number(row.delegation_depth),
-      triggeredBy: String(row.triggered_by),
-      createdAt: String(row.created_at),
-    }));
+    return rows.map((row) => {
+      const id = String(row.id);
+      return {
+        id,
+        name: row.name === null ? null : String(row.name),
+        profileId: String(row.profile_id),
+        runtime: String(row.runtime),
+        model: String(row.model),
+        status: String(row.status),
+        cwd: String(row.cwd),
+        ...(row.parent_task_id === null ? {} : { parentTaskId: String(row.parent_task_id) }),
+        delegationDepth: Number(row.delegation_depth),
+        triggeredBy: String(row.triggered_by),
+        createdAt: String(row.created_at),
+        ...(this.getLatestCompletedMessage(id) ? { latestMessage: this.getLatestCompletedMessage(id) } : {}),
+        ...(this.getLatestTerminalError(id) ? { terminalError: this.getLatestTerminalError(id) } : {}),
+      };
+    });
   }
 
   listTasksByStatus(status: TaskStatus): StoredTask[] {
@@ -269,7 +280,7 @@ export class AppDatabase {
 
   getTask(taskId: string): StoredTask | null {
     const row = this.db.prepare(`
-      SELECT id, name, profile_id, runtime, cwd, workspace_id, parent_task_id, delegation_depth, delegation_chain_json, backend_thread_id, status, budget_json, triggered_by, created_at, updated_at, completed_at
+      SELECT id, name, profile_id, runtime, model, cwd, workspace_id, parent_task_id, delegation_depth, delegation_chain_json, backend_thread_id, status, budget_json, triggered_by, created_at, updated_at, completed_at
       FROM tasks
       WHERE id = ?
     `).get(taskId) as Record<string, unknown> | undefined;
@@ -283,6 +294,7 @@ export class AppDatabase {
       ...(row.name === null ? {} : { name: String(row.name) }),
       profileId: String(row.profile_id),
       runtime: String(row.runtime) as Task["runtime"],
+      model: String(row.model),
       cwd: String(row.cwd),
       workspaceId: String(row.workspace_id),
       ...(row.parent_task_id === null ? {} : { parentTaskId: String(row.parent_task_id) }),
@@ -564,6 +576,44 @@ export class AppDatabase {
     return typeof payload.text === "string" ? payload.text : undefined;
   }
 
+  getLatestTerminalError(taskId: string): string | undefined {
+    const row = this.db.prepare(`
+      SELECT payload_json
+      FROM events
+      WHERE task_id = ? AND type IN ('task.failed', 'task.interrupted')
+      ORDER BY id DESC
+      LIMIT 1
+    `).get(taskId) as { payload_json: string } | undefined;
+
+    if (!row) {
+      return undefined;
+    }
+
+    const payload = JSON.parse(row.payload_json) as { error?: unknown };
+    return typeof payload.error === "string" ? payload.error : undefined;
+  }
+
+  getLatestTerminalTaskEvent(taskId: string): { type: "task.completed" | "task.failed" | "task.interrupted" | "task.cancelled"; ts: string; error?: string | undefined } | undefined {
+    const row = this.db.prepare(`
+      SELECT type, payload_json, ts
+      FROM events
+      WHERE task_id = ? AND type IN ('task.completed', 'task.failed', 'task.interrupted', 'task.cancelled')
+      ORDER BY id DESC
+      LIMIT 1
+    `).get(taskId) as { type: string; payload_json: string; ts: string } | undefined;
+
+    if (!row) {
+      return undefined;
+    }
+
+    const payload = JSON.parse(row.payload_json) as { error?: unknown };
+    return {
+      type: row.type as "task.completed" | "task.failed" | "task.interrupted" | "task.cancelled",
+      ts: row.ts,
+      ...(typeof payload.error === "string" ? { error: payload.error } : {}),
+    };
+  }
+
   listEvents(input: { taskId?: string | undefined; afterId?: number | undefined; limit?: number | undefined }): Array<{ id: number; taskId: string; turnId: string | null; type: string; payload: Record<string, unknown>; ts: string }> {
     const filters: string[] = [];
     const params: Array<string | number> = [];
@@ -769,6 +819,7 @@ export class AppDatabase {
         name TEXT,
         profile_id TEXT NOT NULL REFERENCES profiles(id),
         runtime TEXT NOT NULL,
+        model TEXT NOT NULL,
         parent_task_id TEXT REFERENCES tasks(id),
         delegation_depth INTEGER NOT NULL,
         delegation_chain_json TEXT NOT NULL,
@@ -845,8 +896,23 @@ export class AppDatabase {
     this.ensureColumn("workspaces", "merged_at", "TEXT");
     this.ensureColumn("workspaces", "discarded_at", "TEXT");
     this.ensureColumn("workspaces", "merge_error_json", "TEXT");
+    this.ensureColumn("tasks", "model", "TEXT");
+    this.backfillTaskModels();
     this.recordMigration("001_initial");
     this.recordMigration("002_workspace_lifecycle");
+    this.recordMigration("003_task_model");
+  }
+
+  private backfillTaskModels(): void {
+    this.db.prepare(`
+      UPDATE tasks
+      SET model = COALESCE(
+        NULLIF(model, ''),
+        (SELECT profiles.model FROM profiles WHERE profiles.id = tasks.profile_id),
+        ''
+      )
+      WHERE model IS NULL OR model = ''
+    `).run();
   }
 
   private ensureColumn(tableName: string, columnName: string, type: string): void {

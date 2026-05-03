@@ -30,7 +30,7 @@ export class CodexRuntimeAdapter extends BaseRuntimeAdapter implements RuntimeAd
     }
     const account = this.getAccount(profile.accountId);
     const codex = new Codex(await this.buildCodexOptions(account.id, input.taskId, input.cwd));
-    const thread = codex.startThread(this.toThreadOptions(profile, input.cwd));
+    const thread = codex.startThread(this.toThreadOptions(profile, input.model, input.cwd));
     this.threads.set(input.taskId, thread);
 
     return {
@@ -70,7 +70,7 @@ export class CodexRuntimeAdapter extends BaseRuntimeAdapter implements RuntimeAd
     }
     const account = this.getAccount(profile.accountId);
     const codex = new Codex(await this.buildCodexOptions(account.id, input.taskId, input.cwd));
-    const thread = codex.resumeThread(input.backendThreadId, this.toThreadOptions(profile, input.cwd));
+    const thread = codex.resumeThread(input.backendThreadId, this.toThreadOptions(profile, input.model, input.cwd));
     this.threads.set(input.taskId, thread);
 
     return {
@@ -139,9 +139,9 @@ export class CodexRuntimeAdapter extends BaseRuntimeAdapter implements RuntimeAd
     };
   }
 
-  private toThreadOptions(profile: CodexProfile, cwd: string | undefined): ThreadOptions {
+  private toThreadOptions(profile: CodexProfile, model: string, cwd: string | undefined): ThreadOptions {
     return {
-      model: profile.model,
+      model,
       ...(cwd ? { workingDirectory: cwd } : {}),
       skipGitRepoCheck: true,
       sandboxMode: profile.codexSandboxMode,

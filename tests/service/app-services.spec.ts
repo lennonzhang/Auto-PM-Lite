@@ -30,13 +30,19 @@ import type { RuntimeAdapter, RuntimeTaskHandle, RunTurnInput, StartRuntimeTaskI
 const tempPaths: string[] = [];
 
 class FakeRuntime implements RuntimeAdapter {
+  readonly started: StartRuntimeTaskInput[] = [];
+  readonly turns: RunTurnInput[] = [];
+  readonly resumed: ResumeRuntimeTaskInput[] = [];
+
   constructor(readonly runtime: RuntimeAdapter["runtime"] = "claude") {}
 
   async startTask(input: StartRuntimeTaskInput): Promise<RuntimeTaskHandle> {
+    this.started.push(input);
     return { taskId: input.taskId, backendThreadId: `thread-${input.taskId}` };
   }
 
   async *runTurn(input: RunTurnInput): AsyncIterable<AgentEvent> {
+    this.turns.push(input);
     const ts = new Date().toISOString();
     yield { type: "turn.started", taskId: input.taskId, turnId: "turn-1", ts };
     yield { type: "message.completed", taskId: input.taskId, turnId: "turn-1", text: input.prompt, ts };
@@ -44,6 +50,7 @@ class FakeRuntime implements RuntimeAdapter {
   }
 
   async resumeTask(input: ResumeRuntimeTaskInput): Promise<RuntimeTaskHandle> {
+    this.resumed.push(input);
     return { taskId: input.taskId, backendThreadId: input.backendThreadId };
   }
 
@@ -73,6 +80,7 @@ describe("AppServices", () => {
       });
 
       expect(taskDetailSchema.parse(task).id).toBe(task.id);
+      expect(task.model).toBe("claude-opus-4-7");
       expect(task.workspace).toBeDefined();
       expect(task.turns).toEqual([]);
       expect(services.tasks.listTasks()).toHaveLength(1);
@@ -82,6 +90,45 @@ describe("AppServices", () => {
       expect(runtimeHealth.map((entry) => runtimeHealthSchema.parse(entry).runtime)).toEqual(["claude", "codex"]);
       expect(runtimeHealth.find((entry) => entry.runtime === "claude")?.profiles).toEqual(["claude_main"]);
       expect(runtimeHealth.find((entry) => entry.runtime === "claude")?.staticChecks.length).toBeGreaterThan(0);
+    } finally {
+      await services.close();
+    }
+  });
+
+  it("persists task model overrides and passes them to runtime turns", async () => {
+    const { runtimes, services } = await buildServices({ skipRuntimeHealthGuard: true });
+
+    try {
+      const task = await services.tasks.createTask({
+        profileId: "claude_main",
+        cwd: services.config.getMetadata().workspace.rootDir,
+        model: "claude-sonnet-4-6",
+      });
+
+      expect(task.model).toBe("claude-sonnet-4-6");
+      await services.tasks.runTask({ taskId: task.id, prompt: "selected model" });
+
+      expect(runtimes.claude.started[0]?.model).toBe("claude-sonnet-4-6");
+      expect(runtimes.claude.turns[0]?.model).toBe("claude-sonnet-4-6");
+      const detail = services.tasks.getTask(task.id);
+      expect(detail.latestMessage).toBe("selected model");
+      expect(services.tasks.listTasks()[0]?.latestMessage).toBe("selected model");
+    } finally {
+      await services.close();
+    }
+  });
+
+  it("rejects task model overrides outside profile allowed models", async () => {
+    const { services } = await buildServices();
+
+    try {
+      await expect(services.tasks.createTask({
+        profileId: "claude_main",
+        cwd: services.config.getMetadata().workspace.rootDir,
+        model: "claude-haiku-4-5",
+      })).rejects.toMatchObject({
+        code: "validation_failed",
+      });
     } finally {
       await services.close();
     }
@@ -156,9 +203,11 @@ CODEX__AUTO_CODE_VIP__MODEL=gpt-5.5
 CODEX__AUTO_CODE_VIP__KEY__CX_PRO=sk-codex
 `, "utf8");
 
-    const services = await openAppServices(configPath);
-
+    const originalCwd = process.cwd();
+    let services: Awaited<ReturnType<typeof openAppServices>> | undefined;
     try {
+      process.chdir(root);
+      services = await openAppServices(configPath);
       const metadata = services.config.getMetadata();
       const codexHealth = services.runtime.getHealth().find((entry: RuntimeHealth) => entry.runtime === "codex");
       expect(metadata.launcherEnvFiles).toEqual([path.join(root, "launcher.env")]);
@@ -167,7 +216,79 @@ CODEX__AUTO_CODE_VIP__KEY__CX_PRO=sk-codex
         status: "error",
       }));
     } finally {
-      await services.close();
+      await services?.close();
+      process.chdir(originalCwd);
+    }
+  });
+
+  it("uses cwd launcher env when config lives outside the project directory", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "auto-pm-lite-launcher-cwd-"));
+    tempPaths.push(root);
+    const configDir = path.join(root, "config-home");
+    const projectDir = path.join(root, "project");
+    const dbPath = path.join(configDir, "db.sqlite");
+    const workspaceRoot = path.join(configDir, "workspaces");
+    await fs.mkdir(configDir, { recursive: true });
+    await fs.mkdir(projectDir, { recursive: true });
+    await fs.mkdir(workspaceRoot, { recursive: true });
+    const configPath = path.join(configDir, "config.toml");
+    await fs.writeFile(configPath, `
+[storage]
+db_path = "${dbPath.replace(/\\/g, "/")}"
+busy_timeout_ms = 1000
+
+[workspace]
+root_dir = "${workspaceRoot.replace(/\\/g, "/")}"
+top_level_use_worktree = false
+
+[policy.edit]
+permission_mode = "edit"
+sandbox_mode = "workspace-write"
+network_allowed = false
+approval_policy = "orchestrator"
+require_approval_for = []
+max_depth = 1
+allow_cross_harness_delegation = false
+allow_child_edit = false
+allow_child_network = false
+
+[account.codex_local]
+vendor = "openai-compatible"
+secret_ref = "env:OPENAI_API_KEY"
+
+[profile.codex_edit]
+runtime = "codex"
+account = "codex_local"
+policy = "edit"
+model = "placeholder"
+codex_sandbox_mode = "workspace-write"
+codex_approval_policy = "on-request"
+codex_network_access_enabled = false
+`, "utf8");
+    await fs.writeFile(path.join(projectDir, "launcher.env"), `
+CODEX_PLATFORM=AUTO_CODE_VIP
+CODEX_KEY=CX_PRO
+CODEX_ENV_KEY=OPENAI_API_KEY
+CODEX__AUTO_CODE_VIP__MODEL=gpt-5.5
+CODEX__AUTO_CODE_VIP__KEY__CX_PRO=sk-codex
+`, "utf8");
+
+    const originalCwd = process.cwd();
+    let services: Awaited<ReturnType<typeof openAppServices>> | undefined;
+    try {
+      process.chdir(projectDir);
+      services = await openAppServices(configPath);
+      const metadata = services.config.getMetadata();
+      const codexHealth = services.runtime.getHealth().find((entry: RuntimeHealth) => entry.runtime === "codex");
+      expect(metadata.launcherEnvFiles).toEqual([path.join(projectDir, "launcher.env")]);
+      expect(metadata.profiles.find((profile) => profile.id === "codex_edit")?.model).toBe("gpt-5.5");
+      expect(codexHealth?.staticChecks).not.toContainEqual(expect.objectContaining({
+        id: "secret:env:OPENAI_API_KEY",
+        status: "error",
+      }));
+    } finally {
+      await services?.close();
+      process.chdir(originalCwd);
     }
   });
 
@@ -189,22 +310,28 @@ CODEX__AUTO_CODE_VIP__WIRE_API=responses
 CODEX__AUTO_CODE_VIP__KEY__CX_PRO=sk-codex
 `, "utf8");
 
-    await ensureDefaultConfig(configPath);
-    const launcherEnv = await loadProjectLauncherEnv({ configPath });
-    const config = applyLauncherEnvToConfig(await loadConfig(configPath), launcherEnv);
-    const account = config.accounts.openai_env;
-    const profile = config.profiles.codex_edit;
+    const originalCwd = process.cwd();
+    try {
+      process.chdir(root);
+      await ensureDefaultConfig(configPath);
+      const launcherEnv = await loadProjectLauncherEnv({ configPath });
+      const config = applyLauncherEnvToConfig(await loadConfig(configPath), launcherEnv);
+      const account = config.accounts.openai_env;
+      const profile = config.profiles.codex_edit;
 
-    expect(account?.vendor).toBe("openai-compatible");
-    expect(account?.baseUrl).toBe("https://codex.example/v1");
-    expect(account?.extraConfig).toMatchObject({
-      provider: "OpenAI",
-      wire_api: "responses",
-      requires_openai_auth: true,
-      model_context_window: 258000,
-      model_auto_compact_token_limit: 250000,
-    });
-    expect(profile?.model).toBe("gpt-5.5");
+      expect(account?.vendor).toBe("openai-compatible");
+      expect(account?.baseUrl).toBe("https://codex.example/v1");
+      expect(account?.extraConfig).toMatchObject({
+        provider: "OpenAI",
+        wire_api: "responses",
+        requires_openai_auth: true,
+        model_context_window: 258000,
+        model_auto_compact_token_limit: 250000,
+      });
+      expect(profile?.model).toBe("gpt-5.5");
+    } finally {
+      process.chdir(originalCwd);
+    }
   });
 
   it("allows launcher local auth mode without requiring env secrets", async () => {
@@ -416,7 +543,7 @@ CODEX__AUTO_CODE_VIP__KEY__CX_PRO=sk-codex
   });
 });
 
-async function buildServices(options?: { editableWorkspace?: boolean; secretRef?: string }) {
+async function buildServices(options?: { editableWorkspace?: boolean; secretRef?: string; skipRuntimeHealthGuard?: boolean }) {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), "auto-pm-lite-service-"));
   tempPaths.push(root);
   const repoRoot = options?.editableWorkspace ? path.join(root, "repo") : root;
@@ -466,6 +593,7 @@ async function buildServices(options?: { editableWorkspace?: boolean; secretRef?
         accountId: "anthropic",
         policyId: "readonly",
         model: "claude-opus-4-7",
+        allowedModels: ["claude-opus-4-7", "claude-sonnet-4-6"],
         claudePermissionMode: "dontAsk",
       },
       ...(options?.editableWorkspace
@@ -502,12 +630,15 @@ async function buildServices(options?: { editableWorkspace?: boolean; secretRef?
     rateLimit: { enabled: false },
   };
   const db = new AppDatabase({ dbPath: config.storage.dbPath, busyTimeoutMs: config.storage.busyTimeoutMs });
-  const orchestrator = new Orchestrator(config, db, {
+  const runtimes = {
     claude: new FakeRuntime("claude"),
     ...(options?.editableWorkspace ? { codex: new FakeRuntime("codex") } : {}),
+  };
+  const orchestrator = new Orchestrator(config, db, {
+    ...runtimes,
   });
   orchestrator.syncConfig();
-  return { db, repoRoot, services: createAppServices(config, orchestrator) };
+  return { db, repoRoot, runtimes, services: createAppServices(config, orchestrator, { skipRuntimeHealthGuard: options?.skipRuntimeHealthGuard ?? false }) };
 }
 
 function initializeGitRepo(root: string): void {

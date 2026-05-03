@@ -1,4 +1,4 @@
-import type { ApprovalView, ArtifactView, RuntimeHealth, TaskDetail, TaskResultView, TaskSummary, WorkspaceDiffView } from "../../../api/types.js";
+import type { ApprovalView, ArtifactView, ConfigMetadata, RuntimeHealth, TaskDetail, TaskResultView, TaskSummary, WorkspaceDiffView } from "../../../api/types.js";
 import type { AppErrorCode } from "../../../api/types.js";
 
 export type TaskFilter = "all" | "active" | "approval" | "failed";
@@ -107,7 +107,41 @@ export function taskResultSummary(result?: TaskResultView | null): string {
   if (result.artifacts.length > 0) {
     return `${result.status} with ${result.artifacts.length} artifact(s)`;
   }
-  return result.latestMessage ? result.latestMessage : result.status;
+  if (result.latestMessage) {
+    return result.status === "failed" || result.status === "interrupted"
+      ? `${result.status}: returned ${result.latestMessage}`
+      : result.latestMessage;
+  }
+  if (result.terminalError) {
+    return `${result.status}: ${result.terminalError}`;
+  }
+  return result.status;
+}
+
+export function taskDetailResult(task?: TaskDetail | TaskSummary | null): TaskResultView | null {
+  if (!task?.latestMessage && !task?.terminalError) {
+    return null;
+  }
+  return {
+    taskId: task.id,
+    ...("parentTaskId" in task && task.parentTaskId ? { parentTaskId: task.parentTaskId } : {}),
+    status: task.status,
+    runtime: task.runtime,
+    profileId: task.profileId,
+    model: task.model,
+    ...(task.latestMessage ? { latestMessage: task.latestMessage } : {}),
+    ...(task.terminalError ? { terminalError: task.terminalError } : {}),
+    artifacts: [],
+    pendingApprovalIds: [],
+  };
+}
+
+export function defaultModelForProfile(profile?: ConfigMetadata["profiles"][number] | null): string {
+  return profile?.model ?? "";
+}
+
+export function modelOptionsForProfile(profile?: ConfigMetadata["profiles"][number] | null): string[] {
+  return profile?.allowedModels && profile.allowedModels.length > 0 ? profile.allowedModels : [];
 }
 
 export function canRequestMerge(task?: TaskDetail | null, diff?: WorkspaceDiffView | null): boolean {

@@ -21,8 +21,11 @@ import {
   diffStats,
   filterTasks,
   formatCaughtError,
+  defaultModelForProfile,
+  modelOptionsForProfile,
   pendingApprovalsForTask,
   runtimeSummary,
+  taskDetailResult,
   taskBudgetSummary,
   taskCanCancel,
   taskCanPause,
@@ -49,6 +52,7 @@ function App() {
   const [prompt, setPrompt] = useState("");
   const [newTaskName, setNewTaskName] = useState("");
   const [newTaskProfile, setNewTaskProfile] = useState("");
+  const [newTaskModel, setNewTaskModel] = useState("");
   const [newTaskCwd, setNewTaskCwd] = useState("");
   const [mergeReason, setMergeReason] = useState("Ready to merge");
   const [busy, setBusy] = useState<string | null>(null);
@@ -92,6 +96,7 @@ function App() {
       setApprovals(approvalList);
       setRuntimeHealth(health);
       setNewTaskProfile((current) => current || metadata.profileIds[0] || "");
+      setNewTaskModel((current) => current || metadata.profiles.find((profile) => profile.id === (newTaskProfile || metadata.profileIds[0]))?.model || "");
       setNewTaskCwd((current) => current || metadata.workspace.rootDir);
       const nextSelected = preferredTaskId && taskList.some((task) => task.id === preferredTaskId)
         ? preferredTaskId
@@ -110,14 +115,15 @@ function App() {
     try {
       const detail = await window.autoPm.getTask(taskId);
       setTaskDetail(detail);
+      const ownResult = taskDetailResult(detail);
       if (detail.parentTaskId) {
         try {
           setTaskResult(await window.autoPm.getTaskResult({ requesterTaskId: detail.parentTaskId, taskId }));
         } catch {
-          setTaskResult(null);
+          setTaskResult(ownResult);
         }
       } else {
-        setTaskResult(null);
+        setTaskResult(ownResult);
       }
       if (detail.workspace?.parentWorkspaceId) {
         try {
@@ -146,6 +152,8 @@ function App() {
   const budgetSummary = taskBudgetSummary(taskDetail);
   const filteredEvents = events.filter((event) => !selectedTaskId || event.event.taskId === selectedTaskId);
   const selectedNewTaskProfile = config?.profiles.find((profile) => profile.id === newTaskProfile) ?? null;
+  const selectedNewTaskModelOptions = modelOptionsForProfile(selectedNewTaskProfile);
+  const latestTurnId = taskDetail?.turns[taskDetail.turns.length - 1]?.id;
   const focusedProfile = taskDetail
     ? config?.profiles.find((profile) => profile.id === taskDetail.profileId) ?? null
     : selectedTask
@@ -203,11 +211,26 @@ function App() {
             <div className="createTaskHeader">New Task</div>
             <label>
               Profile
-              <select value={newTaskProfile} onChange={(event) => setNewTaskProfile(event.target.value)} data-testid="new-task-profile">
+              <select value={newTaskProfile} onChange={(event) => {
+                const profileId = event.target.value;
+                const profile = config?.profiles.find((entry) => entry.id === profileId) ?? null;
+                setNewTaskProfile(profileId);
+                setNewTaskModel(defaultModelForProfile(profile));
+              }} data-testid="new-task-profile">
                 {config?.profiles.map((profile) => <option key={profile.id} value={profile.id}>{profile.id}</option>)}
               </select>
             </label>
             {selectedNewTaskProfile ? <ProfilePermissionSummary profile={selectedNewTaskProfile} /> : null}
+            <label>
+              Model
+              {selectedNewTaskModelOptions.length > 0 ? (
+                <select value={newTaskModel} onChange={(event) => setNewTaskModel(event.target.value)} data-testid="new-task-model">
+                  {selectedNewTaskModelOptions.map((model) => <option key={model} value={model}>{model}</option>)}
+                </select>
+              ) : (
+                <input value={newTaskModel} onChange={(event) => setNewTaskModel(event.target.value)} data-testid="new-task-model" />
+              )}
+            </label>
             <label>
               Cwd
               <input value={newTaskCwd} onChange={(event) => setNewTaskCwd(event.target.value)} data-testid="new-task-cwd" />
@@ -216,7 +239,7 @@ function App() {
               Name
               <input value={newTaskName} onChange={(event) => setNewTaskName(event.target.value)} placeholder="optional" data-testid="new-task-name" />
             </label>
-            <button type="submit" disabled={!newTaskProfile || !newTaskCwd || Boolean(busy)} data-testid="create-task">Create Task</button>
+            <button type="submit" disabled={!newTaskProfile || !newTaskModel || !newTaskCwd || Boolean(busy)} data-testid="create-task">Create Task</button>
           </form>
         </aside>
 
@@ -231,7 +254,7 @@ function App() {
                   </span>
                 ) : null}
               </div>
-              <p>{taskDetail ? `${taskDetail.profileId} · ${profilePermissionText(focusedProfile)} · ${taskDetail.cwd}` : config?.workspace.rootDir}</p>
+              <p>{taskDetail ? `${taskDetail.profileId} · ${taskDetail.model} · ${profilePermissionText(focusedProfile)} · ${taskDetail.cwd}` : config?.workspace.rootDir}</p>
             </div>
           </div>
 
@@ -278,6 +301,7 @@ function App() {
                     <time>{new Date(turn.startedAt).toLocaleString()}</time>
                   </div>
                   <p>{turn.promptRedacted}</p>
+                  {taskDetail?.latestMessage && turn.id === latestTurnId ? <pre>{taskDetail.latestMessage}</pre> : null}
                 </div>
               ))}
               {taskDetail && taskDetail.turns.length === 0 ? <div className="empty">No turns</div> : null}
@@ -292,6 +316,7 @@ function App() {
                   <span>{event.event.type}</span>
                   <code>{event.event.taskId.slice(0, 8)}</code>
                   <time>{new Date(event.event.ts).toLocaleTimeString()}</time>
+                  <small>{eventSummary(event.event)}</small>
                 </div>
               ))}
               {events.length === 0 ? <div className="empty">No live events</div> : null}
@@ -404,6 +429,7 @@ function App() {
       const created = await window.autoPm.createTask({
         profileId: newTaskProfile,
         cwd: newTaskCwd,
+        model: newTaskModel.trim(),
         ...(newTaskName ? { name: newTaskName } : {}),
       });
       setNewTaskName("");
@@ -547,6 +573,19 @@ function profilePermissionText(profile?: ConfigMetadata["profiles"][number] | nu
   return `${profile.codexSandboxMode} / ${profile.codexApprovalPolicy} / network:${profile.codexNetworkAccessEnabled ? "on" : "off"}`;
 }
 
+function eventSummary(event: EventEnvelope["event"]): string {
+  if ("text" in event && typeof event.text === "string") {
+    return event.text;
+  }
+  if ("error" in event && typeof event.error === "string") {
+    return event.error;
+  }
+  if ("summary" in event && typeof event.summary === "string") {
+    return event.summary;
+  }
+  return "";
+}
+
 function TaskTreeItem(props: {
   node: TaskTreeNode;
   selectedTaskId: string | null;
@@ -564,7 +603,7 @@ function TaskTreeItem(props: {
       >
         <span className={`statusDot ${props.node.task.status}`} />
         <span className="taskName">{props.node.task.name ?? props.node.task.id.slice(0, 8)}</span>
-        <span className="taskRuntime">{props.node.task.runtime}</span>
+        <span className="taskRuntime">{props.node.task.runtime} · {props.node.task.model}</span>
       </button>
       {props.node.children.map((child) => (
         <TaskTreeItem

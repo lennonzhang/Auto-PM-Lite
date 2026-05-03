@@ -29,8 +29,94 @@ describe("desktop foundation", () => {
     expect(raw).not.toContain("ANTHROPIC_API_KEY =");
     const config = await loadConfig(configPath);
     expect(config.policies.edit?.sandboxMode).toBe("workspace-write");
+    expect(config.policies.network_edit?.networkAllowed).toBe(true);
+    expect(config.policies.full_access?.sandboxMode).toBe("danger-full-access");
     expect(config.accounts.anthropic_env?.secretRef).toBe("env:ANTHROPIC_API_KEY");
     expect(config.accounts.openai_env?.vendor).toBe("openai-compatible");
+    expect(Object.keys(config.profiles)).toEqual([
+      "claude_readonly",
+      "claude_default",
+      "claude_accept_edits",
+      "claude_auto",
+      "claude_plan",
+      "claude_bypass_permissions",
+      "codex_plan",
+      "codex_edit",
+      "codex_untrusted",
+      "codex_never",
+      "codex_on_failure",
+      "codex_network",
+      "codex_danger_full_access",
+    ]);
+    expect(config.profiles.claude_auto).toMatchObject({
+      runtime: "claude",
+      claudePermissionMode: "auto",
+      allowedModels: ["claude-opus-4-7", "claude-opus-4-6"],
+    });
+    expect(config.profiles.claude_bypass_permissions).toMatchObject({
+      runtime: "claude",
+      policyId: "full_access",
+      claudePermissionMode: "bypassPermissions",
+    });
+    expect(config.profiles.codex_plan).toMatchObject({
+      runtime: "codex",
+      policyId: "readonly",
+      codexSandboxMode: "read-only",
+      codexApprovalPolicy: "on-request",
+    });
+    expect(config.profiles.codex_danger_full_access).toMatchObject({
+      runtime: "codex",
+      policyId: "full_access",
+      codexSandboxMode: "danger-full-access",
+      codexApprovalPolicy: "never",
+      codexNetworkAccessEnabled: true,
+    });
+  });
+
+  it("overwrites previously generated default configs with the current preset set", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "auto-pm-lite-desktop-"));
+    const configPath = path.join(root, "config.toml");
+
+    await fs.writeFile(configPath, `# Auto-PM Lite default config
+
+[storage]
+db_path = "${path.join(root, "old.db").replace(/\\/g, "/")}"
+
+[workspace]
+root_dir = "${path.join(root, "old-workspaces").replace(/\\/g, "/")}"
+
+[policy.readonly]
+permission_mode = "read-only"
+sandbox_mode = "read-only"
+network_allowed = false
+approval_policy = "orchestrator"
+require_approval_for = []
+max_depth = 1
+allow_cross_harness_delegation = false
+allow_child_edit = false
+allow_child_network = false
+
+[account.anthropic_env]
+vendor = "anthropic"
+secret_ref = "env:ANTHROPIC_API_KEY"
+
+[profile.claude_readonly]
+runtime = "claude"
+account = "anthropic_env"
+policy = "readonly"
+model = "old-model"
+claude_permission_mode = "dontAsk"
+`, "utf8");
+
+    await ensureDefaultConfig(configPath);
+
+    const raw = await fs.readFile(configPath, "utf8");
+    const config = await loadConfig(configPath);
+    expect(raw).toContain("[profile.claude_auto]");
+    expect(raw).toContain("[profile.codex_danger_full_access]");
+    expect(raw).not.toContain("old-model");
+    expect(Object.keys(config.profiles)).toContain("claude_bypass_permissions");
+    expect(Object.keys(config.profiles)).toContain("codex_network");
   });
 
   it("keeps IPC channels typed, supports replay subscriptions, and avoids raw secret/env channels", () => {
@@ -77,6 +163,7 @@ describe("desktop foundation", () => {
         id: "claude_readonly",
         runtime: "claude",
         model: "claude-opus-4-7",
+        allowedModels: ["claude-opus-4-7"],
         policyId: "readonly",
         claudePermissionMode: "dontAsk",
       }],
@@ -103,6 +190,7 @@ describe("desktop foundation", () => {
           status: "completed",
           runtime: "claude",
           profileId: "claude_readonly",
+          model: "claude-opus-4-7",
           artifacts: [],
           pendingApprovalIds: [],
         }),

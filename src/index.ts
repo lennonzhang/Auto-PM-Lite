@@ -49,7 +49,8 @@ program
   .option("-c, --config <path>", "Path to config TOML", defaultConfigPath())
   .option("--cwd <path>", "Task working directory", process.cwd())
   .option("-n, --name <name>", "Optional task name")
-  .action(async ({ config, cwd, name, profile }) => {
+  .option("--model <model>", "Model to use for this task")
+  .action(async ({ config, cwd, name, profile, model }) => {
     const services = await openAppServices(config);
 
     try {
@@ -57,6 +58,7 @@ program
         profileId: profile,
         cwd,
         name,
+        model,
       });
 
       process.stdout.write(`${JSON.stringify(task, null, 2)}\n`);

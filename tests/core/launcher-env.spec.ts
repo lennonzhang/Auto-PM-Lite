@@ -1,6 +1,17 @@
-import { describe, expect, it } from "vitest";
-import { applyLauncherEnvToConfig, buildLauncherSessionEnv, parseLauncherEnv } from "../../src/core/launcher-env.js";
+import fs from "node:fs/promises";
+import os from "node:os";
+import path from "node:path";
+import { afterEach, describe, expect, it } from "vitest";
+import { applyLauncherEnvToConfig, buildLauncherSessionEnv, loadProjectLauncherEnv, parseLauncherEnv } from "../../src/core/launcher-env.js";
 import type { AppConfig } from "../../src/core/types.js";
+
+const tempPaths: string[] = [];
+
+afterEach(async () => {
+  await Promise.all(tempPaths.splice(0).map(async (target) => {
+    await fs.rm(target, { recursive: true, force: true });
+  }));
+});
 
 describe("project launcher env", () => {
   it("maps launcher registry selections to session env without exposing unrelated keys", () => {
@@ -95,6 +106,38 @@ CODEX__AUTO_CODE_VIP__KEY__CX_PRO=sk-codex
     expect(config.accounts.codex_compatible?.baseUrl).toBeUndefined();
     expect(config.accounts.codex_compatible?.extraConfig).toBeUndefined();
     expect(config.profiles.codex_edit?.model).toBe("placeholder");
+  });
+
+  it("loads config-directory launcher env before project cwd launcher env", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "auto-pm-lite-launcher-candidates-"));
+    tempPaths.push(root);
+    const configDir = path.join(root, "config-home");
+    const projectDir = path.join(root, "project");
+    await fs.mkdir(configDir, { recursive: true });
+    await fs.mkdir(projectDir, { recursive: true });
+    await fs.writeFile(path.join(configDir, "launcher.env"), `
+CODEX_PLATFORM=AUTO_CODE_VIP
+CODEX_KEY=CX_PLUS
+CODEX__AUTO_CODE_VIP__KEY__CX_PLUS=config-key
+CODEX__AUTO_CODE_VIP__MODEL=config-model
+`, "utf8");
+    await fs.writeFile(path.join(projectDir, "launcher.env"), `
+CODEX_KEY=CX_PRO
+CODEX__AUTO_CODE_VIP__KEY__CX_PRO=project-key
+CODEX__AUTO_CODE_VIP__MODEL=project-model
+`, "utf8");
+
+    const launcherEnv = await loadProjectLauncherEnv({
+      cwd: projectDir,
+      configPath: path.join(configDir, "config.toml"),
+    });
+
+    expect(launcherEnv?.files).toEqual([
+      path.join(configDir, "launcher.env"),
+      path.join(projectDir, "launcher.env"),
+    ]);
+    expect(launcherEnv?.values.CODEX_KEY).toBe("CX_PRO");
+    expect(launcherEnv?.sessionEnv.OPENAI_API_KEY).toBe("project-key");
   });
 });
 

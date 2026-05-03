@@ -32,7 +32,7 @@ export interface DesktopApi {
   listTasks(): Promise<TaskSummary[]>;
   getTask(taskId: string): Promise<TaskDetail>;
   getTaskResult(input: { requesterTaskId: string; taskId: string }): Promise<TaskResultView>;
-  createTask(input: { profileId: string; cwd: string; name?: string | undefined }): Promise<TaskDetail>;
+  createTask(input: { profileId: string; cwd: string; name?: string | undefined; model?: string | undefined }): Promise<TaskDetail>;
   createSmokeChildTask(input: { parentTaskId: string; targetProfileId: string; name?: string | undefined }): Promise<TaskDetail>;
   runTask(input: { taskId: string; prompt: string }): Promise<TaskActionAccepted>;
   resumeTask(input: { taskId: string; prompt?: string | undefined }): Promise<TaskActionAccepted & { resumed: true }>;

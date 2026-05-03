@@ -11,6 +11,9 @@ import {
   filterTasks,
   pendingApprovalsForTask,
   runtimeSummary,
+  defaultModelForProfile,
+  modelOptionsForProfile,
+  taskDetailResult,
   taskBudgetSummary,
   taskCanCancel,
   taskCanPause,
@@ -111,6 +114,7 @@ describe("desktop workbench view model", () => {
       status: "awaiting_approval",
       runtime: "claude",
       profileId: "profile",
+      model: "claude-opus-4-7",
       latestMessage: "done",
       artifacts: [artifact],
       pendingApprovalIds: ["approval-1"],
@@ -123,6 +127,36 @@ describe("desktop workbench view model", () => {
     });
     expect(artifactLabel(artifact)).toBe("Result file");
     expect(taskResultSummary(result)).toBe("awaiting_approval with 1 pending approval(s)");
+  });
+
+  it("maps task detail results and profile model options for the desktop form", () => {
+    const detail: TaskDetail = {
+      ...detailTask("task-1", "active"),
+      model: "claude-sonnet-4-6",
+      status: "interrupted" as TaskDetail["status"],
+      latestMessage: "partial answer",
+      terminalError: "provider unavailable",
+    };
+    const result = taskDetailResult(detail);
+
+    expect(result?.model).toBe("claude-sonnet-4-6");
+    expect(taskResultSummary(result)).toBe("interrupted: returned partial answer");
+    expect(defaultModelForProfile({
+      id: "claude",
+      runtime: "claude",
+      model: "claude-opus-4-7",
+      allowedModels: ["claude-opus-4-7", "claude-sonnet-4-6"],
+      policyId: "p",
+      claudePermissionMode: "dontAsk",
+    })).toBe("claude-opus-4-7");
+    expect(modelOptionsForProfile({
+      id: "claude",
+      runtime: "claude",
+      model: "claude-opus-4-7",
+      allowedModels: ["claude-opus-4-7", "claude-sonnet-4-6"],
+      policyId: "p",
+      claudePermissionMode: "dontAsk",
+    })).toEqual(["claude-opus-4-7", "claude-sonnet-4-6"]);
   });
 
   it("summarizes runtime diagnostics", () => {
@@ -153,6 +187,7 @@ function task(id: string, status: string, parentTaskId?: string): TaskSummary {
     name: null,
     profileId: "profile",
     runtime: "claude",
+    model: "claude-opus-4-7",
     status,
     cwd: "cwd",
     ...(parentTaskId ? { parentTaskId } : {}),
@@ -167,6 +202,7 @@ function detailTask(id: string, workspaceStatus: NonNullable<TaskDetail["workspa
     id,
     profileId: "profile",
     runtime: "claude",
+    model: "claude-opus-4-7",
     cwd: "cwd",
     workspaceId: "ws",
     delegationDepth: 0,
