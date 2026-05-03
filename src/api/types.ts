@@ -62,17 +62,22 @@ export interface TaskSummary {
   name: string | null;
   profileId: string;
   runtime: string;
+  model: string;
   status: string;
   cwd: string;
   parentTaskId?: string | undefined;
   delegationDepth: number;
   triggeredBy: string;
   createdAt: string;
+  latestMessage?: string | undefined;
+  terminalError?: string | undefined;
 }
 
 export interface TaskDetail extends Task {
   turns: TurnView[];
   artifacts: ArtifactView[];
+  latestMessage?: string | undefined;
+  terminalError?: string | undefined;
   workspace?: WorkspaceView | undefined;
 }
 
@@ -114,6 +119,7 @@ export type ConfigProfileMetadata =
       id: string;
       runtime: "claude";
       model: string;
+      allowedModels?: string[] | undefined;
       policyId: string;
       claudePermissionMode: ClaudePermissionMode;
     }
@@ -121,6 +127,7 @@ export type ConfigProfileMetadata =
       id: string;
       runtime: "codex";
       model: string;
+      allowedModels?: string[] | undefined;
       policyId: string;
       codexSandboxMode: CodexSandboxMode;
       codexApprovalPolicy: CodexApprovalPolicy;
@@ -141,7 +148,9 @@ export interface TaskResultView {
   status: string;
   runtime: string;
   profileId: string;
+  model: string;
   latestMessage?: string | undefined;
+  terminalError?: string | undefined;
   artifacts: ArtifactView[];
   pendingApprovalIds: string[];
 }

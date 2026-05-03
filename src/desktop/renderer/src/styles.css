@@ -700,10 +700,12 @@ code {
 }
 
 .resultStrip span {
-  overflow: hidden;
-  text-overflow: ellipsis;
-  white-space: nowrap;
   color: var(--text-secondary);
+  display: -webkit-box;
+  -webkit-line-clamp: 4;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  overflow-wrap: anywhere;
 }
 
 /* ── Transcript area ── */
@@ -765,6 +767,22 @@ code {
   line-height: 1.5;
 }
 
+.turnRow pre {
+  margin: 8px 0 0;
+  max-height: 220px;
+  overflow: auto;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  border: 1px solid var(--border-default);
+  border-radius: var(--radius-md);
+  padding: 8px 9px;
+  background: var(--bg-base);
+  color: var(--text-primary);
+  font-family: var(--font-body);
+  font-size: 12.5px;
+  line-height: 1.5;
+}
+
 /* ── Event rows ── */
 
 .eventRow {
@@ -779,6 +797,13 @@ code {
   font-family: var(--font-mono);
   font-size: 11px;
   color: var(--text-secondary);
+}
+
+.eventRow small {
+  grid-column: 1 / -1;
+  min-width: 0;
+  color: var(--text-muted);
+  overflow-wrap: anywhere;
 }
 
 /* ── Approval rows ── */

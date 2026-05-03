@@ -23,6 +23,7 @@ export interface CreateTaskInput {
   profileId: string;
   cwd: string;
   name?: string;
+  model?: string | undefined;
 }
 
 export interface RunTaskInput {
@@ -51,7 +52,9 @@ export interface TaskResultSnapshot {
   status: Task["status"];
   runtime: Task["runtime"];
   profileId: string;
+  model: string;
   latestMessage?: string | undefined;
+  terminalError?: string | undefined;
   artifacts: StoredArtifact[];
   pendingApprovalIds: string[];
 }
@@ -105,6 +108,17 @@ export class Orchestrator {
     const now = new Date().toISOString();
     const runningTasks = this.db.listTasksByStatus("running");
     for (const task of runningTasks) {
+      const terminalEvent = this.db.getLatestTerminalTaskEvent(task.id);
+      if (terminalEvent) {
+        this.db.updateTaskRuntimeState({
+          taskId: task.id,
+          status: terminalEventToTaskStatus(terminalEvent.type),
+          backendThreadId: task.backendThreadId,
+          updatedAt: terminalEvent.ts,
+          ...(terminalEvent.type === "task.completed" || terminalEvent.type === "task.failed" || terminalEvent.type === "task.cancelled" ? { completedAt: terminalEvent.ts } : {}),
+        });
+        continue;
+      }
       this.db.updateTaskRuntimeState({
         taskId: task.id,
         status: "reconcile_required",
@@ -122,6 +136,7 @@ export class Orchestrator {
     }
 
     const policy = this.requirePolicy(profile.policyId);
+    const model = resolveTaskModel(profile, input.model);
     const now = new Date().toISOString();
     const taskId = randomUUID();
     const workspacePlan = this.workspaceManager.resolveWorkspacePlan({
@@ -141,6 +156,7 @@ export class Orchestrator {
       name: input.name,
       profileId: profile.id,
       runtime: profile.runtime,
+      model,
       cwd: workspace.path,
       workspaceId: workspace.id,
       delegationDepth: 0,
@@ -184,6 +200,14 @@ export class Orchestrator {
 
   listArtifacts(taskId: string): ReturnType<AppDatabase["listArtifacts"]> {
     return this.db.listArtifacts(taskId);
+  }
+
+  getLatestCompletedMessage(taskId: string): string | undefined {
+    return this.db.getLatestCompletedMessage(taskId);
+  }
+
+  getLatestTerminalError(taskId: string): string | undefined {
+    return this.db.getLatestTerminalError(taskId);
   }
 
   getWorkspace(workspaceId: string): ReturnType<AppDatabase["getWorkspace"]> {
@@ -579,6 +603,7 @@ export class Orchestrator {
       name: `${input.taskType}:${targetProfile.runtime}`,
       profileId: targetProfile.id,
       runtime: targetProfile.runtime,
+      model: resolveTaskModel(targetProfile),
       cwd: workspace.path,
       workspaceId: workspace.id,
       parentTaskId: parentTask.id,
@@ -717,6 +742,7 @@ export class Orchestrator {
     const handle = await runtime.startTask({
       taskId: task.id,
       profileId: task.profileId,
+      model: task.model,
       cwd: task.cwd,
     });
 
@@ -740,6 +766,7 @@ export class Orchestrator {
       await this.consumeTurn(task, runtime, {
         taskId: task.id,
         profileId: task.profileId,
+        model: task.model,
         cwd: task.cwd,
         prompt: input.prompt,
       }, turnId, handle.backendThreadId);
@@ -787,6 +814,7 @@ export class Orchestrator {
     const handle = await runtime.resumeTask({
       taskId: task.id,
       profileId: task.profileId,
+      model: task.model,
       cwd: task.cwd,
       backendThreadId: task.backendThreadId,
     });
@@ -816,6 +844,7 @@ export class Orchestrator {
       await this.consumeTurn(task, runtime, {
         taskId: task.id,
         profileId: task.profileId,
+        model: task.model,
         cwd: task.cwd,
         prompt: turnPrompt,
       }, turnId, handle.backendThreadId);
@@ -1076,7 +1105,9 @@ export class Orchestrator {
       status: task.status,
       runtime: task.runtime,
       profileId: task.profileId,
+      model: task.model,
       ...(this.db.getLatestCompletedMessage(task.id) ? { latestMessage: this.db.getLatestCompletedMessage(task.id) } : {}),
+      ...(this.db.getLatestTerminalError(task.id) ? { terminalError: this.db.getLatestTerminalError(task.id) } : {}),
       artifacts: this.db.listArtifacts(task.id),
       pendingApprovalIds: this.db.listPendingApprovals(task.id).map((approval) => approval.id),
     };
@@ -1115,7 +1146,7 @@ export class Orchestrator {
   private async consumeTurn(
     task: Task,
     runtime: RuntimeAdapter,
-    input: { taskId: string; profileId: string; cwd: string; prompt: string },
+    input: { taskId: string; profileId: string; model: string; cwd: string; prompt: string },
     turnId: string,
     backendThreadId?: string | undefined,
   ): Promise<void> {
@@ -1204,7 +1235,7 @@ export class Orchestrator {
     if (currentTask?.status === "paused") {
       return;
     }
-    if (currentTask?.status !== "awaiting_approval") {
+    if (currentTask && !["awaiting_approval", "failed", "interrupted", "cancelled"].includes(currentTask.status)) {
       this.db.updateTaskRuntimeState({
         taskId: task.id,
         status: "completed",
@@ -1387,6 +1418,7 @@ export class Orchestrator {
         status: "interrupted",
         backendThreadId: current?.backendThreadId ?? task.backendThreadId,
         updatedAt: event.ts,
+        completedAt: event.ts,
       });
       return;
     }
@@ -1429,6 +1461,34 @@ export class Orchestrator {
     await this.projectEvent(task, event);
   }
 
+}
+
+function resolveTaskModel(profile: { id: string; model: string; allowedModels?: string[] | undefined }, requestedModel?: string | undefined): string {
+  const model = (requestedModel ?? profile.model).trim();
+  if (!model) {
+    throw new AppError("validation_failed", `Model is required for profile ${profile.id}`);
+  }
+  if (profile.allowedModels && profile.allowedModels.length > 0 && !profile.allowedModels.includes(model)) {
+    throw new AppError("validation_failed", `Model ${model} is not allowed for profile ${profile.id}`, {
+      profileId: profile.id,
+      model,
+      allowedModels: profile.allowedModels,
+    });
+  }
+  return model;
+}
+
+function terminalEventToTaskStatus(type: "task.completed" | "task.failed" | "task.interrupted" | "task.cancelled"): Task["status"] {
+  switch (type) {
+    case "task.completed":
+      return "completed";
+    case "task.failed":
+      return "failed";
+    case "task.interrupted":
+      return "interrupted";
+    case "task.cancelled":
+      return "cancelled";
+  }
 }
 
 function usageToRateLimitTokens(usage: TurnUsage): number {

@@ -53,7 +53,7 @@ export class ClaudeRuntimeAdapter extends BaseRuntimeAdapter implements RuntimeA
 
     const options: Options = {
       cwd: input.cwd,
-      model: profile.model,
+      model: input.model,
       env: await this.resolveSecretEnv(account, this.runtime),
       permissionMode: profile.claudePermissionMode,
       ...(profile.claudePermissionMode === "bypassPermissions" ? { allowDangerouslySkipPermissions: true } : {}),

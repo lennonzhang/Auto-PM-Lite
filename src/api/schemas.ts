@@ -8,6 +8,7 @@ export const createTaskRequestSchema = z.object({
   profileId: z.string().min(1),
   cwd: z.string().min(1),
   name: z.string().optional(),
+  model: z.string().min(1).optional(),
 });
 
 export const runTaskRequestSchema = z.object({
@@ -77,6 +78,7 @@ export const taskSummarySchema = z.object({
   name: z.string().nullable(),
   profileId: z.string(),
   runtime: z.string(),
+  model: z.string(),
   status: z.string(),
   cwd: z.string(),
   parentTaskId: z.string().optional(),
@@ -152,6 +154,7 @@ export const taskDetailSchema = z.object({
   name: z.string().optional(),
   profileId: z.string(),
   runtime: z.enum(["claude", "codex"]),
+  model: z.string(),
   cwd: z.string(),
   workspaceId: z.string(),
   parentTaskId: z.string().optional(),
@@ -172,6 +175,8 @@ export const taskDetailSchema = z.object({
   completedAt: z.string().optional(),
   turns: z.array(turnViewSchema),
   artifacts: z.array(artifactViewSchema),
+  latestMessage: z.string().optional(),
+  terminalError: z.string().optional(),
   workspace: workspaceViewSchema.optional(),
 });
 
@@ -232,6 +237,7 @@ const configProfileMetadataSchema = z.discriminatedUnion("runtime", [
     id: z.string(),
     runtime: z.literal("claude"),
     model: z.string(),
+    allowedModels: z.array(z.string()).optional(),
     policyId: z.string(),
     claudePermissionMode: z.enum(["default", "acceptEdits", "bypassPermissions", "plan", "dontAsk", "auto"]),
   }),
@@ -239,6 +245,7 @@ const configProfileMetadataSchema = z.discriminatedUnion("runtime", [
     id: z.string(),
     runtime: z.literal("codex"),
     model: z.string(),
+    allowedModels: z.array(z.string()).optional(),
     policyId: z.string(),
     codexSandboxMode: z.enum(["read-only", "workspace-write", "danger-full-access"]),
     codexApprovalPolicy: z.enum(["never", "on-request", "on-failure", "untrusted"]),
@@ -260,7 +267,9 @@ export const taskResultViewSchema = z.object({
   status: z.string(),
   runtime: z.string(),
   profileId: z.string(),
+  model: z.string(),
   latestMessage: z.string().optional(),
+  terminalError: z.string().optional(),
   artifacts: z.array(artifactViewSchema),
   pendingApprovalIds: z.array(z.string()),
 });

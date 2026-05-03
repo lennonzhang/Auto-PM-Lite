@@ -38,7 +38,7 @@ import {
 } from "../api/schemas.js";
 
 export class TaskService {
-  constructor(private readonly orchestrator: Orchestrator, private readonly runtimeService?: RuntimeService | undefined) {}
+  constructor(private readonly orchestrator: Orchestrator, private readonly runtimeService?: RuntimeService | undefined, private readonly skipRuntimeHealthGuard = false) {}
 
   async createTask(input: unknown): Promise<TaskDetail> {
     const parsed = createTaskRequestSchema.parse(input);
@@ -46,6 +46,7 @@ export class TaskService {
       profileId: parsed.profileId,
       cwd: parsed.cwd,
       ...(parsed.name === undefined ? {} : { name: parsed.name }),
+      ...(parsed.model === undefined ? {} : { model: parsed.model }),
     });
     return this.getTask(task.id);
   }
@@ -89,6 +90,8 @@ export class TaskService {
       ...task,
       turns: this.orchestrator.listTurns(task.id),
       artifacts: this.orchestrator.listArtifacts(task.id),
+      ...(this.orchestrator.getLatestCompletedMessage(task.id) ? { latestMessage: this.orchestrator.getLatestCompletedMessage(task.id) } : {}),
+      ...(this.orchestrator.getLatestTerminalError(task.id) ? { terminalError: this.orchestrator.getLatestTerminalError(task.id) } : {}),
       ...(workspace ? { workspace } : {}),
     };
   }
@@ -103,14 +106,18 @@ export class TaskService {
 
   async runTask(input: unknown): Promise<{ ok: true; taskId: string }> {
     const parsed = runTaskRequestSchema.parse(input);
-    this.runtimeService?.assertCanRunTask(parsed.taskId);
+    if (!this.skipRuntimeHealthGuard) {
+      this.runtimeService?.assertCanRunTask(parsed.taskId);
+    }
     await this.orchestrator.runTask(parsed);
     return { ok: true, taskId: parsed.taskId };
   }
 
   async resumeTask(input: unknown): Promise<{ ok: true; taskId: string; resumed: true }> {
     const parsed = resumeTaskRequestSchema.parse(input);
-    this.runtimeService?.assertCanRunTask(parsed.taskId);
+    if (!this.skipRuntimeHealthGuard) {
+      this.runtimeService?.assertCanRunTask(parsed.taskId);
+    }
     await this.orchestrator.resumeTask(parsed);
     return { ok: true, taskId: parsed.taskId, resumed: true };
   }
@@ -245,6 +252,7 @@ export class ConfigService {
             id: profile.id,
             runtime: profile.runtime,
             model: profile.model,
+            ...(profile.allowedModels ? { allowedModels: profile.allowedModels } : {}),
             policyId: profile.policyId,
             claudePermissionMode: profile.claudePermissionMode,
           };
@@ -253,6 +261,7 @@ export class ConfigService {
           id: profile.id,
           runtime: profile.runtime,
           model: profile.model,
+          ...(profile.allowedModels ? { allowedModels: profile.allowedModels } : {}),
           policyId: profile.policyId,
           codexSandboxMode: profile.codexSandboxMode,
           codexApprovalPolicy: profile.codexApprovalPolicy,
@@ -481,10 +490,11 @@ export interface AppServices {
 
 export interface AppServicesOptions {
   runtimeLog?: ((message: string) => void | Promise<void>) | undefined;
+  skipRuntimeHealthGuard?: boolean | undefined;
 }
 
-export function createAppServices(config: AppConfig, orchestrator: Orchestrator): AppServices {
-  return createAppServicesWithRuntimeEnv(config, orchestrator);
+export function createAppServices(config: AppConfig, orchestrator: Orchestrator, options: AppServicesOptions = {}): AppServices {
+  return createAppServicesWithRuntimeEnv(config, orchestrator, process.env, undefined, options);
 }
 
 function createAppServicesWithRuntimeEnv(
@@ -497,7 +507,7 @@ function createAppServicesWithRuntimeEnv(
   const runtime = new RuntimeService(config, orchestrator, sourceEnv);
   return {
     config: new ConfigService(config, launcherEnv),
-    tasks: new TaskService(orchestrator, runtime),
+    tasks: new TaskService(orchestrator, runtime, options.skipRuntimeHealthGuard),
     approvals: new ApprovalService(orchestrator),
     workspaces: new WorkspaceService(orchestrator),
     events: new EventService(orchestrator),
@@ -546,7 +556,10 @@ export async function openAppServices(configPath: string, options: AppServicesOp
 
 export async function ensureDefaultConfig(configPath = defaultConfigPath()): Promise<void> {
   try {
-    await fs.access(configPath);
+    const raw = await fs.readFile(configPath, "utf8");
+    if (raw.includes(defaultConfigMarker)) {
+      await writeDefaultConfig(configPath);
+    }
     return;
   } catch (error) {
     if (!error || typeof error !== "object" || !("code" in error) || error.code !== "ENOENT") {
@@ -554,10 +567,14 @@ export async function ensureDefaultConfig(configPath = defaultConfigPath()): Pro
     }
   }
 
+  await writeDefaultConfig(configPath);
+}
+
+async function writeDefaultConfig(configPath: string): Promise<void> {
   await fs.mkdir(path.dirname(configPath), { recursive: true });
   const normalizedHomeConfig = configPath.replace(/\\/g, "/");
   const rootDir = path.join(path.dirname(configPath), "workspaces").replace(/\\/g, "/");
-  await fs.writeFile(configPath, `# Auto-PM Lite default config
+  await fs.writeFile(configPath, `${defaultConfigMarker}
 
 [storage]
 db_path = "${path.join(path.dirname(configPath), "auto-pm-lite.db").replace(/\\/g, "/")}"
@@ -594,6 +611,28 @@ allow_cross_harness_delegation = true
 allow_child_edit = true
 allow_child_network = false
 
+[policy.network_edit]
+permission_mode = "edit"
+sandbox_mode = "workspace-write"
+network_allowed = true
+approval_policy = "orchestrator"
+require_approval_for = ["workspace_merge", "shell", "sandbox_escape"]
+max_depth = 2
+allow_cross_harness_delegation = true
+allow_child_edit = true
+allow_child_network = true
+
+[policy.full_access]
+permission_mode = "full"
+sandbox_mode = "danger-full-access"
+network_allowed = true
+approval_policy = "orchestrator"
+require_approval_for = []
+max_depth = 2
+allow_cross_harness_delegation = true
+allow_child_edit = true
+allow_child_network = true
+
 [account.anthropic_env]
 vendor = "anthropic"
 secret_ref = "env:ANTHROPIC_API_KEY"
@@ -607,7 +646,57 @@ runtime = "claude"
 account = "anthropic_env"
 policy = "readonly"
 model = "claude-opus-4-7"
+allowed_models = ["claude-opus-4-7", "claude-opus-4-6"]
 claude_permission_mode = "dontAsk"
+
+[profile.claude_default]
+runtime = "claude"
+account = "anthropic_env"
+policy = "edit"
+model = "claude-opus-4-7"
+allowed_models = ["claude-opus-4-7", "claude-opus-4-6"]
+claude_permission_mode = "default"
+
+[profile.claude_accept_edits]
+runtime = "claude"
+account = "anthropic_env"
+policy = "edit"
+model = "claude-opus-4-7"
+allowed_models = ["claude-opus-4-7", "claude-opus-4-6"]
+claude_permission_mode = "acceptEdits"
+
+[profile.claude_auto]
+runtime = "claude"
+account = "anthropic_env"
+policy = "edit"
+model = "claude-opus-4-7"
+allowed_models = ["claude-opus-4-7", "claude-opus-4-6"]
+claude_permission_mode = "auto"
+
+[profile.claude_plan]
+runtime = "claude"
+account = "anthropic_env"
+policy = "readonly"
+model = "claude-opus-4-7"
+allowed_models = ["claude-opus-4-7", "claude-opus-4-6"]
+claude_permission_mode = "plan"
+
+[profile.claude_bypass_permissions]
+runtime = "claude"
+account = "anthropic_env"
+policy = "full_access"
+model = "claude-opus-4-7"
+allowed_models = ["claude-opus-4-7", "claude-opus-4-6"]
+claude_permission_mode = "bypassPermissions"
+
+[profile.codex_plan]
+runtime = "codex"
+account = "openai_env"
+policy = "readonly"
+model = "gpt-5-codex"
+codex_sandbox_mode = "read-only"
+codex_approval_policy = "on-request"
+codex_network_access_enabled = false
 
 [profile.codex_edit]
 runtime = "codex"
@@ -618,11 +707,58 @@ codex_sandbox_mode = "workspace-write"
 codex_approval_policy = "on-request"
 codex_network_access_enabled = false
 
+[profile.codex_untrusted]
+runtime = "codex"
+account = "openai_env"
+policy = "edit"
+model = "gpt-5-codex"
+codex_sandbox_mode = "workspace-write"
+codex_approval_policy = "untrusted"
+codex_network_access_enabled = false
+
+[profile.codex_never]
+runtime = "codex"
+account = "openai_env"
+policy = "edit"
+model = "gpt-5-codex"
+codex_sandbox_mode = "workspace-write"
+codex_approval_policy = "never"
+codex_network_access_enabled = false
+
+[profile.codex_on_failure]
+runtime = "codex"
+account = "openai_env"
+policy = "edit"
+model = "gpt-5-codex"
+codex_sandbox_mode = "workspace-write"
+codex_approval_policy = "on-failure"
+codex_network_access_enabled = false
+
+[profile.codex_network]
+runtime = "codex"
+account = "openai_env"
+policy = "network_edit"
+model = "gpt-5-codex"
+codex_sandbox_mode = "workspace-write"
+codex_approval_policy = "on-request"
+codex_network_access_enabled = true
+
+[profile.codex_danger_full_access]
+runtime = "codex"
+account = "openai_env"
+policy = "full_access"
+model = "gpt-5-codex"
+codex_sandbox_mode = "danger-full-access"
+codex_approval_policy = "never"
+codex_network_access_enabled = true
+
 # Set ANTHROPIC_API_KEY / OPENAI_API_KEY in the environment, or copy launcher.env.example
 # to launcher.env next to this config and choose CLAUDE_PLATFORM / CODEX_PLATFORM there.
 # Config path: ${normalizedHomeConfig}
 `, "utf8");
 }
+
+const defaultConfigMarker = "# Auto-PM Lite default config";
 
 function unique(values: string[]): string[] {
   return Array.from(new Set(values));

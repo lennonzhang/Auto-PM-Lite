@@ -4,6 +4,7 @@ import { fileURLToPath } from "node:url";
 import electronPath from "electron";
 import { build } from "tsup";
 import { createServer } from "vite";
+import { prepareDesktopRuntimeDependencies } from "./desktop-runtime-deps.js";
 
 const repoRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const mainPath = path.join(repoRoot, "dist", "desktop", "main", "index.js");
@@ -40,6 +41,8 @@ await build({
   outExtension: () => ({ js: ".cjs" }),
   external: ["electron"],
 });
+
+await prepareDesktopRuntimeDependencies({ repoRoot });
 
 const server = await createServer({
   configFile: path.join(repoRoot, "src", "desktop", "renderer", "vite.config.ts"),
