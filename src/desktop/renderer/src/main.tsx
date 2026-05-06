@@ -60,9 +60,27 @@ function App() {
   const [diffOpen, setDiffOpen] = useState(false);
 
   useEffect(() => {
-    let unsubscribe: (() => void) | undefined;
     void refresh();
-    void window.autoPm.replayAndSubscribeToEvents({}, (event) => {
+  }, []);
+
+  useEffect(() => {
+    if (!selectedTaskId) {
+      setTaskDetail(null);
+      setWorkspaceDiff(null);
+      setTaskResult(null);
+      setEvents([]);
+      return;
+    }
+    void loadTaskDetail(selectedTaskId);
+  }, [selectedTaskId]);
+
+  useEffect(() => {
+    if (!selectedTaskId) {
+      return undefined;
+    }
+    let unsubscribe: (() => void) | undefined;
+    setEvents([]);
+    void window.autoPm.replayAndSubscribeToEvents({ taskId: selectedTaskId }, (event) => {
       setEvents((current) => [event, ...current].slice(0, 120));
       void refresh(selectedTaskId);
     }).then((subscription) => {
@@ -71,16 +89,6 @@ function App() {
     return () => {
       unsubscribe?.();
     };
-  }, []);
-
-  useEffect(() => {
-    if (!selectedTaskId) {
-      setTaskDetail(null);
-      setWorkspaceDiff(null);
-      setTaskResult(null);
-      return;
-    }
-    void loadTaskDetail(selectedTaskId);
   }, [selectedTaskId]);
 
   async function refresh(preferredTaskId = selectedTaskId) {
@@ -150,7 +158,7 @@ function App() {
   const approvedMergeId = approvedMergeApprovalId(taskDetail, approvals);
   const healthSummary = runtimeSummary(runtimeHealth);
   const budgetSummary = taskBudgetSummary(taskDetail);
-  const filteredEvents = events.filter((event) => !selectedTaskId || event.event.taskId === selectedTaskId);
+  const filteredEvents = events;
   const selectedNewTaskProfile = config?.profiles.find((profile) => profile.id === newTaskProfile) ?? null;
   const selectedNewTaskModelOptions = modelOptionsForProfile(selectedNewTaskProfile);
   const latestTurnId = taskDetail?.turns[taskDetail.turns.length - 1]?.id;
@@ -313,9 +321,9 @@ function App() {
             <div className="eventList">
               {filteredEvents.map((event, index) => (
                 <div className="eventRow" key={`${event.event.ts}-${index}`}>
-                  <span>{event.event.type}</span>
-                  <code>{event.event.taskId.slice(0, 8)}</code>
-                  <time>{new Date(event.event.ts).toLocaleTimeString()}</time>
+                  <span>{event.event.kind}</span>
+                  <code>{event.taskId.slice(0, 8)}</code>
+                  <time>{new Date(event.ts).toLocaleTimeString()}</time>
                   <small>{eventSummary(event.event)}</small>
                 </div>
               ))}
@@ -574,14 +582,23 @@ function profilePermissionText(profile?: ConfigMetadata["profiles"][number] | nu
 }
 
 function eventSummary(event: EventEnvelope["event"]): string {
-  if ("text" in event && typeof event.text === "string") {
-    return event.text;
+  if (event.kind === "item.started") {
+    return event.item.kind;
   }
-  if ("error" in event && typeof event.error === "string") {
-    return event.error;
+  if (event.kind === "item.updated") {
+    return event.patch.op;
+  }
+  if (event.kind === "item.completed") {
+    return event.itemKind;
+  }
+  if ("error" in event) {
+    return event.error.message;
   }
   if ("summary" in event && typeof event.summary === "string") {
     return event.summary;
+  }
+  if ("message" in event && typeof event.message === "string") {
+    return event.message;
   }
   return "";
 }

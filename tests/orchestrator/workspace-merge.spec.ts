@@ -6,8 +6,9 @@ import { execFileSync } from "node:child_process";
 import { afterEach, describe, expect, it } from "vitest";
 import { AppDatabase } from "../../src/storage/db.js";
 import { Orchestrator } from "../../src/orchestrator/orchestrator.js";
-import type { AgentEvent, AppConfig } from "../../src/core/types.js";
-import type { RuntimeAdapter, RuntimeTaskHandle, RunTurnInput, StartRuntimeTaskInput, ResumeRuntimeTaskInput } from "../../src/runtime/adapter.js";
+import type { AppConfig } from "../../src/core/types.js";
+import type { RuntimeAdapter, RuntimeAdapterOutput, RuntimeTaskHandle, RunTurnInput, StartRuntimeTaskInput, ResumeRuntimeTaskInput } from "../../src/runtime/adapter.js";
+import { fileChanged, messageCompleted, turnCompleted, turnStarted } from "../helpers/v2-runtime.js";
 
 const tempPaths: string[] = [];
 
@@ -18,11 +19,11 @@ class FakeRuntime implements RuntimeAdapter {
     return { taskId: input.taskId, backendThreadId: `thread-${input.taskId}` };
   }
 
-  async *runTurn(input: RunTurnInput): AsyncIterable<AgentEvent> {
+  async *runTurn(input: RunTurnInput): AsyncIterable<RuntimeAdapterOutput> {
     const ts = new Date().toISOString();
-    yield { type: "turn.started", taskId: input.taskId, turnId: "turn-1", ts };
-    yield { type: "message.completed", taskId: input.taskId, turnId: "turn-1", text: input.prompt, ts };
-    yield { type: "turn.completed", taskId: input.taskId, turnId: "turn-1", usage: { inputTokens: 1, outputTokens: 1 }, ts };
+    yield turnStarted(input);
+    yield messageCompleted(input, input.prompt, ts);
+    yield turnCompleted(input, { inputTokens: 1, outputTokens: 1 }, ts);
   }
 
   async resumeTask(input: ResumeRuntimeTaskInput): Promise<RuntimeTaskHandle> {
@@ -81,7 +82,7 @@ describe("workspace merge lifecycle", () => {
       const mergedContent = await fs.readFile(path.join(parent.cwd, "feature.txt"), "utf8");
       expect(mergedContent.replace(/\r\n/g, "\n")).toBe("feature\n");
       expect(db.getWorkspace(childTask!.workspaceId)?.status).toBe("merged");
-      expect(db.listEvents({ taskId: childTask!.id }).map((event) => event.type)).toEqual(expect.arrayContaining([
+      expect(db.listTaskEvents({ taskId: childTask!.id }).map((event) => event.event.kind)).toEqual(expect.arrayContaining([
         "workspace.merge_requested",
         "workspace.merge_started",
         "workspace.merged",
@@ -563,7 +564,7 @@ async function buildEnv(options?: { initializeGit?: boolean; topLevelUseWorktree
         runtime: "codex",
         accountId: "openai",
         policyId: "child_edit",
-        model: "gpt-5-codex",
+        model: "gpt-5-4",
         codexSandboxMode: "workspace-write",
         codexApprovalPolicy: "on-request",
         codexNetworkAccessEnabled: false,
@@ -575,7 +576,7 @@ async function buildEnv(options?: { initializeGit?: boolean; topLevelUseWorktree
               runtime: "codex" as const,
               accountId: "openai",
               policyId: "codex_readonly",
-              model: "gpt-5-codex",
+              model: "gpt-5-4",
               codexSandboxMode: "read-only" as const,
               codexApprovalPolicy: "on-request" as const,
               codexNetworkAccessEnabled: false,

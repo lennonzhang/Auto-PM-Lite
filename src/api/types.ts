@@ -1,5 +1,4 @@
 import type {
-  AgentEvent,
   ArtifactRef,
   ApprovalKind,
   ClaudePermissionMode,
@@ -12,10 +11,11 @@ import type {
   WorkspaceDiff,
   WorkspaceMergeResult,
 } from "../core/types.js";
+export type { EventEnvelope } from "../core/events.js";
 import type { StoredApproval, StoredArtifact } from "../storage/db.js";
 
 export const apiVersion = 1;
-export const eventEnvelopeVersion = 1;
+export const eventEnvelopeVersion = 2;
 
 export type AppErrorCode =
   | "validation_failed"
@@ -153,14 +153,6 @@ export interface TaskResultView {
   terminalError?: string | undefined;
   artifacts: ArtifactView[];
   pendingApprovalIds: string[];
-}
-
-export interface EventEnvelope {
-  eventEnvelopeVersion: number;
-  id?: number | undefined;
-  durable: boolean;
-  ephemeral?: boolean | undefined;
-  event: AgentEvent;
 }
 
 export interface ConfigMetadata {

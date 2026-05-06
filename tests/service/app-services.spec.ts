@@ -24,8 +24,9 @@ import {
   workspaceDiffSchema,
   workspaceMergeResultSchema,
 } from "../../src/api/schemas.js";
-import type { AgentEvent, AppConfig } from "../../src/core/types.js";
-import type { RuntimeAdapter, RuntimeTaskHandle, RunTurnInput, StartRuntimeTaskInput, ResumeRuntimeTaskInput } from "../../src/runtime/adapter.js";
+import type { AppConfig } from "../../src/core/types.js";
+import type { RuntimeAdapter, RuntimeAdapterOutput, RuntimeTaskHandle, RunTurnInput, StartRuntimeTaskInput, ResumeRuntimeTaskInput } from "../../src/runtime/adapter.js";
+import { fileChanged, messageCompleted, turnCompleted, turnStarted } from "../helpers/v2-runtime.js";
 
 const tempPaths: string[] = [];
 
@@ -41,12 +42,12 @@ class FakeRuntime implements RuntimeAdapter {
     return { taskId: input.taskId, backendThreadId: `thread-${input.taskId}` };
   }
 
-  async *runTurn(input: RunTurnInput): AsyncIterable<AgentEvent> {
+  async *runTurn(input: RunTurnInput): AsyncIterable<RuntimeAdapterOutput> {
     this.turns.push(input);
     const ts = new Date().toISOString();
-    yield { type: "turn.started", taskId: input.taskId, turnId: "turn-1", ts };
-    yield { type: "message.completed", taskId: input.taskId, turnId: "turn-1", text: input.prompt, ts };
-    yield { type: "turn.completed", taskId: input.taskId, turnId: "turn-1", usage: { inputTokens: 1, outputTokens: 1 }, ts };
+    yield turnStarted(input);
+    yield messageCompleted(input, input.prompt, ts);
+    yield turnCompleted(input, { inputTokens: 1, outputTokens: 1 }, ts);
   }
 
   async resumeTask(input: ResumeRuntimeTaskInput): Promise<RuntimeTaskHandle> {
@@ -369,7 +370,7 @@ secret_ref = "env:OPENAI_API_KEY"
 runtime = "codex"
 account = "codex_local"
 policy = "edit"
-model = "gpt-5-codex"
+model = "gpt-5-4"
 codex_sandbox_mode = "workspace-write"
 codex_approval_policy = "on-request"
 codex_network_access_enabled = false
@@ -419,7 +420,7 @@ CODEX__AUTO_CODE_VIP__KEY__CX_PRO=sk-codex
     }
   });
 
-  it("wraps replayed events in event envelopes", async () => {
+  it("replays v2 event envelopes", async () => {
     const { services } = await buildServices();
 
     try {
@@ -432,11 +433,10 @@ CODEX__AUTO_CODE_VIP__KEY__CX_PRO=sk-codex
       const replay = await services.events.replayAndSubscribe({
         taskId: task.id,
         listener: (event) => {
-          expect(event.eventEnvelopeVersion).toBe(1);
-          expect(event.durable).toBe(true);
-          expect(event.id).toEqual(expect.any(Number));
-          expect(eventEnvelopeSchema.parse(event).id).toBe(event.id);
-          seen.push(event.event.type);
+          expect(event.v).toBe(2);
+          expect(event.taskSeq).toEqual(expect.any(Number));
+          expect(eventEnvelopeSchema.parse(event).taskSeq).toBe(event.taskSeq);
+          seen.push(event.event.kind);
         },
       });
       replay.unsubscribe();
@@ -447,7 +447,7 @@ CODEX__AUTO_CODE_VIP__KEY__CX_PRO=sk-codex
     }
   });
 
-  it("uses sinceId as an exclusive event cursor", async () => {
+  it("uses sinceTaskSeq as an exclusive task-local cursor", async () => {
     const { db, services } = await buildServices();
 
     try {
@@ -455,23 +455,23 @@ CODEX__AUTO_CODE_VIP__KEY__CX_PRO=sk-codex
         profileId: "claude_main",
         cwd: services.config.getMetadata().workspace.rootDir,
       });
-      const second = await services.tasks.createTask({
+      await services.tasks.createTask({
         profileId: "claude_main",
         cwd: services.config.getMetadata().workspace.rootDir,
       });
-      const firstEvent = db.listEvents({ taskId: first.id })[0]!;
+      const firstEvent = db.listTaskEvents({ taskId: first.id })[0]!;
 
       const seen: string[] = [];
       const replay = await services.events.replayAndSubscribe({
-        sinceId: firstEvent.id,
+        taskId: first.id,
+        sinceTaskSeq: firstEvent.taskSeq,
         listener: (event) => {
-          seen.push(event.event.taskId);
+          seen.push(event.event.kind);
         },
       });
       replay.unsubscribe();
 
-      expect(seen).not.toContain(first.id);
-      expect(seen).toContain(second.id);
+      expect(seen).toEqual([]);
     } finally {
       await services.close();
     }
@@ -522,7 +522,7 @@ CODEX__AUTO_CODE_VIP__KEY__CX_PRO=sk-codex
     expect(createTaskRequestSchema.parse({ profileId: "p", cwd: "c" })).toEqual({ profileId: "p", cwd: "c" });
     expect(resolveApprovalRequestSchema.parse({ approvalId: "a", approved: true })).toEqual({ approvalId: "a", approved: true });
     expect(requestWorkspaceMergeSchema.parse({ taskId: "t", reason: "ready" })).toEqual({ taskId: "t", reason: "ready" });
-    expect(eventSubscriptionRequestSchema.parse({ sinceId: 10 })).toEqual({ sinceId: 10 });
+    expect(eventSubscriptionRequestSchema.parse({ taskId: "task-1", sinceTaskSeq: 10 })).toEqual({ taskId: "task-1", sinceTaskSeq: 10 });
     expect(approvalViewSchema.parse({
       id: "a",
       taskId: "t",
@@ -603,7 +603,7 @@ async function buildServices(options?: { editableWorkspace?: boolean; secretRef?
               runtime: "codex" as const,
               accountId: "anthropic",
               policyId: "child_edit",
-              model: "gpt-5-codex",
+              model: "gpt-5-4",
               codexSandboxMode: "workspace-write" as const,
               codexApprovalPolicy: "on-request" as const,
               codexNetworkAccessEnabled: false,

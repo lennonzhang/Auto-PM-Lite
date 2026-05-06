@@ -115,14 +115,14 @@ describe("CodexRuntimeAdapter", () => {
       runtime: "codex",
       accountId: "vip",
       policyId: "edit",
-      model: "gpt-5-codex",
+      model: "gpt-5-4",
       codexSandboxMode: "danger-full-access",
       codexApprovalPolicy: "never",
       codexNetworkAccessEnabled: true,
-    }, "gpt-5-codex", "D:/Code/Auto-PM-Lite");
+    }, "gpt-5-4", "D:/Code/Auto-PM-Lite");
 
     expect(options).toMatchObject({
-      model: "gpt-5-codex",
+      model: "gpt-5-4",
       sandboxMode: "danger-full-access",
       approvalPolicy: "never",
       networkAccessEnabled: true,

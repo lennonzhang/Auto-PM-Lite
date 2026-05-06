@@ -268,36 +268,6 @@ export interface DelegateToResult {
   message: string;
 }
 
-export type AgentEvent =
-  | { type: "task.queued"; taskId: string; ts: string }
-  | { type: "task.started"; taskId: string; runtime: RuntimeKind; profileId: string; ts: string }
-  | { type: "task.backend_thread"; taskId: string; backendThreadId: string; ts: string }
-  | { type: "turn.started"; taskId: string; turnId: string; ts: string }
-  | { type: "turn.completed"; taskId: string; turnId: string; usage?: TurnUsage | undefined; ts: string }
-  | { type: "message.delta"; taskId: string; turnId?: string; text: string; ts: string }
-  | { type: "message.completed"; taskId: string; turnId?: string; text: string; ts: string }
-  | { type: "tool.call"; taskId: string; tool: string; input: unknown; ts: string }
-  | { type: "tool.result"; taskId: string; tool: string; result: unknown; ts: string }
-  | { type: "approval.requested"; taskId: string; approvalId: string; kind: ApprovalKind; ts: string }
-  | { type: "approval.resolved"; taskId: string; approvalId: string; approved: boolean; ts: string }
-  | { type: "delegation.requested"; taskId: string; request: unknown; ts: string }
-  | { type: "delegation.started"; taskId: string; childTaskId: string; ts: string }
-  | { type: "delegation.completed"; taskId: string; childTaskId: string; ts: string }
-  | { type: "reference.expanded"; taskId: string; sourceTaskId: string; requestedByTaskId: string; ts: string }
-  | { type: "workspace.merge_requested"; taskId: string; workspaceId: string; approvalId: string; ts: string }
-  | { type: "workspace.merge_started"; taskId: string; workspaceId: string; parentAdvanced: boolean; ts: string }
-  | { type: "workspace.merged"; taskId: string; workspaceId: string; parentAdvanced: boolean; ts: string }
-  | { type: "workspace.merge_failed"; taskId: string; workspaceId: string; error: WorkspaceMergeError; ts: string }
-  | { type: "workspace.discarded"; taskId: string; workspaceId: string; ts: string }
-  | { type: "file.changed"; taskId: string; path: string; changeKind: "create" | "modify" | "delete"; ts: string }
-  | { type: "budget.warning"; taskId: string; message: string; ts: string }
-  | { type: "budget.exceeded"; taskId: string; message: string; ts: string }
-  | { type: "task.completed"; taskId: string; summary: string; ts: string }
-  | { type: "task.paused"; taskId: string; ts: string }
-  | { type: "task.interrupted"; taskId: string; error: string; code?: string | undefined; details?: unknown | undefined; action?: string | undefined; ts: string }
-  | { type: "task.failed"; taskId: string; error: string; code?: string | undefined; details?: unknown | undefined; action?: string | undefined; ts: string }
-  | { type: "task.cancelled"; taskId: string; ts: string };
-
 export interface AppConfig {
   accounts: Record<string, Account>;
   policies: Record<string, Policy>;

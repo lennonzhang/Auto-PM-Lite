@@ -6,7 +6,7 @@ import { AppDatabase } from "../../src/storage/db.js";
 import { checkBudget, updateBudget } from "../../src/orchestrator/budget.js";
 import { DefaultTaskScheduler } from "../../src/orchestrator/scheduler.js";
 import { TokenBucketRateLimiter } from "../../src/orchestrator/rate-limit.js";
-import { InMemoryEventStream } from "../../src/orchestrator/event-stream.js";
+import { EventHub } from "../../src/orchestrator/event-hub.js";
 import type { BudgetSnapshot, Policy, Task, TurnUsage } from "../../src/core/types.js";
 
 describe("Phase 4: Budget Tracking", () => {
@@ -216,71 +216,75 @@ describe("Phase 4: Rate Limiter", () => {
   });
 });
 
-describe("Phase 4: Event Stream", () => {
-  it("should publish events to subscribers", () => {
-    const stream = new InMemoryEventStream();
+describe("Phase 4: EventHub", () => {
+  it("should publish v2 events to task subscribers", () => {
+    const db = new AppDatabase({ dbPath: ":memory:", busyTimeoutMs: 1000 });
+    const hub = new EventHub(db.db);
     const events: any[] = [];
 
-    stream.subscribe((event) => {
+    hub.subscribe({ taskId: "task1", listener: (event) => {
       events.push(event);
-    });
+    } });
 
-    stream.publish({
-      type: "task.started",
-      taskId: "task1",
+    hub.publish({
       runtime: "claude",
-      profileId: "profile1",
-      ts: new Date().toISOString(),
+      taskId: "task1",
+      sessionId: "session1",
+      event: { kind: "task.started", profileId: "profile1", model: "model", cwd: "cwd" },
     });
 
     expect(events).toHaveLength(1);
-    expect(events[0].type).toBe("task.started");
+    expect(events[0].event.kind).toBe("task.started");
+    db.close();
   });
 
   it("should support multiple subscribers", () => {
-    const stream = new InMemoryEventStream();
+    const db = new AppDatabase({ dbPath: ":memory:", busyTimeoutMs: 1000 });
+    const hub = new EventHub(db.db);
     const events1: any[] = [];
     const events2: any[] = [];
 
-    stream.subscribe((event) => events1.push(event));
-    stream.subscribe((event) => events2.push(event));
+    hub.subscribe({ taskId: "task1", listener: (event) => events1.push(event) });
+    hub.subscribe({ taskId: "task1", listener: (event) => events2.push(event) });
 
-    stream.publish({
-      type: "task.completed",
+    hub.publish({
+      runtime: "claude",
       taskId: "task1",
-      summary: "Done",
-      ts: new Date().toISOString(),
+      sessionId: "session1",
+      event: { kind: "task.completed", summary: "Done" },
     });
 
     expect(events1).toHaveLength(1);
     expect(events2).toHaveLength(1);
+    db.close();
   });
 
   it("should allow unsubscribing", () => {
-    const stream = new InMemoryEventStream();
+    const db = new AppDatabase({ dbPath: ":memory:", busyTimeoutMs: 1000 });
+    const hub = new EventHub(db.db);
     const events: any[] = [];
 
-    const unsubscribe = stream.subscribe((event) => {
+    const unsubscribe = hub.subscribe({ taskId: "task1", listener: (event) => {
       events.push(event);
-    });
+    } });
 
-    stream.publish({
-      type: "task.started",
-      taskId: "task1",
+    hub.publish({
       runtime: "claude",
-      profileId: "profile1",
-      ts: new Date().toISOString(),
+      taskId: "task1",
+      sessionId: "session1",
+      event: { kind: "task.started", profileId: "profile1", model: "model", cwd: "cwd" },
     });
 
     unsubscribe();
 
-    stream.publish({
-      type: "task.completed",
+    hub.publish({
+      runtime: "claude",
       taskId: "task1",
-      summary: "Done",
-      ts: new Date().toISOString(),
+      sessionId: "session1",
+      event: { kind: "task.completed", summary: "Done" },
     });
 
     expect(events).toHaveLength(1);
+    db.close();
   });
 });

@@ -1,12 +1,10 @@
-import { randomUUID } from "node:crypto";
 import { query, type CanUseTool, type Options, type Query } from "@anthropic-ai/claude-agent-sdk";
-import type { AgentEvent } from "../core/types.js";
 import { createClaudeMcpServer } from "../mcp/claude-binding.js";
 import { AutoPmMcpService } from "../mcp/auto-pm-service.js";
 import { allowedClaudeTools, classifyClaudeTool, isClaudeEditTool } from "../orchestrator/policy.js";
 import { BaseRuntimeAdapter, type RuntimeDependencies } from "./base.js";
-import type { ResumeRuntimeTaskInput, RunTurnInput, RuntimeAdapter, RuntimeTaskHandle, StartRuntimeTaskInput } from "./adapter.js";
-import { normalizeClaudeMessage } from "./normalize/claude.js";
+import type { ResumeRuntimeTaskInput, RunTurnInput, RuntimeAdapter, RuntimeAdapterOutput, RuntimeTaskHandle, StartRuntimeTaskInput } from "./adapter.js";
+import { createClaudeV2NormalizerState, normalizeClaudeMessageV2 } from "./normalize/claude-v2.js";
 
 export interface ClaudeRuntimeDependencies extends RuntimeDependencies {
   createMcpHandlers?: ((taskId: string) => ConstructorParameters<typeof AutoPmMcpService>[0]) | undefined;
@@ -39,7 +37,7 @@ export class ClaudeRuntimeAdapter extends BaseRuntimeAdapter implements RuntimeA
     };
   }
 
-  async *runTurn(input: RunTurnInput): AsyncIterable<AgentEvent> {
+  async *runTurn(input: RunTurnInput): AsyncIterable<RuntimeAdapterOutput> {
     this.writeRuntimeLog(`runtime.turn.start runtime=claude taskId=${input.taskId} profileId=${input.profileId}`);
     const profile = this.getProfile(input.profileId);
     if (profile.runtime !== "claude") {
@@ -47,9 +45,9 @@ export class ClaudeRuntimeAdapter extends BaseRuntimeAdapter implements RuntimeA
     }
     const account = this.getAccount(profile.accountId);
     const policy = this.getPolicy(profile.policyId);
-    const turnId = randomUUID();
+    const state = createClaudeV2NormalizerState();
 
-    yield { type: "turn.started", taskId: input.taskId, turnId, ts: new Date().toISOString() };
+    yield { event: { kind: "turn.started", turnId: input.turnId } };
 
     const options: Options = {
       cwd: input.cwd,
@@ -84,8 +82,15 @@ export class ClaudeRuntimeAdapter extends BaseRuntimeAdapter implements RuntimeA
 
     try {
       for await (const message of session) {
-        for (const event of normalizeClaudeMessage(input.taskId, message, turnId)) {
-          yield event;
+        const events = normalizeClaudeMessageV2({
+          taskId: input.taskId,
+          turnId: input.turnId,
+          cwd: input.cwd,
+          message,
+          state,
+        });
+        if (events.length > 0) {
+          yield { raw: message, events };
         }
       }
     } finally {

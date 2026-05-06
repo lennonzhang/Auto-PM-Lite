@@ -6,8 +6,8 @@ import { AppDatabase } from "../../storage/db.js";
 import { Orchestrator } from "../../orchestrator/orchestrator.js";
 import { createAppServices, type AppServices } from "../../service/app-services.js";
 import { loadConfig } from "../../core/config.js";
-import type { AgentEvent, AppConfig } from "../../core/types.js";
-import type { ResumeRuntimeTaskInput, RunTurnInput, RuntimeAdapter, RuntimeTaskHandle, StartRuntimeTaskInput } from "../../runtime/adapter.js";
+import type { AppConfig } from "../../core/types.js";
+import type { ResumeRuntimeTaskInput, RunTurnInput, RuntimeAdapter, RuntimeAdapterOutput, RuntimeTaskHandle, StartRuntimeTaskInput } from "../../runtime/adapter.js";
 
 export async function openDesktopSmokeServices(configPath: string): Promise<AppServices> {
   await ensureDesktopSmokeConfig(configPath);
@@ -102,20 +102,62 @@ class DesktopSmokeRuntime implements RuntimeAdapter {
     return { taskId: input.taskId, backendThreadId: `smoke-thread-${input.taskId}` };
   }
 
-  async *runTurn(input: RunTurnInput): AsyncIterable<AgentEvent> {
-    const turnId = `turn-${input.taskId}`;
+  async *runTurn(input: RunTurnInput): AsyncIterable<RuntimeAdapterOutput> {
     const ts = new Date().toISOString();
-    yield { type: "turn.started", taskId: input.taskId, turnId, ts };
-    yield { type: "message.completed", taskId: input.taskId, turnId, text: `smoke:${input.prompt}`, ts };
+    yield { event: { kind: "turn.started", turnId: input.turnId } };
+    yield {
+      event: {
+        kind: "item.started",
+        item: {
+          id: `smoke:message:${input.taskId}`,
+          taskId: input.taskId,
+          sessionId: `smoke-thread-${input.taskId}`,
+          turnId: input.turnId,
+          kind: "assistant_message",
+          status: "completed",
+          startedAt: ts,
+          updatedAt: ts,
+          completedAt: ts,
+          payload: { text: `smoke:${input.prompt}` },
+        },
+      },
+    };
 
     if (this.runtime === "claude") {
-      yield { type: "delegation.requested", taskId: input.taskId, request: { taskType: "edit", reason: "desktop smoke" }, ts };
+      yield {
+        event: {
+          kind: "item.started",
+          item: {
+            id: `smoke:delegation:${input.taskId}`,
+            taskId: input.taskId,
+            sessionId: `smoke-thread-${input.taskId}`,
+            turnId: input.turnId,
+            kind: "delegation",
+            status: "completed",
+            startedAt: ts,
+            updatedAt: ts,
+            completedAt: ts,
+            payload: { status: "requested", prompt: "desktop smoke", finalResponse: "desktop smoke delegation" },
+          },
+        },
+      };
     } else {
       await fs.writeFile(path.join(input.cwd, `smoke-${input.taskId.slice(0, 8)}.txt`), "desktop smoke\n", "utf8");
-      yield { type: "file.changed", taskId: input.taskId, path: `smoke-${input.taskId.slice(0, 8)}.txt`, changeKind: "create", ts };
+      yield {
+        event: {
+          kind: "item.completed",
+          itemId: `smoke:file:${input.taskId}`,
+          itemKind: "file_change",
+          finalPayload: {
+            changes: [{ path: `smoke-${input.taskId.slice(0, 8)}.txt`, changeKind: "create", binary: false }],
+            status: "applied",
+          },
+          completedAt: ts,
+        },
+      };
     }
 
-    yield { type: "turn.completed", taskId: input.taskId, turnId, usage: { inputTokens: 1, outputTokens: 1 }, ts };
+    yield { event: { kind: "turn.completed", turnId: input.turnId, usage: { inputTokens: 1, outputTokens: 1 } } };
   }
 
   async resumeTask(input: ResumeRuntimeTaskInput): Promise<RuntimeTaskHandle> {

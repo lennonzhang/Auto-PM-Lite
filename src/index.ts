@@ -331,33 +331,21 @@ program
   .command("events:stream")
   .description("Replay persisted events then stream live events from the orchestrator")
   .option("-c, --config <path>", "Path to config TOML", defaultConfigPath())
-  .option("-t, --task <id>", "Optional task ID filter")
-  .option("--since-id <number>", "Resume after a given event id (defaults to 0 = full history)")
-  .option("--no-replay", "Skip historical replay and only stream live events")
-  .action(async ({ config, task, sinceId, replay }) => {
+  .requiredOption("-t, --task <id>", "Task ID")
+  .option("--since-task-seq <number>", "Resume after a given task-local sequence (defaults to 0 = full history)")
+  .action(async ({ config, task, sinceTaskSeq }) => {
     const services = await openAppServices(config);
 
     try {
       const writer = (event: unknown) => process.stdout.write(`${JSON.stringify(event)}\n`);
-      let unsubscribe: () => void;
-
-      if (replay !== false) {
-        const result = await services.events.replayAndSubscribe({
-          taskId: task,
-          sinceId: sinceId ? Number(sinceId) : undefined,
-          listener: writer,
-        });
-        unsubscribe = result.unsubscribe;
-      } else {
-        unsubscribe = services.events.subscribe((event) => {
-          if (!task || event.event.taskId === task) {
-            writer(event);
-          }
-        });
-      }
+      const result = await services.events.replayAndSubscribe({
+        taskId: task,
+        sinceTaskSeq: sinceTaskSeq ? Number(sinceTaskSeq) : undefined,
+        listener: writer,
+      });
 
       process.on("SIGINT", () => {
-        unsubscribe();
+        result.unsubscribe();
         services.close().then(() => process.exit(0));
       });
 

@@ -15,7 +15,6 @@ import { createCodexMcpServerConfig } from "../mcp/codex-binding.js";
 import { probeInProcessMcp, probeStdioMcp } from "../mcp/diagnostics.js";
 import {
   apiVersion,
-  eventEnvelopeVersion,
   type ApprovalView,
   type ConfigMetadata,
   type EventEnvelope,
@@ -202,37 +201,18 @@ export class EventService {
   constructor(private readonly orchestrator: Orchestrator) {}
 
   async replayAndSubscribe(input: {
-    taskId?: string | undefined;
-    sinceId?: number | undefined;
+    taskId: string;
+    sinceTaskSeq?: number | undefined;
     listener: (event: EventEnvelope) => void;
-  }): Promise<{ unsubscribe: () => void; lastReplayedId: number }> {
+  }): Promise<{ unsubscribe: () => void; lastTaskSeq: number }> {
     const parsed = eventSubscriptionRequestSchema.parse({
-      ...(input.taskId === undefined ? {} : { taskId: input.taskId }),
-      ...(input.sinceId === undefined ? {} : { sinceId: input.sinceId }),
+      taskId: input.taskId,
+      ...(input.sinceTaskSeq === undefined ? {} : { sinceTaskSeq: input.sinceTaskSeq }),
     });
     return this.orchestrator.replayAndSubscribe({
       taskId: parsed.taskId,
-      sinceId: parsed.sinceId,
-      listener: (event, metadata) => {
-        input.listener({
-          eventEnvelopeVersion,
-          ...(metadata.id === undefined ? {} : { id: metadata.id }),
-          durable: metadata.durable,
-          ...(metadata.durable ? {} : { ephemeral: true }),
-          event,
-        });
-      },
-    });
-  }
-
-  subscribe(listener: (event: EventEnvelope) => void): () => void {
-    return this.orchestrator.subscribeToEvents((event) => {
-      listener({
-        eventEnvelopeVersion,
-        durable: false,
-        ephemeral: true,
-        event,
-      });
+      sinceTaskSeq: parsed.sinceTaskSeq,
+      listener: input.listener,
     });
   }
 }
@@ -693,7 +673,7 @@ claude_permission_mode = "bypassPermissions"
 runtime = "codex"
 account = "openai_env"
 policy = "readonly"
-model = "gpt-5-codex"
+model = "gpt-5-4"
 codex_sandbox_mode = "read-only"
 codex_approval_policy = "on-request"
 codex_network_access_enabled = false
@@ -702,7 +682,7 @@ codex_network_access_enabled = false
 runtime = "codex"
 account = "openai_env"
 policy = "edit"
-model = "gpt-5-codex"
+model = "gpt-5-4"
 codex_sandbox_mode = "workspace-write"
 codex_approval_policy = "on-request"
 codex_network_access_enabled = false
@@ -711,7 +691,7 @@ codex_network_access_enabled = false
 runtime = "codex"
 account = "openai_env"
 policy = "edit"
-model = "gpt-5-codex"
+model = "gpt-5-4"
 codex_sandbox_mode = "workspace-write"
 codex_approval_policy = "untrusted"
 codex_network_access_enabled = false
@@ -720,7 +700,7 @@ codex_network_access_enabled = false
 runtime = "codex"
 account = "openai_env"
 policy = "edit"
-model = "gpt-5-codex"
+model = "gpt-5-4"
 codex_sandbox_mode = "workspace-write"
 codex_approval_policy = "never"
 codex_network_access_enabled = false
@@ -729,7 +709,7 @@ codex_network_access_enabled = false
 runtime = "codex"
 account = "openai_env"
 policy = "edit"
-model = "gpt-5-codex"
+model = "gpt-5-4"
 codex_sandbox_mode = "workspace-write"
 codex_approval_policy = "on-failure"
 codex_network_access_enabled = false
@@ -738,7 +718,7 @@ codex_network_access_enabled = false
 runtime = "codex"
 account = "openai_env"
 policy = "network_edit"
-model = "gpt-5-codex"
+model = "gpt-5-4"
 codex_sandbox_mode = "workspace-write"
 codex_approval_policy = "on-request"
 codex_network_access_enabled = true
@@ -747,7 +727,7 @@ codex_network_access_enabled = true
 runtime = "codex"
 account = "openai_env"
 policy = "full_access"
-model = "gpt-5-codex"
+model = "gpt-5-4"
 codex_sandbox_mode = "danger-full-access"
 codex_approval_policy = "never"
 codex_network_access_enabled = true

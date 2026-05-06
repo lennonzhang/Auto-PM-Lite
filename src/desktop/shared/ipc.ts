@@ -48,7 +48,7 @@ export interface DesktopApi {
   getRuntimeHealth(): Promise<RuntimeHealth[]>;
   probeRuntimeLive(runtime?: string | undefined): Promise<RuntimeHealth[]>;
   openLogsDirectory(): Promise<{ ok: true }>;
-  replayAndSubscribeToEvents(input: { taskId?: string | undefined; sinceId?: number | undefined }, listener: (event: EventEnvelope) => void): Promise<{ unsubscribe: () => void; lastReplayedId: number }>;
+  replayAndSubscribeToEvents(input: { taskId: string; sinceTaskSeq?: number | undefined }, listener: (event: EventEnvelope) => void): Promise<{ unsubscribe: () => void; lastTaskSeq: number }>;
 }
 
 declare global {

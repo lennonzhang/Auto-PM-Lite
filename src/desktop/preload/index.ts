@@ -29,9 +29,9 @@ const api: DesktopApi = {
     };
     ipcRenderer.on(ipcChannels.eventsPush, wrapped);
     try {
-      const result = await invokeApi<{ subscriptionId: number; lastReplayedId: number }>(ipcChannels.eventsReplaySubscribe, input);
+      const result = await invokeApi<{ subscriptionId: number; lastTaskSeq: number }>(ipcChannels.eventsReplaySubscribe, input);
       return {
-        lastReplayedId: Number(result.lastReplayedId),
+        lastTaskSeq: Number(result.lastTaskSeq),
         unsubscribe: () => {
           ipcRenderer.off(ipcChannels.eventsPush, wrapped);
           void ipcRenderer.invoke(ipcChannels.eventsUnsubscribe, result.subscriptionId);

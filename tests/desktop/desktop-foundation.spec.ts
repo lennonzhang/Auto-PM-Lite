@@ -237,13 +237,19 @@ claude_permission_mode = "dontAsk"
       events: {
         replayAndSubscribe: async (input: { listener: (event: EventEnvelope) => void }) => {
           input.listener({
-            eventEnvelopeVersion: 1,
-            id: 1,
-            durable: true,
-            event: { type: "task.queued", taskId: "task-1", ts: new Date().toISOString() },
+            v: 2,
+            eventId: "event-1",
+            seq: 1,
+            taskSeq: 1,
+            runtime: "claude",
+            taskId: "task-1",
+            sessionId: "task-1",
+            ts: new Date().toISOString(),
+            delivery: "lossless",
+            event: { kind: "task.queued" },
           });
           return {
-            lastReplayedId: 1,
+            lastTaskSeq: 1,
             unsubscribe: () => {
               unsubscribed = true;
             },
@@ -277,10 +283,10 @@ claude_permission_mode = "dontAsk"
         },
       },
     } as unknown as IpcMainInvokeEvent;
-    const replayResult = await handlers.get(ipcChannels.eventsReplaySubscribe)!(fakeEvent, { sinceId: 0 });
-    expect(replayResult).toEqual({ subscriptionId: 7, lastReplayedId: 1 });
+    const replayResult = await handlers.get(ipcChannels.eventsReplaySubscribe)!(fakeEvent, { taskId: "task-1", sinceTaskSeq: 0 });
+    expect(replayResult).toEqual({ subscriptionId: 7, lastTaskSeq: 1 });
     expect(sent).toHaveLength(1);
-    expect((sent[0] as EventEnvelope).id).toBe(1);
+    expect((sent[0] as EventEnvelope).taskSeq).toBe(1);
 
     const configResult = await handlers.get(ipcChannels.configGet)!(fakeEvent, undefined);
     expect(JSON.stringify(configResult)).not.toContain("API_KEY=");
@@ -345,7 +351,7 @@ claude_permission_mode = "dontAsk"
       },
       runtime: { getHealth: () => [], assertCanRunTask: () => {}, probeLive: async () => [] },
       events: {
-        replayAndSubscribe: async () => ({ lastReplayedId: 0, unsubscribe: () => {} }),
+        replayAndSubscribe: async () => ({ lastTaskSeq: 0, unsubscribe: () => {} }),
       },
       close: async () => {},
     } as unknown as AppServices;
@@ -376,7 +382,7 @@ claude_permission_mode = "dontAsk"
       runtime: { getHealth: () => [] },
       events: {
         replayAndSubscribe: async () => ({
-          lastReplayedId: 0,
+          lastTaskSeq: 0,
           unsubscribe: () => {
             unsubscribeCount += 1;
           },
@@ -413,8 +419,8 @@ claude_permission_mode = "dontAsk"
       },
     } as unknown as IpcMainInvokeEvent;
 
-    await handlers.get(ipcChannels.eventsReplaySubscribe)!(fakeEvent, {});
-    await handlers.get(ipcChannels.eventsReplaySubscribe)!(fakeEvent, {});
+    await handlers.get(ipcChannels.eventsReplaySubscribe)!(fakeEvent, { taskId: "task-1" });
+    await handlers.get(ipcChannels.eventsReplaySubscribe)!(fakeEvent, { taskId: "task-1" });
     expect(unsubscribeCount).toBe(0);
     destroyedListeners[0]!();
     expect(unsubscribeCount).toBe(2);
@@ -440,7 +446,7 @@ claude_permission_mode = "dontAsk"
       },
       events: {
         replayAndSubscribe: async () => ({
-          lastReplayedId: 0,
+          lastTaskSeq: 0,
           unsubscribe: () => {
             unsubscribed = true;
           },
@@ -472,7 +478,7 @@ claude_permission_mode = "dontAsk"
     } as unknown as IpcMainInvokeEvent;
 
     const runPromise = handlers.get(ipcChannels.tasksRun)!(fakeEvent, { taskId: "task-1", prompt: "go" });
-    await handlers.get(ipcChannels.eventsReplaySubscribe)!(fakeEvent, {});
+    await handlers.get(ipcChannels.eventsReplaySubscribe)!(fakeEvent, { taskId: "task-1" });
     destroyedListeners[0]!();
 
     const accepted = await runPromise;

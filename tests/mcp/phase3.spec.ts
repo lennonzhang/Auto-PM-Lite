@@ -21,7 +21,7 @@ const codexProfile: Profile = {
   runtime: "codex",
   accountId: "openai_personal",
   policyId: "readonly_policy",
-  model: "gpt-5-codex",
+  model: "gpt-5-4",
   codexSandboxMode: "read-only",
   codexApprovalPolicy: "on-request",
   codexNetworkAccessEnabled: false,

@@ -1,4 +1,5 @@
-import type { AgentEvent, RuntimeKind } from "../core/types.js";
+import type { CanonicalEvent } from "../core/events.js";
+import type { RuntimeKind } from "../core/types.js";
 
 export interface StartRuntimeTaskInput {
   taskId: string;
@@ -10,6 +11,7 @@ export interface StartRuntimeTaskInput {
 
 export interface RunTurnInput {
   taskId: string;
+  turnId: string;
   profileId: string;
   model: string;
   cwd: string;
@@ -29,10 +31,14 @@ export interface RuntimeTaskHandle {
   backendThreadId?: string | undefined;
 }
 
+export type RuntimeAdapterOutput =
+  | { raw?: unknown | undefined; event: CanonicalEvent }
+  | { raw?: unknown | undefined; events: CanonicalEvent[] };
+
 export interface RuntimeAdapter {
   readonly runtime: RuntimeKind;
   startTask(input: StartRuntimeTaskInput): Promise<RuntimeTaskHandle>;
-  runTurn(input: RunTurnInput): AsyncIterable<AgentEvent>;
+  runTurn(input: RunTurnInput): AsyncIterable<RuntimeAdapterOutput>;
   resumeTask(input: ResumeRuntimeTaskInput): Promise<RuntimeTaskHandle>;
   pauseTask(taskId: string): Promise<void>;
   cancelTask(taskId: string): Promise<void>;

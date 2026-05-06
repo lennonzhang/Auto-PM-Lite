@@ -1,13 +1,12 @@
-import { randomUUID } from "node:crypto";
 import { Codex, type CodexOptions, type Thread, type ThreadOptions } from "@openai/codex-sdk";
-import type { Account, AgentEvent, CodexProfile, VendorKind } from "../core/types.js";
+import type { Account, CodexProfile, VendorKind } from "../core/types.js";
 import { sanitizeEnvKey } from "../core/credentials.js";
 import { isLocalSecretRef, sourceEnvAuthMode } from "../orchestrator/secrets.js";
 import { createCodexMcpServerConfig } from "../mcp/codex-binding.js";
 import { BaseRuntimeAdapter, type RuntimeDependencies } from "./base.js";
 import { getRuntimeEnvKey } from "./env.js";
-import type { ResumeRuntimeTaskInput, RunTurnInput, RuntimeAdapter, RuntimeTaskHandle, StartRuntimeTaskInput } from "./adapter.js";
-import { normalizeCodexEvent } from "./normalize/codex.js";
+import type { ResumeRuntimeTaskInput, RunTurnInput, RuntimeAdapter, RuntimeAdapterOutput, RuntimeTaskHandle, StartRuntimeTaskInput } from "./adapter.js";
+import { createCodexV2NormalizerState, normalizeCodexEventV2 } from "./normalize/codex-v2.js";
 
 type CodexConfigPrimitive = string | number | boolean;
 type CodexConfigShape = CodexConfigPrimitive | CodexConfigShape[] | { [key: string]: CodexConfigShape };
@@ -39,22 +38,30 @@ export class CodexRuntimeAdapter extends BaseRuntimeAdapter implements RuntimeAd
     };
   }
 
-  async *runTurn(input: RunTurnInput): AsyncIterable<AgentEvent> {
+  async *runTurn(input: RunTurnInput): AsyncIterable<RuntimeAdapterOutput> {
     this.writeRuntimeLog(`runtime.turn.start runtime=codex taskId=${input.taskId} profileId=${input.profileId}`);
     const thread = this.threads.get(input.taskId);
     if (!thread) {
       throw new Error(`No Codex thread for task ${input.taskId}`);
     }
 
-    const turnId = randomUUID();
+    const state = createCodexV2NormalizerState();
     const controller = new AbortController();
     this.abortControllers.set(input.taskId, controller);
 
     try {
       const streamed = await thread.runStreamed(input.prompt, { signal: controller.signal });
       for await (const event of streamed.events) {
-        for (const normalized of normalizeCodexEvent(input.taskId, event, turnId)) {
-          yield normalized;
+        const events = normalizeCodexEventV2({
+          taskId: input.taskId,
+          sessionId: thread.id ?? input.taskId,
+          turnId: input.turnId,
+          cwd: input.cwd,
+          event,
+          state,
+        });
+        if (events.length > 0) {
+          yield { raw: event, events };
         }
       }
     } finally {

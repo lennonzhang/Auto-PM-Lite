@@ -53,12 +53,12 @@ export function registerIpcHandlers(ipcMain: Pick<IpcMain, "handle">, runtime: I
     await shell.openPath(logDir);
     return { ok: true as const };
   }));
-  ipcMain.handle(ipcChannels.eventsReplaySubscribe, handleApi(async (event: IpcMainInvokeEvent, input?: { taskId?: string; sinceId?: number }) => {
+  ipcMain.handle(ipcChannels.eventsReplaySubscribe, handleApi(async (event: IpcMainInvokeEvent, input: { taskId: string; sinceTaskSeq?: number }) => {
     const subscriptionId = runtime.getNextSubscriptionId();
     const sender = event.sender;
     const replay = await (await runtime.getServices()).events.replayAndSubscribe({
-      taskId: input?.taskId,
-      sinceId: input?.sinceId,
+      taskId: input.taskId,
+      sinceTaskSeq: input.sinceTaskSeq,
       listener: (envelope: EventEnvelope) => {
         sendEvent(sender, envelope);
       },
@@ -69,7 +69,7 @@ export function registerIpcHandlers(ipcMain: Pick<IpcMain, "handle">, runtime: I
     };
     eventSubscriptions.set(subscriptionId, unsubscribe);
     registerSenderSubscription(senderSubscriptions, eventSubscriptions, sender, subscriptionId);
-    return { subscriptionId, lastReplayedId: replay.lastReplayedId };
+    return { subscriptionId, lastTaskSeq: replay.lastTaskSeq };
   }));
   ipcMain.handle(ipcChannels.eventsUnsubscribe, handleApi(async (_event, subscriptionId: number) => {
     cleanupSubscription(eventSubscriptions, subscriptionId);

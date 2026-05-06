@@ -560,87 +560,80 @@ export class AppDatabase {
   }
 
   getLatestCompletedMessage(taskId: string): string | undefined {
-    const row = this.db.prepare(`
-      SELECT payload_json
+    const v2Row = this.db.prepare(`
+      SELECT event_json
       FROM events
-      WHERE task_id = ? AND type = 'message.completed'
-      ORDER BY id DESC
+      WHERE task_id = ? AND json_extract(event_json, '$.kind') = 'item.completed'
+        AND json_extract(event_json, '$.itemKind') = 'assistant_message'
+      ORDER BY task_seq DESC
       LIMIT 1
-    `).get(taskId) as { payload_json: string } | undefined;
+    `).get(taskId) as { event_json: string } | undefined;
 
-    if (!row) {
-      return undefined;
+    if (v2Row) {
+      const event = JSON.parse(v2Row.event_json) as { finalPayload?: { text?: unknown } };
+      if (typeof event.finalPayload?.text === "string") {
+        return event.finalPayload.text;
+      }
     }
 
-    const payload = JSON.parse(row.payload_json) as { text?: unknown };
-    return typeof payload.text === "string" ? payload.text : undefined;
+    return undefined;
   }
 
   getLatestTerminalError(taskId: string): string | undefined {
-    const row = this.db.prepare(`
-      SELECT payload_json
+    const v2Row = this.db.prepare(`
+      SELECT event_json
       FROM events
-      WHERE task_id = ? AND type IN ('task.failed', 'task.interrupted')
-      ORDER BY id DESC
+      WHERE task_id = ? AND json_extract(event_json, '$.kind') IN ('task.failed', 'task.interrupted', 'turn.failed')
+      ORDER BY task_seq DESC
       LIMIT 1
-    `).get(taskId) as { payload_json: string } | undefined;
+    `).get(taskId) as { event_json: string } | undefined;
 
-    if (!row) {
-      return undefined;
+    if (v2Row) {
+      const event = JSON.parse(v2Row.event_json) as { error?: { message?: unknown } };
+      if (typeof event.error?.message === "string") {
+        return event.error.message;
+      }
     }
 
-    const payload = JSON.parse(row.payload_json) as { error?: unknown };
-    return typeof payload.error === "string" ? payload.error : undefined;
+    return undefined;
   }
 
   getLatestTerminalTaskEvent(taskId: string): { type: "task.completed" | "task.failed" | "task.interrupted" | "task.cancelled"; ts: string; error?: string | undefined } | undefined {
-    const row = this.db.prepare(`
-      SELECT type, payload_json, ts
+    const v2Row = this.db.prepare(`
+      SELECT event_json, ts
       FROM events
-      WHERE task_id = ? AND type IN ('task.completed', 'task.failed', 'task.interrupted', 'task.cancelled')
-      ORDER BY id DESC
+      WHERE task_id = ? AND json_extract(event_json, '$.kind') IN ('task.completed', 'task.failed', 'task.interrupted', 'task.cancelled')
+      ORDER BY task_seq DESC
       LIMIT 1
-    `).get(taskId) as { type: string; payload_json: string; ts: string } | undefined;
+    `).get(taskId) as { event_json: string; ts: string } | undefined;
 
-    if (!row) {
-      return undefined;
+    if (v2Row) {
+      const event = JSON.parse(v2Row.event_json) as { kind: "task.completed" | "task.failed" | "task.interrupted" | "task.cancelled"; error?: { message?: unknown } };
+      return {
+        type: event.kind,
+        ts: v2Row.ts,
+        ...(typeof event.error?.message === "string" ? { error: event.error.message } : {}),
+      };
     }
 
-    const payload = JSON.parse(row.payload_json) as { error?: unknown };
-    return {
-      type: row.type as "task.completed" | "task.failed" | "task.interrupted" | "task.cancelled",
-      ts: row.ts,
-      ...(typeof payload.error === "string" ? { error: payload.error } : {}),
-    };
+    return undefined;
   }
 
-  listEvents(input: { taskId?: string | undefined; afterId?: number | undefined; limit?: number | undefined }): Array<{ id: number; taskId: string; turnId: string | null; type: string; payload: Record<string, unknown>; ts: string }> {
-    const filters: string[] = [];
-    const params: Array<string | number> = [];
-    if (input.taskId) {
-      filters.push("task_id = ?");
-      params.push(input.taskId);
-    }
-    if (input.afterId !== undefined) {
-      filters.push("id > ?");
-      params.push(input.afterId);
-    }
-    const where = filters.length > 0 ? `WHERE ${filters.join(" AND ")}` : "";
+  listTaskEvents(input: { taskId: string; sinceTaskSeq?: number | undefined; limit?: number | undefined }): Array<{ seq: number; taskSeq: number; taskId: string; event: Record<string, unknown>; ts: string }> {
     const limit = input.limit && input.limit > 0 ? input.limit : 1000;
     const rows = this.db.prepare(`
-      SELECT id, task_id, turn_id, type, payload_json, ts
+      SELECT seq, task_seq, task_id, event_json, ts
       FROM events
-      ${where}
-      ORDER BY id ASC
+      WHERE task_id = ? AND task_seq > ?
+      ORDER BY task_seq ASC
       LIMIT ${limit}
-    `).all(...params) as Array<Record<string, unknown>>;
+    `).all(input.taskId, input.sinceTaskSeq ?? 0) as Array<Record<string, unknown>>;
 
     return rows.map((row) => ({
-      id: Number(row.id),
+      seq: Number(row.seq),
+      taskSeq: Number(row.task_seq),
       taskId: String(row.task_id),
-      turnId: row.turn_id === null ? null : String(row.turn_id),
-      type: String(row.type),
-      payload: JSON.parse(String(row.payload_json)) as Record<string, unknown>,
+      event: JSON.parse(String(row.event_json)) as Record<string, unknown>,
       ts: String(row.ts),
     }));
   }
@@ -847,16 +840,6 @@ export class AppDatabase {
         started_at TEXT NOT NULL,
         completed_at TEXT
       );
-
-      CREATE TABLE IF NOT EXISTS events (
-        id INTEGER PRIMARY KEY AUTOINCREMENT,
-        task_id TEXT NOT NULL,
-        turn_id TEXT,
-        type TEXT NOT NULL,
-        payload_json TEXT NOT NULL,
-        ts TEXT NOT NULL
-      );
-      CREATE INDEX IF NOT EXISTS idx_events_task_ts ON events(task_id, ts);
 
       CREATE TABLE IF NOT EXISTS approvals (
         id TEXT PRIMARY KEY,

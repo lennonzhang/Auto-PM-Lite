@@ -5,8 +5,8 @@ import { afterEach, describe, expect, it } from "vitest";
 import { loadConfig } from "../../src/core/config.js";
 import { AppDatabase } from "../../src/storage/db.js";
 import { Orchestrator } from "../../src/orchestrator/orchestrator.js";
-import type { AgentEvent } from "../../src/core/types.js";
-import type { RuntimeAdapter, RuntimeTaskHandle, RunTurnInput, StartRuntimeTaskInput, ResumeRuntimeTaskInput } from "../../src/runtime/adapter.js";
+import type { RuntimeAdapter, RuntimeAdapterOutput, RuntimeTaskHandle, RunTurnInput, StartRuntimeTaskInput, ResumeRuntimeTaskInput } from "../../src/runtime/adapter.js";
+import { fileChanged, messageCompleted, turnCompleted, turnStarted } from "../helpers/v2-runtime.js";
 
 const tempPaths: string[] = [];
 
@@ -21,11 +21,11 @@ class FakeAdapter implements RuntimeAdapter {
     return { taskId: input.taskId, backendThreadId: `thread-${input.taskId}` };
   }
 
-  async *runTurn(input: RunTurnInput): AsyncIterable<AgentEvent> {
+  async *runTurn(input: RunTurnInput): AsyncIterable<RuntimeAdapterOutput> {
     const ts = new Date().toISOString();
-    yield { type: "turn.started", taskId: input.taskId, turnId: "turn-1", ts };
-    yield { type: "message.completed", taskId: input.taskId, turnId: "turn-1", text: "hi", ts };
-    yield { type: "turn.completed", taskId: input.taskId, turnId: "turn-1", usage: this.usage, ts };
+    yield turnStarted(input);
+    yield messageCompleted(input, "hi", ts);
+    yield turnCompleted(input, this.usage, ts);
   }
 
   async resumeTask(input: ResumeRuntimeTaskInput): Promise<RuntimeTaskHandle> {
@@ -47,11 +47,11 @@ class FakeCodexAdapter implements RuntimeAdapter {
     return { taskId: input.taskId, backendThreadId: `codex-thread-${input.taskId}` };
   }
 
-  async *runTurn(input: RunTurnInput): AsyncIterable<AgentEvent> {
+  async *runTurn(input: RunTurnInput): AsyncIterable<RuntimeAdapterOutput> {
     const ts = new Date().toISOString();
-    yield { type: "turn.started", taskId: input.taskId, turnId: "turn-1", ts };
-    yield { type: "message.completed", taskId: input.taskId, turnId: "turn-1", text: `codex:${input.prompt}`, ts };
-    yield { type: "turn.completed", taskId: input.taskId, turnId: "turn-1", usage: { inputTokens: 10, outputTokens: 5 }, ts };
+    yield turnStarted(input);
+    yield messageCompleted(input, `codex:${input.prompt}`, ts);
+    yield turnCompleted(input, { inputTokens: 10, outputTokens: 5 }, ts);
   }
 
   async resumeTask(input: ResumeRuntimeTaskInput): Promise<RuntimeTaskHandle> {
@@ -64,9 +64,9 @@ class FakeCodexAdapter implements RuntimeAdapter {
 }
 
 class ThrowingStartAdapter extends FakeAdapter {
-  override async *runTurn(input: RunTurnInput): AsyncIterable<AgentEvent> {
+  override async *runTurn(input: RunTurnInput): AsyncIterable<RuntimeAdapterOutput> {
     const ts = new Date().toISOString();
-    yield { type: "turn.started", taskId: input.taskId, turnId: "turn-1", ts };
+    yield turnStarted(input);
     throw new Error("start exploded");
   }
 }
@@ -74,13 +74,13 @@ class ThrowingStartAdapter extends FakeAdapter {
 class ThrowingResumeAdapter extends FakeAdapter {
   private turnCount = 0;
 
-  override async *runTurn(input: RunTurnInput): AsyncIterable<AgentEvent> {
+  override async *runTurn(input: RunTurnInput): AsyncIterable<RuntimeAdapterOutput> {
     this.turnCount += 1;
     const ts = new Date().toISOString();
-    yield { type: "turn.started", taskId: input.taskId, turnId: "turn-1", ts };
+    yield turnStarted(input);
     if (this.turnCount === 1) {
-      yield { type: "message.completed", taskId: input.taskId, turnId: "turn-1", text: "seed", ts };
-      yield { type: "turn.completed", taskId: input.taskId, turnId: "turn-1", usage: this.usage, ts };
+      yield messageCompleted(input, "seed", ts);
+      yield turnCompleted(input, this.usage, ts);
       return;
     }
     throw new Error("resume exploded");
@@ -159,7 +159,7 @@ claude_permission_mode = "dontAsk"
 runtime = "codex"
 accountId = "openai_personal"
 policyId = "child"
-model = "gpt-5-codex"
+model = "gpt-5-4"
 codex_sandbox_mode = "read-only"
 codex_approval_policy = "on-request"
 codex_network_access_enabled = false
@@ -341,8 +341,8 @@ describe("failure semantics", () => {
     try {
       const task = await orchestrator.createTask({ profileId: "claude_main", cwd: root });
       const liveTypes: string[] = [];
-      const unsubscribe = orchestrator.subscribeToEvents((event) => {
-        liveTypes.push(event.type);
+      const unsubscribe = orchestrator.subscribeToTaskEvents(task.id, (event) => {
+        liveTypes.push(event.event.kind);
       });
 
       await expect(orchestrator.runTask({ taskId: task.id, prompt: "go" })).rejects.toThrow("start exploded");
@@ -350,7 +350,7 @@ describe("failure semantics", () => {
 
       expect(db.getTask(task.id)?.status).toBe("interrupted");
       expect(liveTypes).toContain("task.interrupted");
-      expect(db.listEvents({ taskId: task.id }).map((row) => row.type)).toContain("task.interrupted");
+      expect(db.listTaskEvents({ taskId: task.id }).map((row) => row.event.kind)).toContain("task.interrupted");
     } finally {
       await orchestrator.close();
     }
@@ -372,8 +372,8 @@ describe("failure semantics", () => {
       });
 
       const liveTypes: string[] = [];
-      const unsubscribe = orchestrator.subscribeToEvents((event) => {
-        liveTypes.push(event.type);
+      const unsubscribe = orchestrator.subscribeToTaskEvents(task.id, (event) => {
+        liveTypes.push(event.event.kind);
       });
 
       await expect(orchestrator.resumeTask({ taskId: task.id, prompt: "resume" })).rejects.toThrow("resume exploded");
@@ -381,7 +381,7 @@ describe("failure semantics", () => {
 
       expect(db.getTask(task.id)?.status).toBe("failed");
       expect(liveTypes).toContain("task.failed");
-      expect(db.listEvents({ taskId: task.id }).map((row) => row.type)).toContain("task.failed");
+      expect(db.listTaskEvents({ taskId: task.id }).map((row) => row.event.kind)).toContain("task.failed");
     } finally {
       await orchestrator.close();
     }
@@ -397,14 +397,14 @@ describe("event replay", () => {
       await orchestrator.runTask({ taskId: task.id, prompt: "go" });
 
       const seenTypes: string[] = [];
-      const durableIds: number[] = [];
+      const durableSeqs: number[] = [];
       const { unsubscribe } = await orchestrator.replayAndSubscribe({
         taskId: task.id,
-        listener: (event, metadata) => {
-          expect(metadata.durable).toBe(true);
-          expect(metadata.id).toEqual(expect.any(Number));
-          durableIds.push(metadata.id!);
-          seenTypes.push(event.type);
+        listener: (event) => {
+          expect(event.v).toBe(2);
+          expect(event.seq).toEqual(expect.any(Number));
+          durableSeqs.push(event.seq);
+          seenTypes.push(event.event.kind);
         },
       });
       unsubscribe();
@@ -415,9 +415,9 @@ describe("event replay", () => {
       expect(seenTypes).toContain("task.completed");
       const completedCount = seenTypes.filter((t) => t === "task.completed").length;
       expect(completedCount).toBe(1);
-      const rows = db.listEvents({ taskId: task.id });
+      const rows = db.listTaskEvents({ taskId: task.id });
       expect(rows.length).toBe(seenTypes.length);
-      expect(durableIds).toEqual(rows.map((row) => row.id));
+      expect(durableSeqs).toEqual(rows.map((row) => row.seq));
     } finally {
       await orchestrator.close();
     }
@@ -428,15 +428,15 @@ describe("event replay", () => {
 
     try {
       const liveTypes: string[] = [];
-      const unsubscribe = orchestrator.subscribeToEvents((event) => {
-        liveTypes.push(event.type);
+      const unsubscribe = orchestrator.subscribeToTaskEvents("pending-task", (event) => {
+        liveTypes.push(event.event.kind);
       });
 
       const task = await orchestrator.createTask({ profileId: "claude_main", cwd: root });
       unsubscribe();
 
-      expect(liveTypes).toContain("task.queued");
-      expect(db.listEvents({ taskId: task.id }).map((row) => row.type)).toContain("task.queued");
+      const replayed = db.listTaskEvents({ taskId: task.id }).map((row) => row.event.kind);
+      expect(replayed).toContain("task.queued");
     } finally {
       await orchestrator.close();
     }
@@ -448,15 +448,15 @@ describe("event replay", () => {
     try {
       const task = await orchestrator.createTask({ profileId: "claude_main", cwd: root });
       const liveTypes: string[] = [];
-      const unsubscribe = orchestrator.subscribeToEvents((event) => {
-        liveTypes.push(event.type);
+      const unsubscribe = orchestrator.subscribeToTaskEvents(task.id, (event) => {
+        liveTypes.push(event.event.kind);
       });
 
       await orchestrator.cancelTask(task.id);
       unsubscribe();
 
       expect(liveTypes).toContain("task.cancelled");
-      expect(db.listEvents({ taskId: task.id }).map((row) => row.type)).toContain("task.cancelled");
+      expect(db.listTaskEvents({ taskId: task.id }).map((row) => row.event.kind)).toContain("task.cancelled");
     } finally {
       await orchestrator.close();
     }
@@ -473,8 +473,8 @@ describe("event replay", () => {
       expect(approval).toBeDefined();
 
       const liveTypes: string[] = [];
-      const unsubscribe = orchestrator.subscribeToEvents((event) => {
-        liveTypes.push(event.type);
+      const unsubscribe = orchestrator.subscribeToTaskEvents(task.id, (event) => {
+        liveTypes.push(event.event.kind);
       });
 
       await orchestrator.resolveApproval({ approvalId: approval!.id, approved: true });
@@ -482,7 +482,7 @@ describe("event replay", () => {
       unsubscribe();
 
       expect(liveTypes).toContain("approval.resolved");
-      expect(db.listEvents({ taskId: task.id }).map((row) => row.type)).toContain("approval.resolved");
+      expect(db.listTaskEvents({ taskId: task.id }).map((row) => row.event.kind)).toContain("approval.resolved");
     } finally {
       await orchestrator.close();
     }

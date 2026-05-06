@@ -1,8 +1,9 @@
 import { z } from "zod";
+import { eventEnvelopeSchemaV2 } from "../core/events.js";
 
 export const taskIdSchema = z.string().min(1);
 export const apiVersionSchema = z.literal(1);
-export const eventEnvelopeVersionSchema = z.literal(1);
+export const eventEnvelopeVersionSchema = z.literal(2);
 
 export const createTaskRequestSchema = z.object({
   profileId: z.string().min(1),
@@ -42,8 +43,8 @@ export const applyWorkspaceMergeSchema = z.object({
 });
 
 export const eventSubscriptionRequestSchema = z.object({
-  taskId: z.string().min(1).optional(),
-  sinceId: z.number().int().nonnegative().optional(),
+  taskId: z.string().min(1),
+  sinceTaskSeq: z.number().int().nonnegative().optional(),
 });
 
 export const errorEnvelopeSchema = z.object({
@@ -291,29 +292,4 @@ export const configMetadataSchema = z.object({
   launcherEnvFiles: z.array(z.string()).optional(),
 });
 
-export const eventEnvelopeSchema = z.object({
-  eventEnvelopeVersion: eventEnvelopeVersionSchema,
-  id: z.number().int().positive().optional(),
-  durable: z.boolean(),
-  ephemeral: z.boolean().optional(),
-  event: z.object({
-    type: z.string(),
-    taskId: z.string(),
-    ts: z.string(),
-  }).passthrough(),
-}).superRefine((value, ctx) => {
-  if (value.durable && typeof value.id !== "number") {
-    ctx.addIssue({
-      code: "custom",
-      message: "durable events require an id",
-      path: ["id"],
-    });
-  }
-  if (!value.durable && value.ephemeral !== true) {
-    ctx.addIssue({
-      code: "custom",
-      message: "non-durable events must be marked ephemeral",
-      path: ["ephemeral"],
-    });
-  }
-});
+export const eventEnvelopeSchema = eventEnvelopeSchemaV2;

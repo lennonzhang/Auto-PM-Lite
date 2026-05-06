@@ -6,8 +6,8 @@ import { loadConfig } from "../../src/core/config.js";
 import { AppDatabase } from "../../src/storage/db.js";
 import { Orchestrator } from "../../src/orchestrator/orchestrator.js";
 import { WorkspaceManager } from "../../src/orchestrator/workspace.js";
-import type { AgentEvent } from "../../src/core/types.js";
-import type { RuntimeAdapter, RuntimeTaskHandle, RunTurnInput, StartRuntimeTaskInput, ResumeRuntimeTaskInput } from "../../src/runtime/adapter.js";
+import type { RuntimeAdapter, RuntimeAdapterOutput, RuntimeTaskHandle, RunTurnInput, StartRuntimeTaskInput, ResumeRuntimeTaskInput } from "../../src/runtime/adapter.js";
+import { fileChanged, messageCompleted, turnCompleted, turnStarted } from "../helpers/v2-runtime.js";
 
 const tempPaths: string[] = [];
 
@@ -25,9 +25,9 @@ class FakeRuntimeAdapter implements RuntimeAdapter {
     };
   }
 
-  async *runTurn(input: RunTurnInput): AsyncIterable<AgentEvent> {
+  async *runTurn(input: RunTurnInput): AsyncIterable<RuntimeAdapterOutput> {
     const ts = new Date().toISOString();
-    yield { type: "turn.started", taskId: input.taskId, turnId: "turn-1", ts };
+    yield turnStarted(input);
 
     if (this.delayMs > 0) {
       await new Promise((resolve) => setTimeout(resolve, this.delayMs));
@@ -38,9 +38,9 @@ class FakeRuntimeAdapter implements RuntimeAdapter {
       throw new Error("boom");
     }
 
-    yield { type: "message.completed", taskId: input.taskId, turnId: "turn-1", text: `echo:${input.prompt}`, ts };
-    yield { type: "file.changed", taskId: input.taskId, path: "notes.txt", changeKind: "modify", ts };
-    yield { type: "turn.completed", taskId: input.taskId, turnId: "turn-1", usage: { inputTokens: 3, outputTokens: 2 }, ts };
+    yield messageCompleted(input, `echo:${input.prompt}`, ts);
+    yield fileChanged(input, { path: "notes.txt", changeKind: "modify", binary: false }, ts);
+    yield turnCompleted(input, { inputTokens: 3, outputTokens: 2 }, ts);
   }
 
   async resumeTask(input: ResumeRuntimeTaskInput): Promise<RuntimeTaskHandle> {
@@ -106,7 +106,7 @@ allow_child_network = false
 runtime = "codex"
 account = "openai_main"
 policy = "readonly"
-model = "gpt-5-codex"
+model = "gpt-5-4"
 codex_sandbox_mode = "read-only"
 codex_approval_policy = "on-request"
 codex_network_access_enabled = false
@@ -246,13 +246,14 @@ claude_permission_mode = "dontAsk"
       expect(storedTask?.status).toBe("completed");
       expect(storedTask?.backendThreadId).toBe(`thread-${task.id}`);
 
-      const events = db.db.prepare(`SELECT type, payload_json FROM events WHERE task_id = ? ORDER BY id ASC`).all(task.id) as Array<{ type: string; payload_json: string }>;
-      expect(events.map((event) => event.type)).toEqual([
+      const events = db.listTaskEvents({ taskId: task.id });
+      expect(events.map((row) => row.event.kind)).toEqual([
         "task.queued",
         "task.started",
         "turn.started",
-        "message.completed",
-        "file.changed",
+        "item.started",
+        "item.completed",
+        "item.completed",
         "turn.completed",
         "task.completed",
       ]);
@@ -418,7 +419,7 @@ claude_permission_mode = "dontAsk"
 runtime = "codex"
 accountId = "openai_personal"
 policyId = "child_readonly"
-model = "gpt-5-codex"
+model = "gpt-5-4"
 codex_sandbox_mode = "read-only"
 codex_approval_policy = "on-request"
 codex_network_access_enabled = false
@@ -466,10 +467,9 @@ codex_network_access_enabled = false
       expect(delegated.finalResponse).toBe("echo:review this");
       expect((await orchestrator.waitForTask(parent.id, childTaskId)).taskId).toBe(childTaskId);
 
-      const events = db.db.prepare(`SELECT type FROM events WHERE task_id = ? ORDER BY id ASC`).all(parent.id) as Array<{ type: string }>;
-      expect(events.map((event) => event.type)).toContain("delegation.requested");
-      expect(events.map((event) => event.type)).toContain("delegation.started");
-      expect(events.map((event) => event.type)).toContain("delegation.completed");
+      const events = db.listTaskEvents({ taskId: parent.id }).map((row) => row.event.kind);
+      expect(events).toContain("item.started");
+      expect(events).toContain("item.completed");
     } finally {
       await orchestrator.close();
     }
@@ -533,7 +533,7 @@ claude_permission_mode = "dontAsk"
 runtime = "codex"
 accountId = "openai_personal"
 policyId = "child"
-model = "gpt-5-codex"
+model = "gpt-5-4"
 codex_sandbox_mode = "read-only"
 codex_approval_policy = "on-request"
 codex_network_access_enabled = false
@@ -615,7 +615,7 @@ claude_permission_mode = "dontAsk"
 runtime = "codex"
 accountId = "openai_personal"
 policyId = "readonly"
-model = "gpt-5-codex"
+model = "gpt-5-4"
 codex_sandbox_mode = "read-only"
 codex_approval_policy = "on-request"
 codex_network_access_enabled = false
@@ -714,7 +714,7 @@ claude_permission_mode = "dontAsk"
 runtime = "codex"
 accountId = "openai_personal"
 policyId = "strict_child"
-model = "gpt-5-codex"
+model = "gpt-5-4"
 codex_sandbox_mode = "read-only"
 codex_approval_policy = "on-request"
 codex_network_access_enabled = false
