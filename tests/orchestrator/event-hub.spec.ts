@@ -75,6 +75,7 @@ describe("EventHub", () => {
       sessionId: "session-a",
       event: { kind: "task.started", profileId: "profile", model: "model", cwd: "cwd" },
     });
+    await nextTick();
 
     unsubscribe();
 
@@ -85,6 +86,116 @@ describe("EventHub", () => {
       { taskId: "task-a", taskSeq: 1 },
       { taskId: "task-a", taskSeq: 2 },
     ]);
+  });
+
+  it("coalesces live command output without dropping persisted events", async () => {
+    db = new Database(":memory:");
+    const hub = new EventHub(db, { subscriberQueueSize: 1 });
+    const live: string[] = [];
+    const unsubscribe = hub.subscribe({
+      taskId: "task-1",
+      listener: (event) => {
+        if (event.event.kind === "item.started") {
+          live.push("started");
+        }
+        if (event.event.kind === "item.updated" && event.event.patch.op === "append_command_output") {
+          live.push(event.event.patch.value.text);
+        }
+      },
+    });
+    const item = commandItem("cmd-1");
+    hub.publish({ runtime: "codex", taskId: "task-1", sessionId: "session-1", event: { kind: "item.started", item } });
+    await nextTick();
+    hub.publish({
+      runtime: "codex",
+      taskId: "task-1",
+      sessionId: "session-1",
+      delivery: "coalescible",
+      event: { kind: "item.updated", itemId: "cmd-1", patch: { op: "append_command_output", value: { stream: "stdout", text: "hello" }, baseLength: 0 } },
+    });
+    hub.publish({
+      runtime: "codex",
+      taskId: "task-1",
+      sessionId: "session-1",
+      delivery: "coalescible",
+      event: { kind: "item.updated", itemId: "cmd-1", patch: { op: "append_command_output", value: { stream: "stdout", text: " world" }, baseLength: 5 } },
+    });
+    await nextTick();
+    unsubscribe();
+
+    const persisted = db.prepare("SELECT COUNT(*) AS count FROM events WHERE task_id = ?").get("task-1") as { count: number };
+    expect(persisted.count).toBe(3);
+    expect(live.join("")).toContain("hello world");
+  });
+
+  it("replaces unsafe coalescing with snapshot or resync notice", async () => {
+    db = new Database(":memory:");
+    const hub = new EventHub(db, { subscriberQueueSize: 1 });
+    const live: string[] = [];
+    hub.subscribe({
+      taskId: "task-1",
+      listener: (event) => {
+        if (event.event.kind === "item.updated" && event.event.patch.op === "replace_payload") {
+          live.push(event.event.patch.reason);
+        }
+        if (event.event.kind === "item.started" && event.event.item.kind === "system_notice") {
+          const item = event.event.item as ReturnType<typeof systemNoticeItem>;
+          live.push(item.payload.code);
+        }
+      },
+    });
+
+    hub.publish({ runtime: "codex", taskId: "task-1", sessionId: "session-1", event: { kind: "item.started", item: commandItem("cmd-1") } });
+    await nextTick();
+    hub.publish({
+      runtime: "codex",
+      taskId: "task-1",
+      sessionId: "session-1",
+      delivery: "coalescible",
+      event: { kind: "item.updated", itemId: "cmd-1", patch: { op: "append_command_output", value: { stream: "stdout", text: "hello" }, baseLength: 0 } },
+    });
+    hub.publish({
+      runtime: "codex",
+      taskId: "task-1",
+      sessionId: "session-1",
+      delivery: "coalescible",
+      event: { kind: "item.updated", itemId: "cmd-1", patch: { op: "append_command_output", value: { stream: "stdout", text: "bad" }, baseLength: 99 } },
+    });
+    await nextTick();
+
+    expect(live).toContain("snapshot");
+  });
+
+  it("supports global replay, redacted raw lookup, and projection checks", () => {
+    db = new Database(":memory:");
+    const hub = new EventHub(db, {});
+
+    const first = hub.publish({
+      runtime: "claude",
+      taskId: "task-1",
+      sessionId: "session-1",
+      raw: { Authorization: "Bearer sk-1234567890abcdef1234567890abcd" },
+      event: { kind: "item.started", item: assistantItem("msg-1", "") },
+    });
+    hub.publish({
+      runtime: "claude",
+      taskId: "task-1",
+      sessionId: "session-1",
+      event: { kind: "item.completed", itemId: "msg-1", itemKind: "assistant_message", finalPayload: { text: "done" }, completedAt: "2026-05-07T00:00:00.000Z" },
+    });
+    hub.publish({
+      runtime: "codex",
+      taskId: "task-2",
+      sessionId: "session-2",
+      event: { kind: "task.queued" },
+    });
+
+    expect(hub.listEvents({ sinceGlobalSeq: 0, taskId: "task-1" }).events).toHaveLength(2);
+    expect(hub.listEvents({ runtime: "codex" }).events[0]?.taskId).toBe("task-2");
+    expect(hub.listEvents({ kind: "item.completed" }).events[0]?.event.kind).toBe("item.completed");
+    expect(hub.getRedactedRawEvent(first.rawRef!)?.redacted).toBeDefined();
+    expect(JSON.stringify(hub.getRedactedRawEvent(first.rawRef!)?.redacted)).not.toContain("sk-1234567890abcdef1234567890abcd");
+    expect(hub.checkProjection("task-1")).toEqual([]);
   });
 
   it("projects item.started and item.completed into the items table", () => {
@@ -135,3 +246,57 @@ describe("EventHub", () => {
     expect(item.last_task_seq).toBe(2);
   });
 });
+
+function nextTick(): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, 0));
+}
+
+function assistantItem(id: string, text: string) {
+  return {
+    id,
+    taskId: "task-1",
+    sessionId: "session-1",
+    kind: "assistant_message" as const,
+    status: "in_progress" as const,
+    startedAt: "2026-05-07T00:00:00.000Z",
+    updatedAt: "2026-05-07T00:00:00.000Z",
+    payload: { text },
+  };
+}
+
+function commandItem(id: string) {
+  return {
+    id,
+    taskId: "task-1",
+    sessionId: "session-1",
+    kind: "command_execution" as const,
+    status: "in_progress" as const,
+    startedAt: "2026-05-07T00:00:00.000Z",
+    updatedAt: "2026-05-07T00:00:00.000Z",
+    payload: {
+      command: "echo hello",
+      cwd: "cwd",
+      source: "model" as const,
+      status: "in_progress" as const,
+      aggregatedOutput: "",
+      outputChunks: [],
+    },
+  };
+}
+
+function systemNoticeItem() {
+  return {
+    id: "notice",
+    taskId: "task-1",
+    sessionId: "session-1",
+    kind: "system_notice" as const,
+    status: "completed" as const,
+    startedAt: "2026-05-07T00:00:00.000Z",
+    updatedAt: "2026-05-07T00:00:00.000Z",
+    payload: {
+      level: "warning" as const,
+      code: "stream_resync_required" as const,
+      message: "resync",
+    },
+  };
+}

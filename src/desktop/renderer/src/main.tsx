@@ -3,7 +3,6 @@ import { createRoot } from "react-dom/client";
 import type {
   ApprovalView,
   ConfigMetadata,
-  EventEnvelope,
   RuntimeHealth,
   TaskDetail,
   TaskResultView,
@@ -36,6 +35,8 @@ import {
   type TaskFilter,
   type DisplayError,
 } from "./view-model.js";
+import { TranscriptView } from "./transcript-components.js";
+import { createTaskViewModel, reduceTaskView, type TaskViewModel } from "./transcript-reducer.js";
 import "./styles.css";
 
 function App() {
@@ -44,7 +45,8 @@ function App() {
   const [taskDetail, setTaskDetail] = useState<TaskDetail | null>(null);
   const [approvals, setApprovals] = useState<ApprovalView[]>([]);
   const [runtimeHealth, setRuntimeHealth] = useState<RuntimeHealth[]>([]);
-  const [events, setEvents] = useState<EventEnvelope[]>([]);
+  const [transcriptView, setTranscriptView] = useState<TaskViewModel | null>(null);
+  const [debugEventCount, setDebugEventCount] = useState(0);
   const [workspaceDiff, setWorkspaceDiff] = useState<WorkspaceDiffView | null>(null);
   const [taskResult, setTaskResult] = useState<TaskResultView | null>(null);
   const [selectedTaskId, setSelectedTaskId] = useState<string | null>(null);
@@ -68,7 +70,8 @@ function App() {
       setTaskDetail(null);
       setWorkspaceDiff(null);
       setTaskResult(null);
-      setEvents([]);
+      setTranscriptView(null);
+      setDebugEventCount(0);
       return;
     }
     void loadTaskDetail(selectedTaskId);
@@ -79,14 +82,30 @@ function App() {
       return undefined;
     }
     let unsubscribe: (() => void) | undefined;
-    setEvents([]);
+    let pendingRefresh: ReturnType<typeof setTimeout> | undefined;
+    setTranscriptView(createTaskViewModel(selectedTaskId));
+    setDebugEventCount(0);
     void window.autoPm.replayAndSubscribeToEvents({ taskId: selectedTaskId }, (event) => {
-      setEvents((current) => [event, ...current].slice(0, 120));
-      void refresh(selectedTaskId);
+      setTranscriptView((current) => reduceTaskView(current ?? createTaskViewModel(selectedTaskId), event));
+      setDebugEventCount((current) => current + 1);
+      if (event.event.kind.startsWith("task.")
+        || event.event.kind.startsWith("approval.")
+        || event.event.kind.startsWith("workspace.")
+        || event.event.kind.startsWith("budget.")) {
+        if (!pendingRefresh) {
+          pendingRefresh = setTimeout(() => {
+            pendingRefresh = undefined;
+            void refresh(selectedTaskId);
+          }, 250);
+        }
+      }
     }).then((subscription) => {
       unsubscribe = subscription.unsubscribe;
     }).catch(setCaughtError);
     return () => {
+      if (pendingRefresh) {
+        clearTimeout(pendingRefresh);
+      }
       unsubscribe?.();
     };
   }, [selectedTaskId]);
@@ -158,7 +177,6 @@ function App() {
   const approvedMergeId = approvedMergeApprovalId(taskDetail, approvals);
   const healthSummary = runtimeSummary(runtimeHealth);
   const budgetSummary = taskBudgetSummary(taskDetail);
-  const filteredEvents = events;
   const selectedNewTaskProfile = config?.profiles.find((profile) => profile.id === newTaskProfile) ?? null;
   const selectedNewTaskModelOptions = modelOptionsForProfile(selectedNewTaskProfile);
   const latestTurnId = taskDetail?.turns[taskDetail.turns.length - 1]?.id;
@@ -298,10 +316,18 @@ function App() {
 
           <div className="transcript">
             <div className="paneHeader">
+              <span>Transcript</span>
+              <div className="headerActions">
+                {transcriptView ? <span className="countBadge">{transcriptView.items.size}</span> : null}
+                <span className="countBadge">{debugEventCount}</span>
+              </div>
+            </div>
+            {transcriptView ? <TranscriptView view={transcriptView} /> : <div className="empty">No selected task</div>}
+            <div className="paneHeader">
               <span>Turns</span>
               {taskDetail ? <span className="countBadge">{taskDetail.turns.length}</span> : null}
             </div>
-            <div className="turnList">
+            <div className="turnList compactTurns">
               {taskDetail?.turns.map((turn) => (
                 <div className="turnRow" key={turn.id}>
                   <div>
@@ -313,21 +339,6 @@ function App() {
                 </div>
               ))}
               {taskDetail && taskDetail.turns.length === 0 ? <div className="empty">No turns</div> : null}
-            </div>
-            <div className="paneHeader">
-              <span>Events</span>
-              <span className="countBadge">{filteredEvents.length}</span>
-            </div>
-            <div className="eventList">
-              {filteredEvents.map((event, index) => (
-                <div className="eventRow" key={`${event.event.ts}-${index}`}>
-                  <span>{event.event.kind}</span>
-                  <code>{event.taskId.slice(0, 8)}</code>
-                  <time>{new Date(event.ts).toLocaleTimeString()}</time>
-                  <small>{eventSummary(event.event)}</small>
-                </div>
-              ))}
-              {events.length === 0 ? <div className="empty">No live events</div> : null}
             </div>
           </div>
         </section>
@@ -579,28 +590,6 @@ function profilePermissionText(profile?: ConfigMetadata["profiles"][number] | nu
     return profile.claudePermissionMode;
   }
   return `${profile.codexSandboxMode} / ${profile.codexApprovalPolicy} / network:${profile.codexNetworkAccessEnabled ? "on" : "off"}`;
-}
-
-function eventSummary(event: EventEnvelope["event"]): string {
-  if (event.kind === "item.started") {
-    return event.item.kind;
-  }
-  if (event.kind === "item.updated") {
-    return event.patch.op;
-  }
-  if (event.kind === "item.completed") {
-    return event.itemKind;
-  }
-  if ("error" in event) {
-    return event.error.message;
-  }
-  if ("summary" in event && typeof event.summary === "string") {
-    return event.summary;
-  }
-  if ("message" in event && typeof event.message === "string") {
-    return event.message;
-  }
-  return "";
 }
 
 function TaskTreeItem(props: {

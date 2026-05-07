@@ -933,6 +933,18 @@ export class Orchestrator {
     return this.eventHub.replayAndSubscribe(input);
   }
 
+  listEvents(input: Parameters<EventHub["listEvents"]>[0]) {
+    return this.eventHub.listEvents(input);
+  }
+
+  getRedactedRawEvent(rawRef: string) {
+    return this.eventHub.getRedactedRawEvent(rawRef);
+  }
+
+  checkEventProjection(taskId: string) {
+    return this.eventHub.checkProjection(taskId);
+  }
+
   subscribeToTaskEvents(taskId: string, listener: (event: EventEnvelope) => void): () => void {
     return this.eventHub.subscribe({ taskId, listener });
   }

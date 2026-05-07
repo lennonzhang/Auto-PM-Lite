@@ -356,6 +356,61 @@ program
     }
   });
 
+program
+  .command("events:debug")
+  .description("Replay canonical v2 events by global sequence for debugging")
+  .option("-c, --config <path>", "Path to config TOML", defaultConfigPath())
+  .option("--since-global-seq <number>", "Resume after a global event sequence")
+  .option("--limit <number>", "Maximum events to print", "500")
+  .option("-t, --task <id>", "Filter by task ID")
+  .option("--runtime <runtime>", "Filter by runtime: claude or codex")
+  .option("--kind <kind>", "Filter by event kind")
+  .action(async ({ config, sinceGlobalSeq, limit, task, runtime, kind }) => {
+    const services = await openAppServices(config);
+    try {
+      const result = services.events.listEvents({
+        sinceGlobalSeq: sinceGlobalSeq ? Number(sinceGlobalSeq) : undefined,
+        limit: limit ? Number(limit) : undefined,
+        taskId: task,
+        runtime,
+        kind,
+      });
+      for (const event of result.events) {
+        process.stdout.write(`${JSON.stringify(event)}\n`);
+      }
+    } finally {
+      await services.close();
+    }
+  });
+
+program
+  .command("events:raw")
+  .description("Print a redacted raw runtime event by rawRef")
+  .option("-c, --config <path>", "Path to config TOML", defaultConfigPath())
+  .requiredOption("--raw-ref <id>", "Raw event reference")
+  .action(async ({ config, rawRef }) => {
+    const services = await openAppServices(config);
+    try {
+      process.stdout.write(`${JSON.stringify(services.events.getRaw({ rawRef }), null, 2)}\n`);
+    } finally {
+      await services.close();
+    }
+  });
+
+program
+  .command("events:check-projection")
+  .description("Replay task events and compare them with the stored item projection")
+  .option("-c, --config <path>", "Path to config TOML", defaultConfigPath())
+  .requiredOption("-t, --task <id>", "Task ID")
+  .action(async ({ config, task }) => {
+    const services = await openAppServices(config);
+    try {
+      process.stdout.write(`${JSON.stringify(services.events.checkProjection({ taskId: task }), null, 2)}\n`);
+    } finally {
+      await services.close();
+    }
+  });
+
 program.parseAsync(process.argv).catch((error: unknown) => {
   process.stderr.write(`${JSON.stringify(toErrorEnvelope(error), null, 2)}\n`);
   process.exitCode = 1;

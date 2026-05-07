@@ -477,6 +477,34 @@ CODEX__AUTO_CODE_VIP__KEY__CX_PRO=sk-codex
     }
   });
 
+  it("exposes global debug replay, redacted raw lookup, and projection checks", async () => {
+    const { services } = await buildServices({ skipRuntimeHealthGuard: true });
+
+    try {
+      const task = await services.tasks.createTask({
+        profileId: "claude_main",
+        cwd: services.config.getMetadata().workspace.rootDir,
+      });
+      await services.tasks.runTask({ taskId: task.id, prompt: "debug event" });
+
+      const debug = services.events.listEvents({ sinceGlobalSeq: 0, taskId: task.id, kind: "item.completed" });
+      expect(debug.events.some((event) => event.event.kind === "item.completed")).toBe(true);
+      expect(debug.lastGlobalSeq).toEqual(expect.any(Number));
+
+      const rawRef = services.events.listEvents({ taskId: task.id }).events.find((event) => event.rawRef)?.rawRef;
+      if (rawRef) {
+        expect(services.events.getRaw({ rawRef }).rawRef).toBe(rawRef);
+      }
+
+      expect(services.events.checkProjection({ taskId: task.id })).toEqual({
+        taskId: task.id,
+        mismatches: [],
+      });
+    } finally {
+      await services.close();
+    }
+  });
+
   it("validates workspace use cases at the service contract layer", async () => {
     const { repoRoot, services } = await buildServices({ editableWorkspace: true });
 

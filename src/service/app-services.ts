@@ -28,8 +28,11 @@ import {
 import {
   applyWorkspaceMergeSchema,
   createTaskRequestSchema,
+  eventDebugRequestSchema,
   eventSubscriptionRequestSchema,
   pauseTaskRequestSchema,
+  projectionCheckRequestSchema,
+  rawEventRequestSchema,
   requestWorkspaceMergeSchema,
   resolveApprovalRequestSchema,
   resumeTaskRequestSchema,
@@ -214,6 +217,28 @@ export class EventService {
       sinceTaskSeq: parsed.sinceTaskSeq,
       listener: input.listener,
     });
+  }
+
+  listEvents(input: unknown = {}) {
+    const parsed = eventDebugRequestSchema.parse(input);
+    return this.orchestrator.listEvents(parsed);
+  }
+
+  getRaw(input: unknown) {
+    const parsed = rawEventRequestSchema.parse(input);
+    const raw = this.orchestrator.getRedactedRawEvent(parsed.rawRef);
+    if (!raw) {
+      throw new AppError("task_not_found", `Unknown rawRef: ${parsed.rawRef}`);
+    }
+    return raw;
+  }
+
+  checkProjection(input: unknown) {
+    const parsed = projectionCheckRequestSchema.parse(input);
+    return {
+      taskId: parsed.taskId,
+      mismatches: this.orchestrator.checkEventProjection(parsed.taskId),
+    };
   }
 }
 

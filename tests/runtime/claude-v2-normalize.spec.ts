@@ -106,6 +106,37 @@ describe("Claude v2 normalizer", () => {
     });
   });
 
+  it("does not treat content_block_stop as turn completion and marks orphan tool results", () => {
+    const state = createClaudeV2NormalizerState();
+    normalize(streamEvent({
+      type: "content_block_start",
+      index: 0,
+      content_block: { type: "text", text: "" },
+    }), state);
+
+    const stop = normalize(streamEvent({
+      type: "content_block_stop",
+      index: 0,
+    }), state);
+    const orphan = normalize(sdk({
+      type: "user",
+      message: { role: "user", content: [] },
+      parent_tool_use_id: null,
+      tool_use_result: { tool_use_id: "missing-tool", content: "late" },
+      uuid: "orphan-result",
+      session_id: "session-1",
+    }), state);
+
+    expect(stop).toEqual([]);
+    expect(orphan[0]).toMatchObject({
+      kind: "item.started",
+      item: {
+        kind: "system_notice",
+        payload: { code: "runtime_notice", level: "warning" },
+      },
+    });
+  });
+
   it("maps system init, compaction, hook response, and result usage", () => {
     const state = createClaudeV2NormalizerState();
     expect(normalize(sdk({

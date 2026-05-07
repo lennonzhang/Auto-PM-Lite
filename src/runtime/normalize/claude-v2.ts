@@ -384,7 +384,20 @@ function normalizeUserMessage(input: {
   const toolUseId = toolUseResultId(result);
   const itemId = toolUseId ? input.state.toolItemByToolUseId.get(toolUseId) : undefined;
   if (!itemId) {
-    return [];
+    return [{
+      kind: "item.started",
+      item: systemNoticeItem({
+        taskId: input.taskId,
+        sessionId: input.sessionId,
+        turnId: input.turnId,
+        itemId: `claude:${input.sessionId}:orphan-tool-result:${input.message.uuid}`,
+        ts: input.ts,
+        level: "warning",
+        code: "runtime_notice",
+        message: `Received tool_result without matching tool_use${toolUseId ? `: ${toolUseId}` : ""}`,
+        details: result,
+      }),
+    }];
   }
   const isError = isRecord(result) && (result.is_error === true || result.error === true);
   return isError

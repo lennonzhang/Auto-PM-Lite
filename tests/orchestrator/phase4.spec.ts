@@ -217,7 +217,7 @@ describe("Phase 4: Rate Limiter", () => {
 });
 
 describe("Phase 4: EventHub", () => {
-  it("should publish v2 events to task subscribers", () => {
+  it("should publish v2 events to task subscribers", async () => {
     const db = new AppDatabase({ dbPath: ":memory:", busyTimeoutMs: 1000 });
     const hub = new EventHub(db.db);
     const events: any[] = [];
@@ -232,13 +232,14 @@ describe("Phase 4: EventHub", () => {
       sessionId: "session1",
       event: { kind: "task.started", profileId: "profile1", model: "model", cwd: "cwd" },
     });
+    await nextTick();
 
     expect(events).toHaveLength(1);
     expect(events[0].event.kind).toBe("task.started");
     db.close();
   });
 
-  it("should support multiple subscribers", () => {
+  it("should support multiple subscribers", async () => {
     const db = new AppDatabase({ dbPath: ":memory:", busyTimeoutMs: 1000 });
     const hub = new EventHub(db.db);
     const events1: any[] = [];
@@ -253,13 +254,14 @@ describe("Phase 4: EventHub", () => {
       sessionId: "session1",
       event: { kind: "task.completed", summary: "Done" },
     });
+    await nextTick();
 
     expect(events1).toHaveLength(1);
     expect(events2).toHaveLength(1);
     db.close();
   });
 
-  it("should allow unsubscribing", () => {
+  it("should allow unsubscribing", async () => {
     const db = new AppDatabase({ dbPath: ":memory:", busyTimeoutMs: 1000 });
     const hub = new EventHub(db.db);
     const events: any[] = [];
@@ -274,6 +276,7 @@ describe("Phase 4: EventHub", () => {
       sessionId: "session1",
       event: { kind: "task.started", profileId: "profile1", model: "model", cwd: "cwd" },
     });
+    await nextTick();
 
     unsubscribe();
 
@@ -288,3 +291,7 @@ describe("Phase 4: EventHub", () => {
     db.close();
   });
 });
+
+function nextTick(): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, 0));
+}

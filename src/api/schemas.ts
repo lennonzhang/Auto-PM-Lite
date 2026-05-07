@@ -47,6 +47,22 @@ export const eventSubscriptionRequestSchema = z.object({
   sinceTaskSeq: z.number().int().nonnegative().optional(),
 });
 
+export const eventDebugRequestSchema = z.object({
+  sinceGlobalSeq: z.number().int().nonnegative().optional(),
+  limit: z.number().int().positive().max(5000).optional(),
+  taskId: z.string().min(1).optional(),
+  runtime: z.enum(["claude", "codex"]).optional(),
+  kind: z.string().min(1).optional(),
+});
+
+export const rawEventRequestSchema = z.object({
+  rawRef: z.string().min(1),
+});
+
+export const projectionCheckRequestSchema = z.object({
+  taskId: z.string().min(1),
+});
+
 export const errorEnvelopeSchema = z.object({
   apiVersion: apiVersionSchema,
   error: z.object({

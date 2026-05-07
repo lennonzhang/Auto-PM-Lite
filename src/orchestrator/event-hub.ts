@@ -5,8 +5,10 @@ import type {
   CanonicalEvent,
   DeliveryTier,
   EventEnvelope,
+  ItemKind,
   ItemEvent,
   ItemPatch,
+  ItemPayload,
   RedactedRawRuntimeEvent,
 } from "../core/events.js";
 import { validateCanonicalEvent } from "../core/events.js";
@@ -15,6 +17,7 @@ import type { SqliteDatabase } from "../storage/db.js";
 
 export interface EventHubOptions {
   redaction?: RedactionOptions | undefined;
+  subscriberQueueSize?: number | undefined;
 }
 
 export interface PublishInput {
@@ -38,6 +41,33 @@ export interface ReplayAndSubscribeInput {
 
 export type EventHubListener = (event: EventEnvelope) => void;
 
+export interface ListEventsInput {
+  sinceGlobalSeq?: number | undefined;
+  limit?: number | undefined;
+  taskId?: string | undefined;
+  runtime?: RuntimeKind | undefined;
+  kind?: string | undefined;
+}
+
+export interface RedactedRawEventView {
+  rawRef: string;
+  runtime: RuntimeKind;
+  taskId: string;
+  sessionId?: string | undefined;
+  turnId?: string | undefined;
+  ts: string;
+  redacted: unknown;
+}
+
+export interface ProjectionMismatch {
+  taskId: string;
+  itemId: string;
+  field: string;
+  expected: unknown;
+  actual: unknown;
+  lastTaskSeq?: number | undefined;
+}
+
 type EventRow = {
   seq: number;
   task_seq: number;
@@ -55,13 +85,25 @@ type EventRow = {
 };
 
 type ItemRow = {
+  item_id?: string;
   kind: string;
   status: string;
   payload_json: string;
+  last_task_seq?: number;
 };
 
+interface Subscriber {
+  id: string;
+  taskId: string;
+  listener: EventHubListener;
+  queue: EventEnvelope[];
+  flushing: boolean;
+  closed: boolean;
+  maxQueueSize: number;
+}
+
 export class EventHub {
-  private readonly taskListeners = new Map<string, Set<EventHubListener>>();
+  private readonly subscribersByTask = new Map<string, Set<Subscriber>>();
   private readonly insertRaw;
   private readonly insertEvent;
   private readonly upsertCounter;
@@ -71,6 +113,9 @@ export class EventHub {
   private readonly selectItem;
   private readonly updateItemFromEvent;
   private readonly selectEvents;
+  private readonly selectGlobalEvents;
+  private readonly selectRaw;
+  private readonly selectProjectedItems;
   private readonly publishTx;
   private closed = false;
 
@@ -149,6 +194,28 @@ export class EventHub {
       WHERE task_id = @taskId AND task_seq > @sinceTaskSeq
       ORDER BY task_seq ASC
       LIMIT @limit
+    `);
+    this.selectGlobalEvents = this.db.prepare(`
+      SELECT seq, task_seq, event_id, runtime, task_id, session_id, turn_id, item_id, parent_item_id,
+             ts, raw_ref, delivery, event_json
+      FROM events
+      WHERE seq > @sinceGlobalSeq
+        AND (@taskId IS NULL OR task_id = @taskId)
+        AND (@runtime IS NULL OR runtime = @runtime)
+        AND (@kind IS NULL OR json_extract(event_json, '$.kind') = @kind)
+      ORDER BY seq ASC
+      LIMIT @limit
+    `);
+    this.selectRaw = this.db.prepare(`
+      SELECT id, task_id, runtime, session_id, turn_id, ts, redacted_json
+      FROM raw_runtime_events
+      WHERE id = ?
+    `);
+    this.selectProjectedItems = this.db.prepare(`
+      SELECT item_id, kind, status, payload_json, last_task_seq
+      FROM items
+      WHERE task_id = ?
+      ORDER BY first_task_seq ASC
     `);
     this.publishTx = this.db.transaction((input: RequiredPublishInput) => {
       const rawRef = input.raw ? this.writeRaw(input) : null;
@@ -241,23 +308,143 @@ export class EventHub {
     if (this.closed) {
       throw new Error("EventHub is closed");
     }
-    let listeners = this.taskListeners.get(input.taskId);
-    if (!listeners) {
-      listeners = new Set<EventHubListener>();
-      this.taskListeners.set(input.taskId, listeners);
+    const subscriber: Subscriber = {
+      id: randomUUID(),
+      taskId: input.taskId,
+      listener: input.listener,
+      queue: [],
+      flushing: false,
+      closed: false,
+      maxQueueSize: this.options.subscriberQueueSize ?? 500,
+    };
+    let subscribers = this.subscribersByTask.get(input.taskId);
+    if (!subscribers) {
+      subscribers = new Set<Subscriber>();
+      this.subscribersByTask.set(input.taskId, subscribers);
     }
-    listeners.add(input.listener);
+    subscribers.add(subscriber);
     return () => {
-      listeners?.delete(input.listener);
-      if (listeners?.size === 0) {
-        this.taskListeners.delete(input.taskId);
+      subscriber.closed = true;
+      subscriber.queue = [];
+      subscribers?.delete(subscriber);
+      if (subscribers?.size === 0) {
+        this.subscribersByTask.delete(input.taskId);
       }
     };
   }
 
+  listEvents(input: ListEventsInput = {}): { events: EventEnvelope[]; lastGlobalSeq: number } {
+    const rows = this.selectGlobalEvents.all({
+      sinceGlobalSeq: input.sinceGlobalSeq ?? 0,
+      limit: input.limit && input.limit > 0 ? Math.min(input.limit, 5000) : 500,
+      taskId: input.taskId ?? null,
+      runtime: input.runtime ?? null,
+      kind: input.kind ?? null,
+    }) as EventRow[];
+    const events = rows.map(rowToEnvelope);
+    return {
+      events,
+      lastGlobalSeq: events.at(-1)?.seq ?? input.sinceGlobalSeq ?? 0,
+    };
+  }
+
+  getRedactedRawEvent(rawRef: string): RedactedRawEventView | null {
+    const row = this.selectRaw.get(rawRef) as Record<string, unknown> | undefined;
+    if (!row) {
+      return null;
+    }
+    return {
+      rawRef: String(row.id),
+      runtime: String(row.runtime) as RuntimeKind,
+      taskId: String(row.task_id),
+      ...(row.session_id === null ? {} : { sessionId: String(row.session_id) }),
+      ...(row.turn_id === null ? {} : { turnId: String(row.turn_id) }),
+      ts: String(row.ts),
+      redacted: JSON.parse(String(row.redacted_json)),
+    };
+  }
+
+  checkProjection(taskId: string): ProjectionMismatch[] {
+    const replay = new Map<string, { kind: string; status: string; payload: unknown; lastTaskSeq: number }>();
+    for (const row of this.selectEvents.all({ taskId, sinceTaskSeq: 0, limit: 100000 }) as EventRow[]) {
+      const envelope = rowToEnvelope(row);
+      const event = envelope.event;
+      if (event.kind === "item.started") {
+        replay.set(event.item.id, {
+          kind: event.item.kind,
+          status: event.item.status,
+          payload: event.item.payload,
+          lastTaskSeq: envelope.taskSeq,
+        });
+      } else if (event.kind === "item.updated") {
+        const current = replay.get(event.itemId);
+        if (current) {
+          const applied = applyItemPatch(current.kind, current.status, cloneRecord(current.payload), event.patch);
+          replay.set(event.itemId, {
+            kind: current.kind,
+            status: applied.status,
+            payload: applied.payload,
+            lastTaskSeq: envelope.taskSeq,
+          });
+        }
+      } else if (event.kind === "item.completed") {
+        const current = replay.get(event.itemId);
+        replay.set(event.itemId, {
+          kind: event.itemKind,
+          status: "completed",
+          payload: event.finalPayload,
+          lastTaskSeq: envelope.taskSeq,
+          ...(current ? {} : {}),
+        });
+      } else if (event.kind === "item.failed" || event.kind === "item.cancelled") {
+        const current = replay.get(event.itemId);
+        if (current) {
+          replay.set(event.itemId, {
+            ...current,
+            status: event.kind === "item.failed" ? "failed" : "cancelled",
+            lastTaskSeq: envelope.taskSeq,
+          });
+        }
+      }
+    }
+
+    const projectedRows = this.selectProjectedItems.all(taskId) as ItemRow[];
+    const mismatches: ProjectionMismatch[] = [];
+    for (const row of projectedRows) {
+      const itemId = String(row.item_id);
+      const expected = replay.get(itemId);
+      if (!expected) {
+        mismatches.push({ taskId, itemId, field: "item", expected: undefined, actual: "projected", lastTaskSeq: row.last_task_seq });
+        continue;
+      }
+      const actualPayload = JSON.parse(row.payload_json);
+      if (row.kind !== expected.kind) {
+        mismatches.push({ taskId, itemId, field: "kind", expected: expected.kind, actual: row.kind, lastTaskSeq: row.last_task_seq });
+      }
+      if (row.status !== expected.status) {
+        mismatches.push({ taskId, itemId, field: "status", expected: expected.status, actual: row.status, lastTaskSeq: row.last_task_seq });
+      }
+      if (JSON.stringify(actualPayload) !== JSON.stringify(expected.payload)) {
+        mismatches.push({ taskId, itemId, field: "payload", expected: expected.payload, actual: actualPayload, lastTaskSeq: row.last_task_seq });
+      }
+    }
+    for (const [itemId, expected] of replay.entries()) {
+      if (!projectedRows.some((row) => row.item_id === itemId)) {
+        mismatches.push({ taskId, itemId, field: "item", expected: expected.kind, actual: undefined, lastTaskSeq: expected.lastTaskSeq });
+      }
+    }
+    return mismatches;
+  }
+
   close(): void {
     this.closed = true;
-    this.taskListeners.clear();
+    for (const subscribers of this.subscribersByTask.values()) {
+      for (const subscriber of subscribers) {
+        subscriber.closed = true;
+        subscriber.queue = [];
+      }
+    }
+    this.subscribersByTask.clear();
   }
 
   private writeRaw(input: RequiredPublishInput): string {
@@ -389,15 +576,137 @@ export class EventHub {
   }
 
   private fanOut(envelope: EventEnvelope): void {
-    const listeners = this.taskListeners.get(envelope.taskId);
-    if (!listeners) {
+    const subscribers = this.subscribersByTask.get(envelope.taskId);
+    if (!subscribers) {
       return;
     }
-    for (const listener of listeners) {
+    for (const subscriber of subscribers) {
+      this.enqueue(subscriber, envelope);
+    }
+  }
+
+  private enqueue(subscriber: Subscriber, envelope: EventEnvelope): void {
+    if (subscriber.closed) {
+      return;
+    }
+    if (subscriber.queue.length >= subscriber.maxQueueSize) {
+      const accepted = this.tryCoalesce(subscriber, envelope);
+      if (!accepted && envelope.delivery === "lossless") {
+        subscriber.queue.push(this.resyncNotice(envelope));
+        subscriber.closed = true;
+      } else if (!accepted && envelope.delivery !== "lossless") {
+        subscriber.queue.push(this.resyncNotice(envelope));
+      }
+    } else if (!this.tryCoalesce(subscriber, envelope)) {
+      subscriber.queue.push(envelope);
+    }
+    this.scheduleFlush(subscriber);
+  }
+
+  private tryCoalesce(subscriber: Subscriber, envelope: EventEnvelope): boolean {
+    if (envelope.delivery === "lossless" || envelope.event.kind !== "item.updated") {
+      return false;
+    }
+    const incoming = envelope.event.patch;
+    const existingIndex = findCoalescibleIndex(subscriber.queue, envelope);
+    if (existingIndex < 0) {
+      return false;
+    }
+    const existing = subscriber.queue[existingIndex]!;
+    if (existing.event.kind !== "item.updated") {
+      return false;
+    }
+    const merged = mergePatches(existing.event.patch, incoming);
+    if (!merged) {
+      subscriber.queue[existingIndex] = this.snapshotOrResync(envelope);
+      return true;
+    }
+    subscriber.queue[existingIndex] = {
+      ...envelope,
+      event: {
+        kind: "item.updated",
+        itemId: envelope.event.itemId,
+        patch: merged,
+      },
+    };
+    return true;
+  }
+
+  private snapshotOrResync(envelope: EventEnvelope): EventEnvelope {
+    if (envelope.event.kind === "item.updated") {
+      const row = this.selectItem.get({ taskId: envelope.taskId, itemId: envelope.event.itemId }) as ItemRow | undefined;
+      if (row) {
+        const patch = {
+          op: "replace_payload",
+          itemKind: row.kind as ItemKind,
+          value: JSON.parse(row.payload_json) as ItemPayload[ItemKind],
+          reason: "snapshot",
+        } as ItemPatch;
+        return {
+          ...envelope,
+          delivery: "lossless",
+          event: {
+            kind: "item.updated",
+            itemId: envelope.event.itemId,
+            patch,
+          },
+        };
+      }
+    }
+    return this.resyncNotice(envelope);
+  }
+
+  private resyncNotice(envelope: EventEnvelope): EventEnvelope {
+    const itemId = `system:resync:${envelope.eventId}`;
+    return {
+      ...envelope,
+      eventId: randomUUID(),
+      itemId,
+      parentItemId: undefined,
+      delivery: "lossless",
+      event: {
+        kind: "item.started",
+        item: {
+          id: itemId,
+          taskId: envelope.taskId,
+          sessionId: envelope.sessionId,
+          ...(envelope.turnId ? { turnId: envelope.turnId } : {}),
+          kind: "system_notice",
+          status: "completed",
+          startedAt: envelope.ts,
+          updatedAt: envelope.ts,
+          completedAt: envelope.ts,
+          payload: {
+            level: "warning",
+            code: "stream_resync_required",
+            message: "Live event delivery fell behind; replay this task stream.",
+            details: { lastSeq: envelope.seq, lastTaskSeq: envelope.taskSeq },
+          },
+        },
+      },
+    };
+  }
+
+  private scheduleFlush(subscriber: Subscriber): void {
+    if (subscriber.flushing) {
+      return;
+    }
+    subscriber.flushing = true;
+    queueMicrotask(() => this.flushSubscriber(subscriber));
+  }
+
+  private flushSubscriber(subscriber: Subscriber): void {
+    subscriber.flushing = false;
+    while (subscriber.queue.length > 0) {
+      const envelope = subscriber.queue.shift()!;
       try {
-        listener(envelope);
+        subscriber.listener(envelope);
       } catch (error) {
         console.error("EventHub listener error:", error);
+      }
+      if (subscriber.closed) {
+        subscriber.queue = [];
+        break;
       }
     }
   }
@@ -515,6 +824,85 @@ function rowToEnvelope(row: EventRow): EventEnvelope {
     delivery: row.delivery,
     event: validateCanonicalEvent(JSON.parse(row.event_json)),
   };
+}
+
+function findCoalescibleIndex(queue: EventEnvelope[], envelope: EventEnvelope): number {
+  if (envelope.event.kind !== "item.updated") {
+    return -1;
+  }
+  const incomingKey = coalesceKey(envelope);
+  for (let index = queue.length - 1; index >= 0; index -= 1) {
+    const candidate = queue[index]!;
+    if (candidate.delivery === "lossless") {
+      return -1;
+    }
+    if (coalesceKey(candidate) === incomingKey) {
+      return index;
+    }
+  }
+  return -1;
+}
+
+function coalesceKey(envelope: EventEnvelope): string | null {
+  if (envelope.event.kind !== "item.updated") {
+    return null;
+  }
+  const patch = envelope.event.patch;
+  const path = "path" in patch ? patch.path : patch.op;
+  return `${envelope.taskId}:${envelope.event.itemId}:${patch.op}:${path}`;
+}
+
+function mergePatches(previous: ItemPatch, next: ItemPatch): ItemPatch | null {
+  if (previous.op !== next.op) {
+    return null;
+  }
+  switch (previous.op) {
+    case "append_text":
+      return next.op === "append_text" && previous.baseLength + previous.value.length === next.baseLength
+        ? { ...previous, value: previous.value + next.value }
+        : null;
+    case "append_array_text":
+      return next.op === "append_array_text"
+        && previous.path === next.path
+        && previous.index === next.index
+        && previous.baseLength + previous.value.length === next.baseLength
+        ? { ...previous, value: previous.value + next.value }
+        : null;
+    case "append_command_output":
+      return next.op === "append_command_output" && previous.baseLength + previous.value.text.length === next.baseLength
+        ? {
+            ...previous,
+            value: {
+              stream: previous.value.stream === next.value.stream ? previous.value.stream : "system",
+              text: previous.value.text + next.value.text,
+              truncated: Boolean(previous.value.truncated || next.value.truncated) || undefined,
+            },
+          }
+        : null;
+    case "append_tool_input_json":
+      return next.op === "append_tool_input_json" && previous.baseLength + previous.value.length === next.baseLength
+        ? {
+            ...previous,
+            value: previous.value + next.value,
+            ...(next.partialParsed === undefined ? {} : { partialParsed: next.partialParsed }),
+          }
+        : null;
+    case "merge_payload":
+      return next.op === "merge_payload"
+        ? { op: "merge_payload", value: { ...previous.value, ...next.value } }
+        : null;
+    case "replace_payload":
+    case "set_status":
+    case "set_tool_phase":
+      return next;
+  }
+}
+
+function cloneRecord(value: unknown): Record<string, unknown> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) {
+    return {};
+  }
+  return JSON.parse(JSON.stringify(value)) as Record<string, unknown>;
 }
 
 function applyItemPatch(kind: string, status: string, payload: Record<string, unknown>, patch: ItemPatch): { status: string; payload: Record<string, unknown> } {
