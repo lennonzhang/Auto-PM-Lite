@@ -30,24 +30,25 @@ export class CodexRuntimeAdapter extends BaseRuntimeAdapter implements RuntimeAd
     const account = this.getAccount(profile.accountId);
     const codex = new Codex(await this.buildCodexOptions(account.id, input.taskId, input.cwd));
     const thread = codex.startThread(this.toThreadOptions(profile, input.model, input.cwd));
-    this.threads.set(input.taskId, thread);
+    this.threads.set(input.sessionId, thread);
 
     return {
       taskId: input.taskId,
+      sessionId: input.sessionId,
       ...(thread.id ? { backendThreadId: thread.id } : {}),
     };
   }
 
   async *runTurn(input: RunTurnInput): AsyncIterable<RuntimeAdapterOutput> {
     this.writeRuntimeLog(`runtime.turn.start runtime=codex taskId=${input.taskId} profileId=${input.profileId}`);
-    const thread = this.threads.get(input.taskId);
+    const thread = this.threads.get(input.sessionId);
     if (!thread) {
-      throw new Error(`No Codex thread for task ${input.taskId}`);
+      throw new Error(`No Codex thread for session ${input.sessionId}`);
     }
 
     const state = createCodexV2NormalizerState();
     const controller = new AbortController();
-    this.abortControllers.set(input.taskId, controller);
+    this.abortControllers.set(input.sessionId, controller);
     let sawCodexTurnTerminalEvent = false;
 
     try {
@@ -58,7 +59,7 @@ export class CodexRuntimeAdapter extends BaseRuntimeAdapter implements RuntimeAd
         }
         const events = normalizeCodexEventV2({
           taskId: input.taskId,
-          sessionId: thread.id ?? input.taskId,
+          sessionId: input.sessionId,
           turnId: input.turnId,
           cwd: input.cwd,
           event,
@@ -74,7 +75,7 @@ export class CodexRuntimeAdapter extends BaseRuntimeAdapter implements RuntimeAd
       }
       throw error;
     } finally {
-      this.abortControllers.delete(input.taskId);
+      this.abortControllers.delete(input.sessionId);
     }
   }
 
@@ -87,31 +88,32 @@ export class CodexRuntimeAdapter extends BaseRuntimeAdapter implements RuntimeAd
     const account = this.getAccount(profile.accountId);
     const codex = new Codex(await this.buildCodexOptions(account.id, input.taskId, input.cwd));
     const thread = codex.resumeThread(input.backendThreadId, this.toThreadOptions(profile, input.model, input.cwd));
-    this.threads.set(input.taskId, thread);
+    this.threads.set(input.sessionId, thread);
 
     return {
       taskId: input.taskId,
+      sessionId: input.sessionId,
       backendThreadId: input.backendThreadId,
     };
   }
 
-  async cancelTask(taskId: string): Promise<void> {
-    this.writeRuntimeLog(`runtime.task.cancel runtime=codex taskId=${taskId}`);
-    const controller = this.abortControllers.get(taskId);
+  async cancelTask(sessionId: string): Promise<void> {
+    this.writeRuntimeLog(`runtime.task.cancel runtime=codex sessionId=${sessionId}`);
+    const controller = this.abortControllers.get(sessionId);
     if (controller) {
       controller.abort();
-      this.abortControllers.delete(taskId);
+      this.abortControllers.delete(sessionId);
     }
   }
 
-  async pauseTask(taskId: string): Promise<void> {
-    this.writeRuntimeLog(`runtime.task.pause runtime=codex taskId=${taskId}`);
-    await this.cancelTask(taskId);
+  async pauseTask(sessionId: string): Promise<void> {
+    this.writeRuntimeLog(`runtime.task.pause runtime=codex sessionId=${sessionId}`);
+    await this.cancelTask(sessionId);
   }
 
-  async closeTask(taskId: string): Promise<void> {
-    this.abortControllers.delete(taskId);
-    this.threads.delete(taskId);
+  async closeTask(sessionId: string): Promise<void> {
+    this.abortControllers.delete(sessionId);
+    this.threads.delete(sessionId);
   }
 
   private async buildCodexOptions(accountId: string, taskId: string, cwd?: string): Promise<CodexOptions> {

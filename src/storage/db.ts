@@ -1,7 +1,7 @@
 import fs from "node:fs";
 import path from "node:path";
 import Database from "better-sqlite3";
-import type { AppConfig, ApprovalKind, Task, TaskStatus, TurnRecord, Workspace } from "../core/types.js";
+import type { AppConfig, ApprovalKind, RuntimeSession, RuntimeSessionCloseReason, RuntimeSessionStatus, Task, TaskStatus, TurnRecord, Workspace } from "../core/types.js";
 
 export type SqliteDatabase = InstanceType<typeof Database>;
 
@@ -26,16 +26,16 @@ export interface StoredTask {
   parentTaskId?: string | undefined;
   delegationDepth: number;
   delegationChain: string[];
-  backendThreadId?: string | undefined;
   status: TaskStatus;
   budget: Task["budget"];
   triggeredBy: Task["triggeredBy"];
   createdAt: string;
   updatedAt: string;
-  completedAt?: string | undefined;
+  closedAt?: string | undefined;
 }
 
 export interface StoredTurn extends TurnRecord {}
+export interface StoredRuntimeSession extends RuntimeSession {}
 
 export interface StoredApproval {
   id: string;
@@ -176,8 +176,8 @@ export class AppDatabase {
     `);
 
     const insertTask = this.db.prepare(`
-      INSERT INTO tasks (id, name, profile_id, runtime, model, parent_task_id, delegation_depth, delegation_chain_json, backend_thread_id, workspace_id, cwd, status, budget_json, triggered_by, created_at, updated_at, completed_at)
-      VALUES (@id, @name, @profile_id, @runtime, @model, @parent_task_id, @delegation_depth, @delegation_chain_json, @backend_thread_id, @workspace_id, @cwd, @status, @budget_json, @triggered_by, @created_at, @updated_at, @completed_at)
+      INSERT INTO tasks (id, name, profile_id, runtime, model, parent_task_id, delegation_depth, delegation_chain_json, workspace_id, cwd, status, budget_json, triggered_by, created_at, updated_at, closed_at)
+      VALUES (@id, @name, @profile_id, @runtime, @model, @parent_task_id, @delegation_depth, @delegation_chain_json, @workspace_id, @cwd, @status, @budget_json, @triggered_by, @created_at, @updated_at, @closed_at)
     `);
 
     const tx = this.db.transaction(() => {
@@ -209,7 +209,6 @@ export class AppDatabase {
         parent_task_id: input.task.parentTaskId ?? null,
         delegation_depth: input.task.delegationDepth,
         delegation_chain_json: JSON.stringify(input.task.delegationChain),
-        backend_thread_id: input.task.backendThreadId ?? null,
         workspace_id: input.task.workspaceId,
         cwd: input.task.cwd,
         status: input.task.status,
@@ -217,7 +216,7 @@ export class AppDatabase {
         triggered_by: input.task.triggeredBy,
         created_at: input.task.createdAt,
         updated_at: input.task.updatedAt,
-        completed_at: input.task.completedAt ?? null,
+        closed_at: input.task.closedAt ?? null,
       });
     });
 
@@ -280,7 +279,7 @@ export class AppDatabase {
 
   getTask(taskId: string): StoredTask | null {
     const row = this.db.prepare(`
-      SELECT id, name, profile_id, runtime, model, cwd, workspace_id, parent_task_id, delegation_depth, delegation_chain_json, backend_thread_id, status, budget_json, triggered_by, created_at, updated_at, completed_at
+      SELECT id, name, profile_id, runtime, model, cwd, workspace_id, parent_task_id, delegation_depth, delegation_chain_json, status, budget_json, triggered_by, created_at, updated_at, closed_at
       FROM tasks
       WHERE id = ?
     `).get(taskId) as Record<string, unknown> | undefined;
@@ -300,36 +299,33 @@ export class AppDatabase {
       ...(row.parent_task_id === null ? {} : { parentTaskId: String(row.parent_task_id) }),
       delegationDepth: Number(row.delegation_depth),
       delegationChain: JSON.parse(String(row.delegation_chain_json)) as string[],
-      ...(row.backend_thread_id === null ? {} : { backendThreadId: String(row.backend_thread_id) }),
       status: String(row.status) as TaskStatus,
       budget: JSON.parse(String(row.budget_json)) as Task["budget"],
       triggeredBy: String(row.triggered_by) as Task["triggeredBy"],
       createdAt: String(row.created_at),
       updatedAt: String(row.updated_at),
-      ...(row.completed_at === null ? {} : { completedAt: String(row.completed_at) }),
+      ...(row.closed_at === null ? {} : { closedAt: String(row.closed_at) }),
     };
   }
 
   updateTaskRuntimeState(input: {
     taskId: string;
     status: TaskStatus;
-    backendThreadId?: string | undefined;
-    completedAt?: string | undefined;
+    closedAt?: string | null | undefined;
     updatedAt: string;
   }): void {
     this.db.prepare(`
       UPDATE tasks
       SET status = @status,
-          backend_thread_id = COALESCE(@backend_thread_id, backend_thread_id),
           updated_at = @updated_at,
-          completed_at = @completed_at
+          closed_at = CASE WHEN @closed_at_set THEN @closed_at ELSE closed_at END
       WHERE id = @task_id
     `).run({
       task_id: input.taskId,
       status: input.status,
-      backend_thread_id: input.backendThreadId ?? null,
       updated_at: input.updatedAt,
-      completed_at: input.completedAt ?? null,
+      closed_at_set: input.closedAt !== undefined ? 1 : 0,
+      closed_at: input.closedAt ?? null,
     });
   }
 
@@ -346,13 +342,110 @@ export class AppDatabase {
     });
   }
 
+  createRuntimeSession(session: StoredRuntimeSession): void {
+    this.db.prepare(`
+      INSERT INTO runtime_sessions (
+        id, task_id, runtime, profile_id, model, cwd, backend_thread_id,
+        parent_session_id, forked_from_turn_id, handoff_from_session_id,
+        rollover_from_session_id, status, close_reason, created_at, last_used_at, closed_at
+      )
+      VALUES (
+        @id, @task_id, @runtime, @profile_id, @model, @cwd, @backend_thread_id,
+        @parent_session_id, @forked_from_turn_id, @handoff_from_session_id,
+        @rollover_from_session_id, @status, @close_reason, @created_at, @last_used_at, @closed_at
+      )
+    `).run(runtimeSessionParams(session));
+  }
+
+  getRuntimeSession(sessionId: string): StoredRuntimeSession | null {
+    const row = this.db.prepare(`
+      SELECT id, task_id, runtime, profile_id, model, cwd, backend_thread_id,
+             parent_session_id, forked_from_turn_id, handoff_from_session_id,
+             rollover_from_session_id, status, close_reason, created_at, last_used_at, closed_at
+      FROM runtime_sessions
+      WHERE id = ?
+    `).get(sessionId) as Record<string, unknown> | undefined;
+    return row ? rowToRuntimeSession(row) : null;
+  }
+
+  getCurrentSession(taskId: string): StoredRuntimeSession | null {
+    const row = this.db.prepare(`
+      SELECT id, task_id, runtime, profile_id, model, cwd, backend_thread_id,
+             parent_session_id, forked_from_turn_id, handoff_from_session_id,
+             rollover_from_session_id, status, close_reason, created_at, last_used_at, closed_at
+      FROM runtime_sessions
+      WHERE task_id = ? AND status = 'active'
+      ORDER BY created_at DESC
+      LIMIT 1
+    `).get(taskId) as Record<string, unknown> | undefined;
+    return row ? rowToRuntimeSession(row) : null;
+  }
+
+  listRuntimeSessions(taskId: string): StoredRuntimeSession[] {
+    const rows = this.db.prepare(`
+      SELECT id, task_id, runtime, profile_id, model, cwd, backend_thread_id,
+             parent_session_id, forked_from_turn_id, handoff_from_session_id,
+             rollover_from_session_id, status, close_reason, created_at, last_used_at, closed_at
+      FROM runtime_sessions
+      WHERE task_id = ?
+      ORDER BY created_at ASC
+    `).all(taskId) as Array<Record<string, unknown>>;
+    return rows.map(rowToRuntimeSession);
+  }
+
+  listRuntimeSessionsByStatus(taskId: string, status: RuntimeSessionStatus): StoredRuntimeSession[] {
+    const rows = this.db.prepare(`
+      SELECT id, task_id, runtime, profile_id, model, cwd, backend_thread_id,
+             parent_session_id, forked_from_turn_id, handoff_from_session_id,
+             rollover_from_session_id, status, close_reason, created_at, last_used_at, closed_at
+      FROM runtime_sessions
+      WHERE task_id = ? AND status = ?
+      ORDER BY created_at ASC
+    `).all(taskId, status) as Array<Record<string, unknown>>;
+    return rows.map(rowToRuntimeSession);
+  }
+
+  updateRuntimeSession(input: {
+    sessionId: string;
+    status?: RuntimeSessionStatus | undefined;
+    backendThreadId?: string | undefined;
+    clearBackendThreadId?: boolean | undefined;
+    closeReason?: RuntimeSessionCloseReason | null | undefined;
+    lastUsedAt?: string | null | undefined;
+    closedAt?: string | null | undefined;
+  }): void {
+    this.db.prepare(`
+      UPDATE runtime_sessions
+      SET status = COALESCE(@status, status),
+          backend_thread_id = CASE WHEN @clear_backend_thread_id THEN NULL ELSE COALESCE(@backend_thread_id, backend_thread_id) END,
+          close_reason = CASE WHEN @close_reason_set THEN @close_reason ELSE close_reason END,
+          last_used_at = CASE WHEN @last_used_at_set THEN @last_used_at ELSE last_used_at END,
+          closed_at = CASE WHEN @closed_at_set THEN @closed_at ELSE closed_at END
+      WHERE id = @session_id
+    `).run({
+      session_id: input.sessionId,
+      status: input.status ?? null,
+      backend_thread_id: input.backendThreadId ?? null,
+      clear_backend_thread_id: input.clearBackendThreadId ? 1 : 0,
+      close_reason_set: input.closeReason !== undefined ? 1 : 0,
+      close_reason: input.closeReason ?? null,
+      last_used_at_set: input.lastUsedAt !== undefined ? 1 : 0,
+      last_used_at: input.lastUsedAt ?? null,
+      closed_at_set: input.closedAt !== undefined ? 1 : 0,
+      closed_at: input.closedAt ?? null,
+    });
+  }
+
   createTurn(turn: StoredTurn): void {
     this.db.prepare(`
-      INSERT INTO turns (id, task_id, prompt_redacted, prompt_raw_encrypted, prompt_raw_ttl_at, status, usage_json, started_at, completed_at)
-      VALUES (@id, @task_id, @prompt_redacted, @prompt_raw_encrypted, @prompt_raw_ttl_at, @status, @usage_json, @started_at, @completed_at)
+      INSERT INTO turns (id, task_id, session_id, turn_number, request_id, prompt_redacted, prompt_raw_encrypted, prompt_raw_ttl_at, status, usage_json, started_at, completed_at)
+      VALUES (@id, @task_id, @session_id, @turn_number, @request_id, @prompt_redacted, @prompt_raw_encrypted, @prompt_raw_ttl_at, @status, @usage_json, @started_at, @completed_at)
     `).run({
       id: turn.id,
       task_id: turn.taskId,
+      session_id: turn.sessionId,
+      turn_number: turn.turnNumber,
+      request_id: turn.requestId ?? null,
       prompt_redacted: turn.promptRedacted,
       prompt_raw_encrypted: turn.promptRawEncrypted ?? null,
       prompt_raw_ttl_at: turn.promptRawTtlAt ?? null,
@@ -385,10 +478,10 @@ export class AppDatabase {
 
   getLatestTurn(taskId: string): StoredTurn | null {
     const row = this.db.prepare(`
-      SELECT id, task_id, prompt_redacted, prompt_raw_encrypted, prompt_raw_ttl_at, status, usage_json, started_at, completed_at
+      SELECT id, task_id, session_id, turn_number, request_id, prompt_redacted, prompt_raw_encrypted, prompt_raw_ttl_at, status, usage_json, started_at, completed_at
       FROM turns
       WHERE task_id = ?
-      ORDER BY started_at DESC
+      ORDER BY turn_number DESC, started_at DESC
       LIMIT 1
     `).get(taskId) as Record<string, unknown> | undefined;
 
@@ -396,38 +489,37 @@ export class AppDatabase {
       return null;
     }
 
-    return {
-      id: String(row.id),
-      taskId: String(row.task_id),
-      promptRedacted: String(row.prompt_redacted),
-      ...(row.prompt_raw_encrypted === null ? {} : { promptRawEncrypted: String(row.prompt_raw_encrypted) }),
-      ...(row.prompt_raw_ttl_at === null ? {} : { promptRawTtlAt: String(row.prompt_raw_ttl_at) }),
-      status: String(row.status) as StoredTurn["status"],
-      ...(row.usage_json === null ? {} : { usage: JSON.parse(String(row.usage_json)) as NonNullable<StoredTurn["usage"]> }),
-      startedAt: String(row.started_at),
-      ...(row.completed_at === null ? {} : { completedAt: String(row.completed_at) }),
-    };
+    return rowToTurn(row);
   }
 
   listTurns(taskId: string): StoredTurn[] {
     const rows = this.db.prepare(`
-      SELECT id, task_id, prompt_redacted, prompt_raw_encrypted, prompt_raw_ttl_at, status, usage_json, started_at, completed_at
+      SELECT id, task_id, session_id, turn_number, request_id, prompt_redacted, prompt_raw_encrypted, prompt_raw_ttl_at, status, usage_json, started_at, completed_at
       FROM turns
       WHERE task_id = ?
-      ORDER BY started_at ASC
+      ORDER BY turn_number ASC, started_at ASC
     `).all(taskId) as Array<Record<string, unknown>>;
 
-    return rows.map((row) => ({
-      id: String(row.id),
-      taskId: String(row.task_id),
-      promptRedacted: String(row.prompt_redacted),
-      ...(row.prompt_raw_encrypted === null ? {} : { promptRawEncrypted: String(row.prompt_raw_encrypted) }),
-      ...(row.prompt_raw_ttl_at === null ? {} : { promptRawTtlAt: String(row.prompt_raw_ttl_at) }),
-      status: String(row.status) as StoredTurn["status"],
-      ...(row.usage_json === null ? {} : { usage: JSON.parse(String(row.usage_json)) as NonNullable<StoredTurn["usage"]> }),
-      startedAt: String(row.started_at),
-      ...(row.completed_at === null ? {} : { completedAt: String(row.completed_at) }),
-    }));
+    return rows.map(rowToTurn);
+  }
+
+  getTurnByRequestId(taskId: string, requestId: string): StoredTurn | null {
+    const row = this.db.prepare(`
+      SELECT id, task_id, session_id, turn_number, request_id, prompt_redacted, prompt_raw_encrypted, prompt_raw_ttl_at, status, usage_json, started_at, completed_at
+      FROM turns
+      WHERE task_id = ? AND request_id = ?
+      LIMIT 1
+    `).get(taskId, requestId) as Record<string, unknown> | undefined;
+    return row ? rowToTurn(row) : null;
+  }
+
+  nextTurnNumber(taskId: string): number {
+    const row = this.db.prepare(`
+      SELECT COALESCE(MAX(turn_number), 0) + 1 AS next_turn_number
+      FROM turns
+      WHERE task_id = ?
+    `).get(taskId) as { next_turn_number: number } | undefined;
+    return Number(row?.next_turn_number ?? 1);
   }
 
   createApproval(input: StoredApproval): void {
@@ -598,17 +690,17 @@ export class AppDatabase {
     return undefined;
   }
 
-  getLatestTerminalTaskEvent(taskId: string): { type: "task.completed" | "task.failed" | "task.interrupted" | "task.cancelled"; ts: string; error?: string | undefined } | undefined {
+  getLatestTerminalTaskEvent(taskId: string): { type: "task.idle" | "task.failed" | "task.interrupted" | "task.cancelled" | "task.closed"; ts: string; error?: string | undefined } | undefined {
     const v2Row = this.db.prepare(`
       SELECT event_json, ts
       FROM events
-      WHERE task_id = ? AND json_extract(event_json, '$.kind') IN ('task.completed', 'task.failed', 'task.interrupted', 'task.cancelled')
+      WHERE task_id = ? AND json_extract(event_json, '$.kind') IN ('task.idle', 'task.failed', 'task.interrupted', 'task.cancelled', 'task.closed')
       ORDER BY task_seq DESC
       LIMIT 1
     `).get(taskId) as { event_json: string; ts: string } | undefined;
 
     if (v2Row) {
-      const event = JSON.parse(v2Row.event_json) as { kind: "task.completed" | "task.failed" | "task.interrupted" | "task.cancelled"; error?: { message?: unknown } };
+      const event = JSON.parse(v2Row.event_json) as { kind: "task.idle" | "task.failed" | "task.interrupted" | "task.cancelled" | "task.closed"; error?: { message?: unknown } };
       return {
         type: event.kind,
         ts: v2Row.ts,
@@ -816,7 +908,6 @@ export class AppDatabase {
         parent_task_id TEXT REFERENCES tasks(id),
         delegation_depth INTEGER NOT NULL,
         delegation_chain_json TEXT NOT NULL,
-        backend_thread_id TEXT,
         workspace_id TEXT NOT NULL REFERENCES workspaces(id),
         cwd TEXT NOT NULL,
         status TEXT NOT NULL,
@@ -824,7 +915,7 @@ export class AppDatabase {
         triggered_by TEXT NOT NULL,
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL,
-        completed_at TEXT
+        closed_at TEXT
       );
       CREATE INDEX IF NOT EXISTS idx_tasks_parent ON tasks(parent_task_id);
       CREATE INDEX IF NOT EXISTS idx_tasks_status ON tasks(status);
@@ -832,6 +923,9 @@ export class AppDatabase {
       CREATE TABLE IF NOT EXISTS turns (
         id TEXT PRIMARY KEY,
         task_id TEXT NOT NULL REFERENCES tasks(id),
+        session_id TEXT,
+        turn_number INTEGER,
+        request_id TEXT,
         prompt_redacted TEXT NOT NULL,
         prompt_raw_encrypted TEXT,
         prompt_raw_ttl_at TEXT,
@@ -840,6 +934,29 @@ export class AppDatabase {
         started_at TEXT NOT NULL,
         completed_at TEXT
       );
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_turns_task_turn_number ON turns(task_id, turn_number);
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_turns_task_request_id ON turns(task_id, request_id) WHERE request_id IS NOT NULL;
+
+      CREATE TABLE IF NOT EXISTS runtime_sessions (
+        id TEXT PRIMARY KEY,
+        task_id TEXT NOT NULL REFERENCES tasks(id),
+        runtime TEXT NOT NULL,
+        profile_id TEXT NOT NULL,
+        model TEXT NOT NULL,
+        cwd TEXT NOT NULL,
+        backend_thread_id TEXT,
+        parent_session_id TEXT REFERENCES runtime_sessions(id),
+        forked_from_turn_id TEXT REFERENCES turns(id),
+        handoff_from_session_id TEXT REFERENCES runtime_sessions(id),
+        rollover_from_session_id TEXT REFERENCES runtime_sessions(id),
+        status TEXT NOT NULL,
+        close_reason TEXT,
+        created_at TEXT NOT NULL,
+        last_used_at TEXT,
+        closed_at TEXT
+      );
+      CREATE INDEX IF NOT EXISTS idx_runtime_sessions_task ON runtime_sessions(task_id, created_at);
+      CREATE UNIQUE INDEX IF NOT EXISTS idx_runtime_sessions_one_active ON runtime_sessions(task_id) WHERE status = 'active';
 
       CREATE TABLE IF NOT EXISTS approvals (
         id TEXT PRIMARY KEY,
@@ -880,10 +997,17 @@ export class AppDatabase {
     this.ensureColumn("workspaces", "discarded_at", "TEXT");
     this.ensureColumn("workspaces", "merge_error_json", "TEXT");
     this.ensureColumn("tasks", "model", "TEXT");
+    this.ensureColumn("tasks", "runtime", "TEXT");
+    this.ensureColumn("tasks", "closed_at", "TEXT");
+    this.ensureColumn("turns", "session_id", "TEXT");
+    this.ensureColumn("turns", "turn_number", "INTEGER");
+    this.ensureColumn("turns", "request_id", "TEXT");
     this.backfillTaskModels();
+    this.backfillTurnSessionColumns();
     this.recordMigration("001_initial");
     this.recordMigration("002_workspace_lifecycle");
     this.recordMigration("003_task_model");
+    this.recordMigration("004_runtime_sessions");
   }
 
   private backfillTaskModels(): void {
@@ -896,6 +1020,77 @@ export class AppDatabase {
       )
       WHERE model IS NULL OR model = ''
     `).run();
+  }
+
+  private backfillTurnSessionColumns(): void {
+    const sessionsByTask = new Map<string, string>();
+    const sessionRows = this.db.prepare(`
+      SELECT id, task_id
+      FROM runtime_sessions
+      ORDER BY created_at ASC
+    `).all() as Array<{ id: string; task_id: string }>;
+    for (const row of sessionRows) {
+      if (!sessionsByTask.has(row.task_id)) {
+        sessionsByTask.set(row.task_id, row.id);
+      }
+    }
+
+    const tasks = this.db.prepare(`
+      SELECT id, runtime, profile_id, model, cwd, created_at
+      FROM tasks
+    `).all() as Array<{ id: string; runtime: string; profile_id: string; model: string; cwd: string; created_at: string }>;
+    const insertSession = this.db.prepare(`
+      INSERT OR IGNORE INTO runtime_sessions (id, task_id, runtime, profile_id, model, cwd, status, created_at)
+      VALUES (@id, @task_id, @runtime, @profile_id, @model, @cwd, 'active', @created_at)
+    `);
+    for (const task of tasks) {
+      if (sessionsByTask.has(task.id)) {
+        continue;
+      }
+      const sessionId = `session-${task.id}`;
+      insertSession.run({
+        id: sessionId,
+        task_id: task.id,
+        runtime: task.runtime,
+        profile_id: task.profile_id,
+        model: task.model,
+        cwd: task.cwd,
+        created_at: task.created_at,
+      });
+      sessionsByTask.set(task.id, sessionId);
+    }
+
+    const turns = this.db.prepare(`
+      SELECT id, task_id
+      FROM turns
+      WHERE session_id IS NULL OR turn_number IS NULL
+      ORDER BY task_id ASC, started_at ASC
+    `).all() as Array<{ id: string; task_id: string }>;
+    const counters = new Map<string, number>();
+    const maxRows = this.db.prepare(`
+      SELECT task_id, COALESCE(MAX(turn_number), 0) AS max_turn_number
+      FROM turns
+      WHERE turn_number IS NOT NULL
+      GROUP BY task_id
+    `).all() as Array<{ task_id: string; max_turn_number: number }>;
+    for (const row of maxRows) {
+      counters.set(row.task_id, Number(row.max_turn_number));
+    }
+    const updateTurn = this.db.prepare(`
+      UPDATE turns
+      SET session_id = COALESCE(session_id, @session_id),
+          turn_number = COALESCE(turn_number, @turn_number)
+      WHERE id = @turn_id
+    `);
+    for (const turn of turns) {
+      const current = (counters.get(turn.task_id) ?? 0) + 1;
+      counters.set(turn.task_id, current);
+      updateTurn.run({
+        turn_id: turn.id,
+        session_id: sessionsByTask.get(turn.task_id) ?? `session-${turn.task_id}`,
+        turn_number: current,
+      });
+    }
   }
 
   private ensureColumn(tableName: string, columnName: string, type: string): void {
@@ -911,4 +1106,63 @@ export class AppDatabase {
       VALUES (?, ?)
     `).run(id, new Date().toISOString());
   }
+}
+
+function runtimeSessionParams(session: StoredRuntimeSession): Record<string, unknown> {
+  return {
+    id: session.id,
+    task_id: session.taskId,
+    runtime: session.runtime,
+    profile_id: session.profileId,
+    model: session.model,
+    cwd: session.cwd,
+    backend_thread_id: session.backendThreadId ?? null,
+    parent_session_id: session.parentSessionId ?? null,
+    forked_from_turn_id: session.forkedFromTurnId ?? null,
+    handoff_from_session_id: session.handoffFromSessionId ?? null,
+    rollover_from_session_id: session.rolloverFromSessionId ?? null,
+    status: session.status,
+    close_reason: session.closeReason ?? null,
+    created_at: session.createdAt,
+    last_used_at: session.lastUsedAt ?? null,
+    closed_at: session.closedAt ?? null,
+  };
+}
+
+function rowToRuntimeSession(row: Record<string, unknown>): StoredRuntimeSession {
+  return {
+    id: String(row.id),
+    taskId: String(row.task_id),
+    runtime: String(row.runtime) as StoredRuntimeSession["runtime"],
+    profileId: String(row.profile_id),
+    model: String(row.model),
+    cwd: String(row.cwd),
+    ...(row.backend_thread_id === null ? {} : { backendThreadId: String(row.backend_thread_id) }),
+    ...(row.parent_session_id === null ? {} : { parentSessionId: String(row.parent_session_id) }),
+    ...(row.forked_from_turn_id === null ? {} : { forkedFromTurnId: String(row.forked_from_turn_id) }),
+    ...(row.handoff_from_session_id === null ? {} : { handoffFromSessionId: String(row.handoff_from_session_id) }),
+    ...(row.rollover_from_session_id === null ? {} : { rolloverFromSessionId: String(row.rollover_from_session_id) }),
+    status: String(row.status) as RuntimeSessionStatus,
+    ...(row.close_reason === null ? {} : { closeReason: String(row.close_reason) as RuntimeSessionCloseReason }),
+    createdAt: String(row.created_at),
+    ...(row.last_used_at === null ? {} : { lastUsedAt: String(row.last_used_at) }),
+    ...(row.closed_at === null ? {} : { closedAt: String(row.closed_at) }),
+  };
+}
+
+function rowToTurn(row: Record<string, unknown>): StoredTurn {
+  return {
+    id: String(row.id),
+    taskId: String(row.task_id),
+    sessionId: String(row.session_id),
+    turnNumber: Number(row.turn_number),
+    ...(row.request_id === null ? {} : { requestId: String(row.request_id) }),
+    promptRedacted: String(row.prompt_redacted),
+    ...(row.prompt_raw_encrypted === null ? {} : { promptRawEncrypted: String(row.prompt_raw_encrypted) }),
+    ...(row.prompt_raw_ttl_at === null ? {} : { promptRawTtlAt: String(row.prompt_raw_ttl_at) }),
+    status: String(row.status) as StoredTurn["status"],
+    ...(row.usage_json === null ? {} : { usage: JSON.parse(String(row.usage_json)) as NonNullable<StoredTurn["usage"]> }),
+    startedAt: String(row.started_at),
+    ...(row.completed_at === null ? {} : { completedAt: String(row.completed_at) }),
+  };
 }

@@ -39,7 +39,7 @@ class FakeRuntime implements RuntimeAdapter {
 
   async startTask(input: StartRuntimeTaskInput): Promise<RuntimeTaskHandle> {
     this.started.push(input);
-    return { taskId: input.taskId, backendThreadId: `thread-${input.taskId}` };
+    return { taskId: input.taskId, sessionId: input.sessionId, backendThreadId: `thread-${input.taskId}` };
   }
 
   async *runTurn(input: RunTurnInput): AsyncIterable<RuntimeAdapterOutput> {
@@ -52,7 +52,7 @@ class FakeRuntime implements RuntimeAdapter {
 
   async resumeTask(input: ResumeRuntimeTaskInput): Promise<RuntimeTaskHandle> {
     this.resumed.push(input);
-    return { taskId: input.taskId, backendThreadId: input.backendThreadId };
+    return { taskId: input.taskId, sessionId: input.sessionId, backendThreadId: input.backendThreadId };
   }
 
   async pauseTask(_taskId: string): Promise<void> {}
@@ -408,7 +408,6 @@ CODEX__AUTO_CODE_VIP__KEY__CX_PRO=sk-codex
       db.updateTaskRuntimeState({
         taskId: task.id,
         status: "running",
-        backendThreadId: "thread-stale",
         updatedAt: new Date().toISOString(),
       });
 

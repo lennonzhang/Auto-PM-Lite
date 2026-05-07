@@ -99,7 +99,7 @@ class DesktopSmokeRuntime implements RuntimeAdapter {
   constructor(readonly runtime: RuntimeAdapter["runtime"], private readonly config: AppConfig) {}
 
   async startTask(input: StartRuntimeTaskInput): Promise<RuntimeTaskHandle> {
-    return { taskId: input.taskId, backendThreadId: `smoke-thread-${input.taskId}` };
+    return { taskId: input.taskId, sessionId: input.sessionId, backendThreadId: `smoke-thread-${input.taskId}` };
   }
 
   async *runTurn(input: RunTurnInput): AsyncIterable<RuntimeAdapterOutput> {
@@ -111,7 +111,7 @@ class DesktopSmokeRuntime implements RuntimeAdapter {
         item: {
           id: `smoke:message:${input.taskId}`,
           taskId: input.taskId,
-          sessionId: `smoke-thread-${input.taskId}`,
+          sessionId: input.sessionId,
           turnId: input.turnId,
           kind: "assistant_message",
           status: "completed",
@@ -130,7 +130,7 @@ class DesktopSmokeRuntime implements RuntimeAdapter {
           item: {
             id: `smoke:delegation:${input.taskId}`,
             taskId: input.taskId,
-            sessionId: `smoke-thread-${input.taskId}`,
+            sessionId: input.sessionId,
             turnId: input.turnId,
             kind: "delegation",
             status: "completed",
@@ -161,7 +161,7 @@ class DesktopSmokeRuntime implements RuntimeAdapter {
   }
 
   async resumeTask(input: ResumeRuntimeTaskInput): Promise<RuntimeTaskHandle> {
-    return { taskId: input.taskId, backendThreadId: input.backendThreadId };
+    return { taskId: input.taskId, sessionId: input.sessionId, backendThreadId: input.backendThreadId };
   }
 
   async pauseTask(_taskId: string): Promise<void> {}

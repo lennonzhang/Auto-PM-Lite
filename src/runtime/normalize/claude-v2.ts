@@ -36,6 +36,7 @@ export function createClaudeV2NormalizerState(): ClaudeV2NormalizerState {
 
 export function normalizeClaudeMessageV2(input: {
   taskId: string;
+  sessionId: string;
   turnId: string;
   cwd: string;
   message: SDKMessage;
@@ -43,7 +44,7 @@ export function normalizeClaudeMessageV2(input: {
   ts?: string | undefined;
 }): CanonicalEvent[] {
   const ts = input.ts ?? new Date().toISOString();
-  const sessionId = messageSessionId(input.message, input.taskId);
+  const sessionId = input.sessionId;
 
   if (input.message.type === "stream_event") {
     return normalizeStreamEvent({
@@ -96,7 +97,7 @@ export function normalizeClaudeMessageV2(input: {
   }
 
   if (input.message.type === "result") {
-    const backend: CanonicalEvent = { kind: "task.backend_thread", backendThreadId: input.message.session_id };
+    const backend: CanonicalEvent = { kind: "session.backend_thread", sessionId: input.sessionId, backendThreadId: input.message.session_id };
     if (input.message.subtype === "success") {
       return [
         backend,
@@ -650,10 +651,6 @@ function systemNoticeItem(input: {
 
 function blockItemId(sessionId: string, turnId: string, index: number): string {
   return `claude:${sessionId}:${turnId}:block:${index}`;
-}
-
-function messageSessionId(message: SDKMessage, fallback: string): string {
-  return "session_id" in message && typeof message.session_id === "string" ? message.session_id : fallback;
 }
 
 function taskError(message: string) {

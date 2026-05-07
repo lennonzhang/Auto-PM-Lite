@@ -252,7 +252,7 @@ describe("Phase 4: EventHub", () => {
       runtime: "claude",
       taskId: "task1",
       sessionId: "session1",
-      event: { kind: "task.completed", summary: "Done" },
+      event: { kind: "task.idle", reason: "turn_completed" },
     });
     await nextTick();
 
@@ -284,7 +284,7 @@ describe("Phase 4: EventHub", () => {
       runtime: "claude",
       taskId: "task1",
       sessionId: "session1",
-      event: { kind: "task.completed", summary: "Done" },
+      event: { kind: "task.idle", reason: "turn_completed" },
     });
 
     expect(events).toHaveLength(1);

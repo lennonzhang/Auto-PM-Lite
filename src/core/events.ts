@@ -27,12 +27,23 @@ export type CanonicalEvent = LifecycleEvent | ItemEvent | ControlEvent;
 export type LifecycleEvent =
   | { kind: "session.started"; profileId: string; model: string; tools?: ToolSummary[] | undefined; mcpServers?: McpServerSummary[] | undefined }
   | { kind: "session.updated"; patch: SessionPatch }
+  | { kind: "session.opened"; sessionId: string; runtime: RuntimeKind; profileId: string; model: string }
+  | { kind: "session.backend_thread"; sessionId: string; backendThreadId: string }
+  | { kind: "session.closed"; sessionId: string; reason: "handoff" | "rollover" | "forked" | "cancelled" | "failed" | "task_closed" }
+  | { kind: "session.failed"; sessionId: string; error: TaskError }
   | { kind: "task.started"; profileId: string; model: string; cwd: string }
   | { kind: "task.queued" }
-  | { kind: "task.backend_thread"; backendThreadId: string }
   | { kind: "task.paused" }
-  | { kind: "task.cancelled"; reason?: string | undefined }
-  | { kind: "task.completed"; summary: string }
+  | { kind: "task.cancellation_requested"; taskId: string; reason?: string | undefined }
+  | { kind: "task.cancelled"; taskId: string; reason?: string | undefined }
+  | { kind: "task.idle"; reason: "turn_completed" | "handoff_completed" | "rollover_completed" | "recovered" }
+  | { kind: "task.closed"; taskId: string; summary?: string | undefined }
+  | { kind: "task.handoff_started"; sourceSessionId: string; targetSessionId: string; contextTokens: number }
+  | { kind: "task.handoff_completed"; sourceSessionId: string; targetSessionId: string }
+  | { kind: "task.handoff_failed"; sourceSessionId: string; error: TaskError; rolledBack: boolean }
+  | { kind: "task.forked"; sourceSessionId: string; targetSessionId: string; forkKind: "native" | "logical"; childTaskId?: string | undefined }
+  | { kind: "task.rollover_started"; sourceSessionId: string; targetSessionId: string; reason: string }
+  | { kind: "task.rollover_completed"; sourceSessionId: string; targetSessionId: string }
   | { kind: "task.failed"; error: TaskError }
   | { kind: "task.interrupted"; error: TaskError }
   | { kind: "turn.started"; turnId: string; promptRedacted?: string | undefined }
@@ -593,12 +604,27 @@ export const lifecycleEventSchema: z.ZodType<LifecycleEvent> = z.discriminatedUn
     mcpServers: z.array(z.object({ name: z.string(), status: z.string() })).optional(),
   }),
   z.object({ kind: z.literal("session.updated"), patch: z.record(z.string(), z.unknown()) }),
+  z.object({ kind: z.literal("session.opened"), sessionId: z.string(), runtime: runtimeKindSchema, profileId: z.string(), model: z.string() }),
+  z.object({ kind: z.literal("session.backend_thread"), sessionId: z.string(), backendThreadId: z.string() }),
+  z.object({
+    kind: z.literal("session.closed"),
+    sessionId: z.string(),
+    reason: z.enum(["handoff", "rollover", "forked", "cancelled", "failed", "task_closed"]),
+  }),
+  z.object({ kind: z.literal("session.failed"), sessionId: z.string(), error: taskErrorSchema }),
   z.object({ kind: z.literal("task.started"), profileId: z.string(), model: z.string(), cwd: z.string() }),
   z.object({ kind: z.literal("task.queued") }),
-  z.object({ kind: z.literal("task.backend_thread"), backendThreadId: z.string() }),
   z.object({ kind: z.literal("task.paused") }),
-  z.object({ kind: z.literal("task.cancelled"), reason: z.string().optional() }),
-  z.object({ kind: z.literal("task.completed"), summary: z.string() }),
+  z.object({ kind: z.literal("task.cancellation_requested"), taskId: z.string(), reason: z.string().optional() }),
+  z.object({ kind: z.literal("task.cancelled"), taskId: z.string(), reason: z.string().optional() }),
+  z.object({ kind: z.literal("task.idle"), reason: z.enum(["turn_completed", "handoff_completed", "rollover_completed", "recovered"]) }),
+  z.object({ kind: z.literal("task.closed"), taskId: z.string(), summary: z.string().optional() }),
+  z.object({ kind: z.literal("task.handoff_started"), sourceSessionId: z.string(), targetSessionId: z.string(), contextTokens: z.number() }),
+  z.object({ kind: z.literal("task.handoff_completed"), sourceSessionId: z.string(), targetSessionId: z.string() }),
+  z.object({ kind: z.literal("task.handoff_failed"), sourceSessionId: z.string(), error: taskErrorSchema, rolledBack: z.boolean() }),
+  z.object({ kind: z.literal("task.forked"), sourceSessionId: z.string(), targetSessionId: z.string(), forkKind: z.enum(["native", "logical"]), childTaskId: z.string().optional() }),
+  z.object({ kind: z.literal("task.rollover_started"), sourceSessionId: z.string(), targetSessionId: z.string(), reason: z.string() }),
+  z.object({ kind: z.literal("task.rollover_completed"), sourceSessionId: z.string(), targetSessionId: z.string() }),
   z.object({ kind: z.literal("task.failed"), error: taskErrorSchema }),
   z.object({ kind: z.literal("task.interrupted"), error: taskErrorSchema }),
   z.object({ kind: z.literal("turn.started"), turnId: z.string(), promptRedacted: z.string().optional() }),

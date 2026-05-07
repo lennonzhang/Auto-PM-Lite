@@ -264,17 +264,41 @@ program
 
 program
   .command("task:run")
-  .description("Run one queued task turn")
+  .description("Alias for task:send-turn")
   .requiredOption("-t, --task <id>", "Task ID")
   .requiredOption("-m, --message <prompt>", "Prompt to send to the runtime")
+  .option("--request-id <id>", "Idempotency key")
   .option("-c, --config <path>", "Path to config TOML", defaultConfigPath())
-  .action(async ({ config, message, task }) => {
+  .action(async ({ config, message, requestId, task }) => {
     const services = await openAppServices(config);
 
     try {
       const result = await services.tasks.runTask({
         taskId: task,
         prompt: message,
+        requestId,
+      });
+      process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
+    } finally {
+      await services.close();
+    }
+  });
+
+program
+  .command("task:send-turn")
+  .description("Send a normal follow-up turn to a queued or idle task")
+  .requiredOption("-t, --task <id>", "Task ID")
+  .requiredOption("-m, --message <prompt>", "Prompt to send to the runtime")
+  .option("--request-id <id>", "Idempotency key")
+  .option("-c, --config <path>", "Path to config TOML", defaultConfigPath())
+  .action(async ({ config, message, requestId, task }) => {
+    const services = await openAppServices(config);
+
+    try {
+      const result = await services.tasks.sendTurn({
+        taskId: task,
+        prompt: message,
+        requestId,
       });
       process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
     } finally {
@@ -287,14 +311,116 @@ program
   .description("Resume an interrupted task")
   .requiredOption("-t, --task <id>", "Task ID")
   .option("-m, --message <prompt>", "Optional prompt override")
+  .option("--request-id <id>", "Idempotency key")
   .option("-c, --config <path>", "Path to config TOML", defaultConfigPath())
-  .action(async ({ config, message, task }) => {
+  .action(async ({ config, message, requestId, task }) => {
     const services = await openAppServices(config);
 
     try {
       const result = await services.tasks.resumeTask({
         taskId: task,
         prompt: message,
+        requestId,
+      });
+      process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
+    } finally {
+      await services.close();
+    }
+  });
+
+program
+  .command("task:close")
+  .description("Explicitly close an idle or recoverable task")
+  .requiredOption("-t, --task <id>", "Task ID")
+  .option("-s, --summary <text>", "Optional close summary")
+  .option("-c, --config <path>", "Path to config TOML", defaultConfigPath())
+  .action(async ({ config, summary, task }) => {
+    const services = await openAppServices(config);
+
+    try {
+      const result = await services.tasks.closeTask({
+        taskId: task,
+        summary,
+      });
+      process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
+    } finally {
+      await services.close();
+    }
+  });
+
+program
+  .command("task:handoff")
+  .description("Handoff an idle task to another profile")
+  .requiredOption("-t, --task <id>", "Task ID")
+  .requiredOption("-p, --profile <id>", "Target profile ID")
+  .requiredOption("-r, --reason <text>", "Handoff reason")
+  .option("-m, --message <prompt>", "Optional prompt for the target runtime")
+  .option("--request-id <id>", "Idempotency key")
+  .option("-c, --config <path>", "Path to config TOML", defaultConfigPath())
+  .action(async ({ config, message, profile, reason, requestId, task }) => {
+    const services = await openAppServices(config);
+
+    try {
+      const result = await services.tasks.handoffTask({
+        taskId: task,
+        targetProfileId: profile,
+        prompt: message,
+        reason,
+        requestId,
+      });
+      process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
+    } finally {
+      await services.close();
+    }
+  });
+
+program
+  .command("task:fork")
+  .description("Fork a task session")
+  .requiredOption("-t, --task <id>", "Task ID")
+  .option("--from-turn <id>", "Completed turn to fork from")
+  .option("--mode <task|session>", "Fork mode", "task")
+  .option("-n, --name <text>", "Child task name")
+  .option("-m, --message <prompt>", "Optional prompt for logical fork")
+  .option("--request-id <id>", "Idempotency key")
+  .option("-c, --config <path>", "Path to config TOML", defaultConfigPath())
+  .action(async ({ config, fromTurn, message, mode, name, requestId, task }) => {
+    const services = await openAppServices(config);
+
+    try {
+      const result = await services.tasks.forkTask({
+        taskId: task,
+        fromTurnId: fromTurn,
+        mode,
+        name,
+        prompt: message,
+        requestId,
+      });
+      process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
+    } finally {
+      await services.close();
+    }
+  });
+
+program
+  .command("task:rollover")
+  .description("Rollover an idle task to a fresh runtime session")
+  .requiredOption("-t, --task <id>", "Task ID")
+  .requiredOption("-r, --reason <context_limit|model_change|profile_change|session_corrupt|manual>", "Rollover reason")
+  .option("-p, --profile <id>", "Optional target profile ID")
+  .option("-m, --message <prompt>", "Optional carry-over prompt")
+  .option("--request-id <id>", "Idempotency key")
+  .option("-c, --config <path>", "Path to config TOML", defaultConfigPath())
+  .action(async ({ config, message, profile, reason, requestId, task }) => {
+    const services = await openAppServices(config);
+
+    try {
+      const result = await services.tasks.rolloverSession({
+        taskId: task,
+        reason,
+        targetProfileId: profile,
+        carryOverPrompt: message,
+        requestId,
       });
       process.stdout.write(`${JSON.stringify(result, null, 2)}\n`);
     } finally {

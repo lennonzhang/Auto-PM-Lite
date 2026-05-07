@@ -3,6 +3,7 @@ import type { RuntimeKind } from "../core/types.js";
 
 export interface StartRuntimeTaskInput {
   taskId: string;
+  sessionId: string;
   profileId: string;
   model: string;
   cwd: string;
@@ -11,6 +12,7 @@ export interface StartRuntimeTaskInput {
 
 export interface RunTurnInput {
   taskId: string;
+  sessionId: string;
   turnId: string;
   profileId: string;
   model: string;
@@ -20,6 +22,7 @@ export interface RunTurnInput {
 
 export interface ResumeRuntimeTaskInput {
   taskId: string;
+  sessionId: string;
   profileId: string;
   model: string;
   cwd?: string;
@@ -28,7 +31,24 @@ export interface ResumeRuntimeTaskInput {
 
 export interface RuntimeTaskHandle {
   taskId: string;
+  sessionId: string;
   backendThreadId?: string | undefined;
+}
+
+export interface ForkRuntimeSessionInput {
+  taskId: string;
+  sourceSessionId: string;
+  targetSessionId: string;
+  profileId: string;
+  model: string;
+  cwd: string;
+  sourceBackendThreadId: string;
+  upToMessageId?: string | undefined;
+}
+
+export interface ForkRuntimeSessionResult {
+  backendThreadId: string;
+  forkKind: "native" | "logical";
 }
 
 export type RuntimeAdapterOutput =
@@ -40,7 +60,8 @@ export interface RuntimeAdapter {
   startTask(input: StartRuntimeTaskInput): Promise<RuntimeTaskHandle>;
   runTurn(input: RunTurnInput): AsyncIterable<RuntimeAdapterOutput>;
   resumeTask(input: ResumeRuntimeTaskInput): Promise<RuntimeTaskHandle>;
-  pauseTask(taskId: string): Promise<void>;
-  cancelTask(taskId: string): Promise<void>;
-  closeTask(taskId: string): Promise<void>;
+  forkSession?(input: ForkRuntimeSessionInput): Promise<ForkRuntimeSessionResult>;
+  pauseTask(sessionId: string): Promise<void>;
+  cancelTask(sessionId: string): Promise<void>;
+  closeTask(sessionId: string): Promise<void>;
 }

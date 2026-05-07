@@ -258,7 +258,7 @@ describe("Claude v2 normalizer", () => {
     }), state);
 
     expect(result).toEqual(expect.arrayContaining([
-      { kind: "task.backend_thread", backendThreadId: "session-1" },
+      { kind: "session.backend_thread", sessionId: "session-1", backendThreadId: "session-1" },
       {
         kind: "turn.completed",
         turnId: "turn-1",
@@ -277,6 +277,7 @@ describe("Claude v2 normalizer", () => {
 function normalize(message: SDKMessage, state = createClaudeV2NormalizerState()) {
   return normalizeClaudeMessageV2({
     taskId: "task-1",
+    sessionId: "session-1",
     turnId: "turn-1",
     cwd: "cwd",
     message,

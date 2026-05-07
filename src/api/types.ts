@@ -34,6 +34,16 @@ export type AppErrorCode =
   | "logs_unavailable"
   | "runtime_probe_failed"
   | "runtime_unavailable"
+  | "task_busy"
+  | "task_terminal"
+  | "not_recoverable"
+  | "session_unavailable"
+  | "runtime_capability_unavailable"
+  | "fork_not_supported"
+  | "fork_truncation_required"
+  | "handoff_failed"
+  | "rollover_failed"
+  | "continuation_context_too_large"
   | "unknown_error";
 
 export interface ErrorEnvelope {
@@ -139,7 +149,7 @@ export interface TaskActionAccepted {
   accepted: true;
   taskId: string;
   actionId: string;
-  action: "run" | "resume" | "pause";
+  action: "send_turn" | "run" | "resume" | "pause" | "handoff" | "fork" | "rollover" | "close" | "cancel";
 }
 
 export interface TaskResultView {
@@ -234,6 +244,21 @@ function isZodErrorLike(error: unknown): error is { issues: unknown[] } {
 }
 
 function inferErrorCode(message: string): AppErrorCode {
+  const exactCodes: AppErrorCode[] = [
+    "task_busy",
+    "task_terminal",
+    "not_recoverable",
+    "session_unavailable",
+    "runtime_capability_unavailable",
+    "fork_not_supported",
+    "fork_truncation_required",
+    "handoff_failed",
+    "rollover_failed",
+    "continuation_context_too_large",
+  ];
+  if (exactCodes.includes(message as AppErrorCode)) {
+    return message as AppErrorCode;
+  }
   if (message.includes("Unknown task")) {
     return "task_not_found";
   }

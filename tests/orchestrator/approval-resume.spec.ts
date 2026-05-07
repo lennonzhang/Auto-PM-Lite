@@ -18,7 +18,7 @@ class FakeAdapter implements RuntimeAdapter {
 
   async startTask(input: StartRuntimeTaskInput): Promise<RuntimeTaskHandle> {
     this.startCount += 1;
-    return { taskId: input.taskId, backendThreadId: `thread-${input.taskId}` };
+    return { taskId: input.taskId, sessionId: input.sessionId, backendThreadId: `thread-${input.taskId}` };
   }
 
   async *runTurn(input: RunTurnInput): AsyncIterable<RuntimeAdapterOutput> {
@@ -30,7 +30,7 @@ class FakeAdapter implements RuntimeAdapter {
 
   async resumeTask(input: ResumeRuntimeTaskInput): Promise<RuntimeTaskHandle> {
     this.resumeCount += 1;
-    return { taskId: input.taskId, backendThreadId: input.backendThreadId };
+    return { taskId: input.taskId, sessionId: input.sessionId, backendThreadId: input.backendThreadId };
   }
 
   async pauseTask(_taskId: string): Promise<void> {}
@@ -44,7 +44,7 @@ class FakeCodexAdapter implements RuntimeAdapter {
 
   async startTask(input: StartRuntimeTaskInput): Promise<RuntimeTaskHandle> {
     this.startCount += 1;
-    return { taskId: input.taskId, backendThreadId: `codex-thread-${input.taskId}` };
+    return { taskId: input.taskId, sessionId: input.sessionId, backendThreadId: `codex-thread-${input.taskId}` };
   }
 
   async *runTurn(input: RunTurnInput): AsyncIterable<RuntimeAdapterOutput> {
@@ -55,7 +55,7 @@ class FakeCodexAdapter implements RuntimeAdapter {
   }
 
   async resumeTask(input: ResumeRuntimeTaskInput): Promise<RuntimeTaskHandle> {
-    return { taskId: input.taskId, backendThreadId: input.backendThreadId };
+    return { taskId: input.taskId, sessionId: input.sessionId, backendThreadId: input.backendThreadId };
   }
 
   async pauseTask(_taskId: string): Promise<void> {}
@@ -367,7 +367,6 @@ describe("failure semantics", () => {
       db.updateTaskRuntimeState({
         taskId: task.id,
         status: "interrupted",
-        backendThreadId: `thread-${task.id}`,
         updatedAt: new Date().toISOString(),
       });
 
@@ -412,9 +411,9 @@ describe("event replay", () => {
       expect(seenTypes).toContain("task.queued");
       expect(seenTypes).toContain("task.started");
       expect(seenTypes).toContain("turn.completed");
-      expect(seenTypes).toContain("task.completed");
-      const completedCount = seenTypes.filter((t) => t === "task.completed").length;
-      expect(completedCount).toBe(1);
+      expect(seenTypes).toContain("task.idle");
+      const idleCount = seenTypes.filter((t) => t === "task.idle").length;
+      expect(idleCount).toBe(1);
       const rows = db.listTaskEvents({ taskId: task.id });
       expect(rows.length).toBe(seenTypes.length);
       expect(durableSeqs).toEqual(rows.map((row) => row.seq));

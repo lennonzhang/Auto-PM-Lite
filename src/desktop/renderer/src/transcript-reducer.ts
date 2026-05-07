@@ -58,10 +58,13 @@ export function reduceTaskView(input: TaskViewModel, env: EventEnvelope): TaskVi
       vm.status = "paused";
       return vm;
     case "task.cancelled":
-      vm.status = "cancelled";
+      vm.status = "interrupted";
       return vm;
-    case "task.completed":
-      vm.status = "completed";
+    case "task.idle":
+      vm.status = "idle";
+      return vm;
+    case "task.closed":
+      vm.status = "closed";
       return vm;
     case "task.failed":
       vm.status = "failed";

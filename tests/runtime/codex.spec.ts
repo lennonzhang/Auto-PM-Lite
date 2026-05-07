@@ -226,7 +226,7 @@ function buildAdapterWithThread(thread: FakeThread): CodexRuntimeAdapter {
       },
     },
   });
-  (adapter as unknown as { threads: Map<string, FakeThread> }).threads.set("task-1", thread);
+  (adapter as unknown as { threads: Map<string, FakeThread> }).threads.set("session-1", thread);
   return adapter;
 }
 
@@ -234,6 +234,7 @@ async function collectRunTurn(adapter: CodexRuntimeAdapter) {
   const outputs: RuntimeAdapterOutput[] = [];
   for await (const output of adapter.runTurn({
     taskId: "task-1",
+    sessionId: "session-1",
     turnId: "turn-1",
     profileId: "codex_plan",
     model: "gpt-5-4",

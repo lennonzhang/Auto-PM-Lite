@@ -10,7 +10,7 @@ export function filterTasks(tasks: TaskSummary[], filter: TaskFilter): TaskSumma
     case "approval":
       return tasks.filter((task) => task.status === "awaiting_approval");
     case "failed":
-      return tasks.filter((task) => task.status === "failed" || task.status === "cancelled");
+      return tasks.filter((task) => task.status === "failed" || task.status === "interrupted");
     case "all":
       return tasks;
   }

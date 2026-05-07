@@ -122,13 +122,17 @@ export interface BudgetSnapshot {
 export type TaskStatus =
   | "queued"
   | "running"
+  | "idle"
   | "paused"
   | "awaiting_approval"
   | "interrupted"
   | "reconcile_required"
-  | "completed"
+  | "cancelling"
   | "failed"
-  | "cancelled";
+  | "closed";
+
+export type RuntimeSessionStatus = "opening" | "active" | "closed" | "failed";
+export type RuntimeSessionCloseReason = "handoff" | "rollover" | "forked" | "cancelled" | "failed" | "task_closed";
 
 export interface Workspace {
   id: string;
@@ -196,13 +200,31 @@ export interface Task {
   parentTaskId?: string | undefined;
   delegationDepth: number;
   delegationChain: string[];
-  backendThreadId?: string | undefined;
   status: TaskStatus;
   budget: BudgetSnapshot;
   triggeredBy: "user" | `delegate:${string}`;
   createdAt: string;
   updatedAt: string;
-  completedAt?: string | undefined;
+  closedAt?: string | undefined;
+}
+
+export interface RuntimeSession {
+  id: string;
+  taskId: string;
+  runtime: RuntimeKind;
+  profileId: string;
+  model: string;
+  cwd: string;
+  backendThreadId?: string | undefined;
+  parentSessionId?: string | undefined;
+  forkedFromTurnId?: string | undefined;
+  handoffFromSessionId?: string | undefined;
+  rolloverFromSessionId?: string | undefined;
+  status: RuntimeSessionStatus;
+  closeReason?: RuntimeSessionCloseReason | undefined;
+  createdAt: string;
+  lastUsedAt?: string | undefined;
+  closedAt?: string | undefined;
 }
 
 export interface TurnUsage {
@@ -217,10 +239,13 @@ export interface TurnUsage {
 export interface TurnRecord {
   id: string;
   taskId: string;
+  sessionId: string;
+  turnNumber: number;
+  requestId?: string | undefined;
   promptRedacted: string;
   promptRawEncrypted?: string | undefined;
   promptRawTtlAt?: string | undefined;
-  status: "running" | "paused" | "completed" | "failed";
+  status: "running" | "paused" | "completed" | "failed" | "cancelled";
   usage?: TurnUsage | undefined;
   startedAt: string;
   completedAt?: string | undefined;

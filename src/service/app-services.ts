@@ -31,6 +31,9 @@ import {
   eventDebugRequestSchema,
   eventSubscriptionRequestSchema,
   pauseTaskRequestSchema,
+  forkTaskRequestSchema,
+  handoffTaskRequestSchema,
+  rolloverSessionRequestSchema,
   projectionCheckRequestSchema,
   rawEventRequestSchema,
   requestWorkspaceMergeSchema,
@@ -108,10 +111,15 @@ export class TaskService {
 
   async runTask(input: unknown): Promise<{ ok: true; taskId: string }> {
     const parsed = runTaskRequestSchema.parse(input);
+    return this.sendTurn(parsed);
+  }
+
+  async sendTurn(input: unknown): Promise<{ ok: true; taskId: string }> {
+    const parsed = runTaskRequestSchema.parse(input);
     if (!this.skipRuntimeHealthGuard) {
       this.runtimeService?.assertCanRunTask(parsed.taskId);
     }
-    await this.orchestrator.runTask(parsed);
+    await this.orchestrator.sendTurn(parsed);
     return { ok: true, taskId: parsed.taskId };
   }
 
@@ -133,6 +141,38 @@ export class TaskService {
   async cancelTask(taskId: string): Promise<{ ok: true; taskId: string; cancelled: true }> {
     await this.orchestrator.cancelTask(taskId);
     return { ok: true, taskId, cancelled: true };
+  }
+
+  async closeTask(input: unknown): Promise<{ ok: true; taskId: string; closed: true }> {
+    const parsed = typeof input === "string" ? { taskId: input } : input as { taskId?: unknown; summary?: unknown };
+    const taskId = typeof parsed.taskId === "string" ? parsed.taskId : undefined;
+    if (!taskId) {
+      throw new AppError("validation_failed", "taskId is required");
+    }
+    await this.orchestrator.closeTask(taskId, typeof parsed.summary === "string" ? parsed.summary : undefined);
+    return { ok: true, taskId, closed: true };
+  }
+
+  async handoffTask(input: unknown): Promise<{ ok: true; taskId: string; handoff: true }> {
+    const parsed = handoffTaskRequestSchema.parse(input);
+    if (!this.skipRuntimeHealthGuard) {
+      this.runtimeService?.assertProfileAvailable(parsed.targetProfileId);
+    }
+    await this.orchestrator.handoffTask(parsed);
+    return { ok: true, taskId: parsed.taskId, handoff: true };
+  }
+
+  async forkTask(input: unknown) {
+    return this.orchestrator.forkTask(forkTaskRequestSchema.parse(input));
+  }
+
+  async rolloverSession(input: unknown): Promise<{ ok: true; taskId: string; rollover: true }> {
+    const parsed = rolloverSessionRequestSchema.parse(input);
+    if (!this.skipRuntimeHealthGuard && parsed.targetProfileId) {
+      this.runtimeService?.assertProfileAvailable(parsed.targetProfileId);
+    }
+    await this.orchestrator.rolloverSession(parsed);
+    return { ok: true, taskId: parsed.taskId, rollover: true };
   }
 
   getTaskResult(input: { requesterTaskId: string; taskId: string }): TaskResultView;
@@ -419,6 +459,25 @@ export class RuntimeService {
     const workspace = this.orchestrator?.getWorkspace(task.workspaceId);
     if (!workspace || !fsSync.existsSync(workspace.path)) {
       throw new AppError("workspace_unavailable", `Workspace path is unavailable for task ${task.id}`);
+    }
+  }
+
+  assertProfileAvailable(profileId: string): void {
+    const profile = this.config.profiles[profileId];
+    if (!profile) {
+      throw new AppError("runtime_unavailable", `Task profile is missing: ${profileId}`);
+    }
+    const account = this.config.accounts[profile.accountId];
+    if (!account) {
+      throw new AppError("runtime_unavailable", `Task account is missing: ${profile.accountId}`);
+    }
+    const policy = this.config.policies[profile.policyId];
+    if (!policy) {
+      throw new AppError("policy_denied", `Task policy is missing: ${profile.policyId}`);
+    }
+    const health = this.getHealth().find((entry) => entry.runtime === profile.runtime);
+    if (!health?.available) {
+      throw new AppError("runtime_unavailable", health?.message ?? `Runtime unavailable: ${profile.runtime}`, health);
     }
   }
 

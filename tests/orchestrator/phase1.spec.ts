@@ -21,6 +21,7 @@ class FakeRuntimeAdapter implements RuntimeAdapter {
   async startTask(input: StartRuntimeTaskInput): Promise<RuntimeTaskHandle> {
     return {
       taskId: input.taskId,
+      sessionId: input.sessionId,
       backendThreadId: `thread-${input.taskId}`,
     };
   }
@@ -47,6 +48,7 @@ class FakeRuntimeAdapter implements RuntimeAdapter {
     this.resumeCalls += 1;
     return {
       taskId: input.taskId,
+      sessionId: input.sessionId,
       backendThreadId: input.backendThreadId,
     };
   }
@@ -243,19 +245,20 @@ claude_permission_mode = "dontAsk"
       });
 
       const storedTask = db.getTask(task.id);
-      expect(storedTask?.status).toBe("completed");
-      expect(storedTask?.backendThreadId).toBe(`thread-${task.id}`);
+      expect(storedTask?.status).toBe("idle");
+      expect(db.getCurrentSession(task.id)?.backendThreadId).toBe(`thread-${task.id}`);
 
       const events = db.listTaskEvents({ taskId: task.id });
       expect(events.map((row) => row.event.kind)).toEqual([
         "task.queued",
+        "session.opened",
         "task.started",
         "turn.started",
         "item.started",
         "item.completed",
         "item.completed",
         "turn.completed",
-        "task.completed",
+        "task.idle",
       ]);
 
       const turns = db.listTurns(task.id);
@@ -330,20 +333,20 @@ claude_permission_mode = "dontAsk"
         cwd: root,
         name: "approval-check",
       });
+      await orchestrator.runTask({ taskId: task.id, prompt: "seed" });
+      const session = db.getCurrentSession(task.id);
+      if (!session) {
+        throw new Error("missing session");
+      }
 
       db.updateTaskRuntimeState({
         taskId: task.id,
         status: "interrupted",
-        backendThreadId: `thread-${task.id}`,
         updatedAt: new Date().toISOString(),
       });
-      db.createTurn({
-        id: "turn-existing",
-        taskId: task.id,
-        promptRedacted: "resume me",
-        status: "completed",
-        startedAt: new Date().toISOString(),
-        completedAt: new Date().toISOString(),
+      db.updateRuntimeSession({
+        sessionId: session.id,
+        backendThreadId: `thread-${task.id}`,
       });
 
       orchestrator.createApproval({
@@ -352,7 +355,7 @@ claude_permission_mode = "dontAsk"
         payload: { path: "notes.txt" },
       });
 
-      await expect(orchestrator.resumeTask({ taskId: task.id })).rejects.toThrow("requires reconciliation before resume");
+      await expect(orchestrator.resumeTask({ taskId: task.id })).rejects.toThrow("not_recoverable");
       expect(db.getTask(task.id)?.status).toBe("reconcile_required");
     } finally {
       await orchestrator.close();
@@ -463,7 +466,7 @@ codex_network_access_enabled = false
       expect(childTask?.parentTaskId).toBe(parent.id);
       expect(childTask?.runtime).toBe("codex");
       expect(childTask?.cwd).toBe(parent.cwd);
-      expect(childTask?.status).toBe("completed");
+      expect(childTask?.status).toBe("idle");
       expect(delegated.finalResponse).toBe("echo:review this");
       expect((await orchestrator.waitForTask(parent.id, childTaskId)).taskId).toBe(childTaskId);
 
@@ -647,7 +650,7 @@ codex_network_access_enabled = false
       expect(result.status).toBe("started");
       expect(result.childTaskId).toBeDefined();
       const waited = await orchestrator.waitForTask(parent.id, result.childTaskId!, 1000);
-      expect(waited.status).toBe("completed");
+      expect(waited.status).toBe("idle");
       expect(waited.latestMessage).toBe("echo:slow review");
     } finally {
       await orchestrator.close();

@@ -30,7 +30,7 @@ export function normalizeCodexEventV2(input: {
   const ts = input.ts ?? new Date().toISOString();
   switch (input.event.type) {
     case "thread.started":
-      return [{ kind: "task.backend_thread", backendThreadId: input.event.thread_id }];
+      return [{ kind: "session.backend_thread", sessionId: input.sessionId, backendThreadId: input.event.thread_id }];
     case "turn.started":
       return [{ kind: "turn.started", turnId: input.turnId }];
     case "turn.completed":

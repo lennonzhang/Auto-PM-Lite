@@ -9,9 +9,14 @@ export const ipcChannels = {
   tasksCreate: "tasks:create",
   tasksCreateSmokeChild: "tasks:create-smoke-child",
   tasksRun: "tasks:run",
+  tasksSendTurn: "tasks:send-turn",
   tasksResume: "tasks:resume",
   tasksPause: "tasks:pause",
   tasksCancel: "tasks:cancel",
+  tasksClose: "tasks:close",
+  tasksHandoff: "tasks:handoff",
+  tasksFork: "tasks:fork",
+  tasksRollover: "tasks:rollover",
   approvalsList: "approvals:list",
   approvalsResolve: "approvals:resolve",
   workspaceChanges: "workspace:changes",
@@ -34,10 +39,15 @@ export interface DesktopApi {
   getTaskResult(input: { requesterTaskId: string; taskId: string }): Promise<TaskResultView>;
   createTask(input: { profileId: string; cwd: string; name?: string | undefined; model?: string | undefined }): Promise<TaskDetail>;
   createSmokeChildTask(input: { parentTaskId: string; targetProfileId: string; name?: string | undefined }): Promise<TaskDetail>;
-  runTask(input: { taskId: string; prompt: string }): Promise<TaskActionAccepted>;
-  resumeTask(input: { taskId: string; prompt?: string | undefined }): Promise<TaskActionAccepted & { resumed: true }>;
+  runTask(input: { taskId: string; prompt: string; requestId?: string | undefined }): Promise<TaskActionAccepted>;
+  sendTurn(input: { taskId: string; prompt: string; requestId?: string | undefined }): Promise<TaskActionAccepted>;
+  resumeTask(input: { taskId: string; prompt?: string | undefined; requestId?: string | undefined }): Promise<TaskActionAccepted & { resumed: true }>;
   pauseTask(taskId: string): Promise<TaskActionAccepted>;
   cancelTask(taskId: string): Promise<{ ok: true; taskId: string; cancelled: true }>;
+  closeTask(input: { taskId: string; summary?: string | undefined } | string): Promise<{ ok: true; taskId: string; closed: true }>;
+  handoffTask(input: { taskId: string; targetProfileId: string; prompt?: string | undefined; reason: string; requestId?: string | undefined }): Promise<{ ok: true; taskId: string; handoff: true }>;
+  forkTask(input: { taskId: string; fromTurnId?: string | undefined; name?: string | undefined; mode?: "task" | "session" | undefined; prompt?: string | undefined; requestId?: string | undefined }): Promise<unknown>;
+  rolloverSession(input: { taskId: string; reason: "context_limit" | "model_change" | "profile_change" | "session_corrupt" | "manual"; targetProfileId?: string | undefined; carryOverPrompt?: string | undefined; requestId?: string | undefined }): Promise<{ ok: true; taskId: string; rollover: true }>;
   listApprovals(taskId?: string | undefined): Promise<ApprovalView[]>;
   resolveApproval(input: { approvalId: string; approved: boolean; reason?: string | undefined }): Promise<unknown>;
   listWorkspaceChanges(taskId: string): Promise<WorkspaceChange[]>;

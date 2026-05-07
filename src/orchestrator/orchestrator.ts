@@ -1,7 +1,7 @@
 import { randomUUID } from "node:crypto";
 import fs from "node:fs";
 import type { ApprovalPayload, ApprovalView, CanonicalEvent, EventEnvelope, ItemPayload, TaskError } from "../core/events.js";
-import type { AppConfig, ApprovalKind, ArtifactRef, BudgetSnapshot, DelegateToResult, Policy, Task, TaskReference, TurnUsage, Workspace, WorkspaceDiff, WorkspaceMergeError, WorkspaceMergeResult } from "../core/types.js";
+import type { AppConfig, ApprovalKind, ArtifactRef, BudgetSnapshot, DelegateToResult, Policy, RuntimeSession, Task, TaskReference, TurnUsage, Workspace, WorkspaceDiff, WorkspaceMergeError, WorkspaceMergeResult } from "../core/types.js";
 import type { AutoPmMcpHandlers, McpToolResult } from "../mcp/auto-pm-service.js";
 import { redactText } from "../core/redaction.js";
 import { canAccessReference, policyTrustLevel } from "../core/reference.js";
@@ -18,6 +18,7 @@ import { DefaultTaskScheduler } from "./scheduler.js";
 import { NoOpRateLimiter, TokenBucketRateLimiter, type RateLimiter } from "./rate-limit.js";
 import { EventHub } from "./event-hub.js";
 import { expirePendingApprovals } from "./approval.js";
+import { buildContinuationContext, withContinuationPrompt } from "./continuation-context.js";
 
 export interface CreateTaskInput {
   profileId: string;
@@ -29,11 +30,49 @@ export interface CreateTaskInput {
 export interface RunTaskInput {
   taskId: string;
   prompt: string;
+  requestId?: string | undefined;
 }
+
+export interface SendTurnInput extends RunTaskInput {}
 
 export interface ResumeTaskInput {
   taskId: string;
   prompt?: string | undefined;
+  requestId?: string | undefined;
+}
+
+export interface HandoffTaskInput {
+  taskId: string;
+  targetProfileId: string;
+  prompt?: string | undefined;
+  reason: string;
+  requestId?: string | undefined;
+}
+
+export interface ForkTaskInput {
+  taskId: string;
+  fromTurnId?: string | undefined;
+  name?: string | undefined;
+  mode?: "task" | "session" | undefined;
+  prompt?: string | undefined;
+  requestId?: string | undefined;
+}
+
+export interface ForkTaskResult {
+  forkKind: "native" | "logical";
+  sourceTaskId: string;
+  sourceSessionId: string;
+  sourceTurnId: string;
+  childTaskId?: string | undefined;
+  childSessionId: string;
+}
+
+export interface RolloverSessionInput {
+  taskId: string;
+  reason: "context_limit" | "model_change" | "profile_change" | "session_corrupt" | "manual";
+  targetProfileId?: string | undefined;
+  carryOverPrompt?: string | undefined;
+  requestId?: string | undefined;
 }
 
 export interface DelegateTaskInput extends DelegateTaskRequest {
@@ -68,6 +107,7 @@ export class Orchestrator {
   private readonly workspaceManager: WorkspaceManager;
   private readonly eventHub: EventHub;
   private readonly activeRuns = new Map<string, Promise<void>>();
+  private readonly activeTaskActions = new Set<string>();
   private readonly pauseRequests = new Set<string>();
   private readonly scheduler: DefaultTaskScheduler;
   private readonly rateLimiter: RateLimiter;
@@ -102,27 +142,29 @@ export class Orchestrator {
 
   recoverStaleRunningTasks(): { recoveredTaskIds: string[] } {
     const now = new Date().toISOString();
-    const runningTasks = this.db.listTasksByStatus("running");
-    for (const task of runningTasks) {
+    const staleTasks = [
+      ...this.db.listTasksByStatus("running"),
+      ...this.db.listTasksByStatus("cancelling"),
+    ];
+    for (const task of staleTasks) {
       const terminalEvent = this.db.getLatestTerminalTaskEvent(task.id);
       if (terminalEvent) {
+        const status = terminalEventToTaskStatus(terminalEvent.type);
         this.db.updateTaskRuntimeState({
           taskId: task.id,
-          status: terminalEventToTaskStatus(terminalEvent.type),
-          backendThreadId: task.backendThreadId,
+          status,
           updatedAt: terminalEvent.ts,
-          ...(terminalEvent.type === "task.completed" || terminalEvent.type === "task.failed" || terminalEvent.type === "task.cancelled" ? { completedAt: terminalEvent.ts } : {}),
+          ...(status === "closed" ? { closedAt: terminalEvent.ts } : {}),
         });
         continue;
       }
       this.db.updateTaskRuntimeState({
         taskId: task.id,
         status: "reconcile_required",
-        backendThreadId: task.backendThreadId,
         updatedAt: now,
       });
     }
-    return { recoveredTaskIds: runningTasks.map((task) => task.id) };
+    return { recoveredTaskIds: staleTasks.map((task) => task.id) };
   }
 
   async createTask(input: CreateTaskInput): Promise<Task> {
@@ -442,7 +484,6 @@ export class Orchestrator {
     this.db.updateTaskRuntimeState({
       taskId: task.id,
       status: "queued",
-      backendThreadId: task.backendThreadId,
       updatedAt: resolvedAt,
     });
 
@@ -726,75 +767,353 @@ export class Orchestrator {
   }
 
   async runTask(input: RunTaskInput): Promise<void> {
+    await this.sendTurn(input);
+  }
+
+  async sendTurn(input: SendTurnInput): Promise<void> {
     const task = this.db.getTask(input.taskId);
     if (!task) {
       throw new Error(`Unknown task: ${input.taskId}`);
     }
-
-    const profile = this.config.profiles[task.profileId];
-    if (!profile) {
-      throw new Error(`Unknown profile: ${task.profileId}`);
+    const existing = input.requestId ? this.db.getTurnByRequestId(task.id, input.requestId) : null;
+    if (existing) {
+      return;
     }
+    this.assertCanSendTurn(task);
+    const session = this.db.getCurrentSession(task.id) ?? this.createInitialSession(task, new Date().toISOString());
+    await this.submitTurn({
+      task,
+      session,
+      prompt: input.prompt,
+      mode: session.backendThreadId ? "next_turn" : "first_turn",
+      requestId: input.requestId,
+      markInterruptedOnFailure: true,
+    });
+  }
 
-    const runtime = this.runtimes[task.runtime];
-    if (!runtime) {
-      throw new Error(`Runtime adapter not configured for ${task.runtime}`);
+  async handoffTask(input: HandoffTaskInput): Promise<void> {
+    const task = this.requireTask(input.taskId);
+    if (input.requestId && this.db.getTurnByRequestId(task.id, input.requestId)) {
+      return;
     }
-
-    // Check rate limits before starting
-    const rateLimitCheck = await this.rateLimiter.checkLimit(profile.accountId);
-    if (!rateLimitCheck.allowed) {
-      throw new Error(`Rate limit exceeded: ${rateLimitCheck.reason}`);
-    }
-
-    // Block here until a slot frees (per-account + global concurrency limits).
-    // For long waits, callers can observe queue depth via getSchedulerSnapshot().
-    await this.scheduler.acquire(task.id, profile.accountId);
-    this.rateLimiter.recordRequest(profile.accountId);
-
-    const startedAt = new Date().toISOString();
-    const handle = await runtime.startTask({
-      taskId: task.id,
-      profileId: task.profileId,
-      model: task.model,
+    this.assertCanRunSaga(task);
+    const sourceSession = this.requireCurrentSession(task.id);
+    const targetProfile = this.requireProfile(input.targetProfileId);
+    const latestTurn = this.db.getLatestTurn(task.id);
+    const now = new Date().toISOString();
+    const context = this.createContinuationContext({
+      kind: "handoff",
+      task,
+      sourceSession,
+      sourceTurnId: latestTurn?.id,
+      policyId: targetProfile.policyId,
+      prompt: input.prompt,
+      handoffReason: input.reason,
+    });
+    const targetSession = this.createRuntimeSession({
+      task,
+      profileId: targetProfile.id,
+      model: resolveTaskModel(targetProfile),
+      runtime: targetProfile.runtime,
       cwd: task.cwd,
+      status: "opening",
+      now,
+      handoffFromSessionId: sourceSession.id,
     });
 
-    this.db.updateTaskRuntimeState({
-      taskId: task.id,
-      status: "running",
-      backendThreadId: handle.backendThreadId,
-      updatedAt: startedAt,
-    });
-    this.publishTaskEvent(task, {
-      kind: "task.started",
-      profileId: task.profileId,
-      model: task.model,
-      cwd: task.cwd,
-    }, { ts: startedAt });
-
-    const turnId = await this.beginTurn(task.id, input.prompt, startedAt);
+    this.publishAndProjectTaskEvent(task, {
+      kind: "task.handoff_started",
+      sourceSessionId: sourceSession.id,
+      targetSessionId: targetSession.id,
+      contextTokens: context.tokenEstimate,
+    }, { ts: now, sessionId: targetSession.id });
 
     try {
-      await this.consumeTurn(task, runtime, {
-        taskId: task.id,
-        turnId,
-        profileId: task.profileId,
-        model: task.model,
-        cwd: task.cwd,
-        prompt: input.prompt,
-      }, turnId, handle.backendThreadId);
+      await this.submitTurn({
+        task,
+        session: targetSession,
+        prompt: withContinuationPrompt(context.xml, input.prompt),
+        mode: "handoff",
+        requestId: input.requestId,
+        markInterruptedOnFailure: false,
+        idleReason: "handoff_completed",
+        activateSession: false,
+        projectTaskFailure: false,
+      });
+      const completedAt = new Date().toISOString();
+      await this.closeRuntimeSessionHandle(sourceSession);
+      this.db.updateRuntimeSession({
+        sessionId: sourceSession.id,
+        status: "closed",
+        closeReason: "handoff",
+        closedAt: completedAt,
+      });
+      this.db.updateRuntimeSession({
+        sessionId: targetSession.id,
+        status: "active",
+        lastUsedAt: completedAt,
+      });
+      this.publishAndProjectTaskEvent(task, { kind: "session.closed", sessionId: sourceSession.id, reason: "handoff" }, { ts: completedAt, sessionId: sourceSession.id });
+      this.publishAndProjectTaskEvent(task, { kind: "task.handoff_completed", sourceSessionId: sourceSession.id, targetSessionId: targetSession.id }, { ts: completedAt, sessionId: targetSession.id });
+      this.db.updateTaskRuntimeState({ taskId: task.id, status: "idle", updatedAt: completedAt });
     } catch (error) {
-      if (this.pauseRequests.has(task.id)) {
-        await this.markTaskPaused(task);
-        return;
+      const failedAt = new Date().toISOString();
+      this.db.updateRuntimeSession({
+        sessionId: targetSession.id,
+        status: "failed",
+        closeReason: "failed",
+        closedAt: failedAt,
+      });
+      const current = this.db.getTask(task.id);
+      if (current?.status !== "failed" && current?.status !== "closed") {
+        this.db.updateTaskRuntimeState({
+          taskId: task.id,
+          status: "idle",
+          updatedAt: failedAt,
+        });
       }
-      await this.failTask(task.id, handle.backendThreadId, error, true);
+      this.publishAndProjectTaskEvent(task, { kind: "session.failed", sessionId: targetSession.id, error: toTaskError(errorMessage(error)) }, { ts: failedAt, sessionId: targetSession.id });
+      this.publishAndProjectTaskEvent(task, {
+        kind: "task.handoff_failed",
+        sourceSessionId: sourceSession.id,
+        error: toTaskError(errorMessage(error)),
+        rolledBack: true,
+      }, { ts: failedAt, sessionId: sourceSession.id });
+      throw error instanceof AppError && error.code === "continuation_context_too_large"
+        ? error
+        : new AppError("handoff_failed", `handoff_failed: ${errorMessage(error)}`);
+    }
+  }
+
+  async forkTask(input: ForkTaskInput): Promise<ForkTaskResult> {
+    const sourceTask = this.requireTask(input.taskId);
+    if (input.requestId) {
+      const existingTurn = this.db.getTurnByRequestId(sourceTask.id, input.requestId);
+      if (existingTurn) {
+        const existingSession = this.db.getRuntimeSession(existingTurn.sessionId);
+        return {
+          forkKind: sourceTask.runtime === "claude" ? "native" : "logical",
+          sourceTaskId: sourceTask.id,
+          sourceSessionId: existingSession?.parentSessionId ?? existingTurn.sessionId,
+          sourceTurnId: existingTurn.id,
+          childSessionId: existingTurn.sessionId,
+        };
+      }
+    }
+    this.assertCanRunSaga(sourceTask);
+    const sourceSession = this.requireCurrentSession(sourceTask.id);
+    const sourceTurn = input.fromTurnId
+      ? this.db.listTurns(sourceTask.id).find((turn) => turn.id === input.fromTurnId)
+      : this.db.listTurns(sourceTask.id).filter((turn) => turn.status === "completed").at(-1);
+    if (!sourceTurn) {
+      throw new AppError("not_recoverable", "not_recoverable");
+    }
+    if (sourceTurn.sessionId !== sourceSession.id) {
+      throw new AppError("fork_truncation_required", "fork_truncation_required");
+    }
+
+    const now = new Date().toISOString();
+    const mode = input.mode ?? "task";
+    const childTask = mode === "task"
+      ? this.createForkChildTask(sourceTask, input.name, now)
+      : sourceTask;
+    const targetSession = this.createRuntimeSession({
+      task: childTask,
+      profileId: sourceSession.profileId,
+      model: sourceSession.model,
+      runtime: sourceSession.runtime,
+      cwd: childTask.cwd,
+      status: mode === "task" ? "active" : "closed",
+      now,
+      parentSessionId: sourceSession.id,
+      forkedFromTurnId: sourceTurn.id,
+    });
+
+    let forkKind: "native" | "logical" = "logical";
+    try {
+      if (sourceSession.runtime === "claude" && sourceSession.backendThreadId) {
+        const runtime = this.runtimes[sourceSession.runtime];
+        if (!runtime?.forkSession) {
+          throw new AppError("runtime_capability_unavailable", "runtime_capability_unavailable");
+        }
+        if (input.fromTurnId) {
+          throw new AppError("fork_truncation_required", "fork_truncation_required");
+        }
+        const result = await runtime.forkSession({
+          taskId: childTask.id,
+          sourceSessionId: sourceSession.id,
+          targetSessionId: targetSession.id,
+          profileId: sourceSession.profileId,
+          model: sourceSession.model,
+          cwd: childTask.cwd,
+          sourceBackendThreadId: sourceSession.backendThreadId,
+        });
+      this.db.updateRuntimeSession({
+        sessionId: targetSession.id,
+        status: mode === "task" ? "active" : "closed",
+        backendThreadId: result.backendThreadId,
+        lastUsedAt: now,
+      });
+        forkKind = result.forkKind;
+      if (mode === "session") {
+        this.db.updateRuntimeSession({
+          sessionId: targetSession.id,
+          closeReason: "forked",
+          closedAt: now,
+        });
+      }
+      }
+
+      if (sourceSession.runtime === "codex") {
+        const context = this.createContinuationContext({
+          kind: "fork",
+          task: sourceTask,
+          sourceSession,
+          sourceTurnId: sourceTurn.id,
+          policyId: this.requireProfile(sourceSession.profileId).policyId,
+          prompt: input.prompt,
+        });
+        await this.submitTurn({
+          task: childTask,
+          session: targetSession,
+          prompt: withContinuationPrompt(context.xml, input.prompt),
+        mode: "fork",
+        requestId: input.requestId,
+        markInterruptedOnFailure: false,
+        activateSession: mode === "task",
+        projectTaskFailure: false,
+      });
+      if (mode === "session") {
+        const forkedAt = new Date().toISOString();
+        this.db.updateRuntimeSession({
+          sessionId: targetSession.id,
+          status: "closed",
+          closeReason: "forked",
+          closedAt: forkedAt,
+        });
+      }
+    }
+    } catch (error) {
+      const failedAt = new Date().toISOString();
+      this.db.updateRuntimeSession({
+        sessionId: targetSession.id,
+        status: "failed",
+        closeReason: "failed",
+        closedAt: failedAt,
+      });
+      if (mode === "task" && childTask.id !== sourceTask.id) {
+        this.db.updateTaskRuntimeState({
+          taskId: childTask.id,
+          status: "failed",
+          updatedAt: failedAt,
+        });
+      }
       throw error;
-    } finally {
-      this.scheduler.recordComplete(task.id);
-      await runtime.closeTask(task.id);
-      this.pauseRequests.delete(task.id);
+    }
+
+    this.publishAndProjectTaskEvent(sourceTask, {
+      kind: "task.forked",
+      sourceSessionId: sourceSession.id,
+      targetSessionId: targetSession.id,
+      forkKind,
+      ...(mode === "task" ? { childTaskId: childTask.id } : {}),
+    }, { ts: now, sessionId: sourceSession.id });
+
+    return {
+      forkKind,
+      sourceTaskId: sourceTask.id,
+      sourceSessionId: sourceSession.id,
+      sourceTurnId: sourceTurn.id,
+      ...(mode === "task" ? { childTaskId: childTask.id } : {}),
+      childSessionId: targetSession.id,
+    };
+  }
+
+  async rolloverSession(input: RolloverSessionInput): Promise<void> {
+    const task = this.requireTask(input.taskId);
+    if (input.requestId && this.db.getTurnByRequestId(task.id, input.requestId)) {
+      return;
+    }
+    this.assertCanRunSaga(task);
+    const sourceSession = this.requireCurrentSession(task.id);
+    const targetProfile = input.targetProfileId ? this.requireProfile(input.targetProfileId) : this.requireProfile(sourceSession.profileId);
+    const latestTurn = this.db.getLatestTurn(task.id);
+    const now = new Date().toISOString();
+    const context = this.createContinuationContext({
+      kind: "rollover",
+      task,
+      sourceSession,
+      sourceTurnId: latestTurn?.id,
+      policyId: targetProfile.policyId,
+      prompt: input.carryOverPrompt,
+      rolloverReason: input.reason,
+    });
+    const targetSession = this.createRuntimeSession({
+      task,
+      profileId: targetProfile.id,
+      model: resolveTaskModel(targetProfile),
+      runtime: targetProfile.runtime,
+      cwd: task.cwd,
+      status: "opening",
+      now,
+      rolloverFromSessionId: sourceSession.id,
+    });
+
+    this.publishAndProjectTaskEvent(task, {
+      kind: "task.rollover_started",
+      sourceSessionId: sourceSession.id,
+      targetSessionId: targetSession.id,
+      reason: input.reason,
+    }, { ts: now, sessionId: targetSession.id });
+
+    try {
+      await this.submitTurn({
+        task,
+        session: targetSession,
+        prompt: withContinuationPrompt(context.xml, input.carryOverPrompt),
+        mode: "rollover",
+        requestId: input.requestId,
+        markInterruptedOnFailure: false,
+        idleReason: "rollover_completed",
+        activateSession: false,
+        projectTaskFailure: false,
+      });
+      const completedAt = new Date().toISOString();
+      await this.closeRuntimeSessionHandle(sourceSession);
+      this.db.updateRuntimeSession({
+        sessionId: sourceSession.id,
+        status: "closed",
+        closeReason: "rollover",
+        closedAt: completedAt,
+      });
+      this.db.updateRuntimeSession({
+        sessionId: targetSession.id,
+        status: "active",
+        lastUsedAt: completedAt,
+      });
+      this.publishAndProjectTaskEvent(task, { kind: "session.closed", sessionId: sourceSession.id, reason: "rollover" }, { ts: completedAt, sessionId: sourceSession.id });
+      this.publishAndProjectTaskEvent(task, { kind: "task.rollover_completed", sourceSessionId: sourceSession.id, targetSessionId: targetSession.id }, { ts: completedAt, sessionId: targetSession.id });
+      this.db.updateTaskRuntimeState({ taskId: task.id, status: "idle", updatedAt: completedAt });
+    } catch (error) {
+      const failedAt = new Date().toISOString();
+      this.db.updateRuntimeSession({
+        sessionId: targetSession.id,
+        status: "failed",
+        closeReason: "failed",
+        closedAt: failedAt,
+      });
+      const current = this.db.getTask(task.id);
+      if (current?.status !== "failed" && current?.status !== "closed") {
+        this.db.updateTaskRuntimeState({
+          taskId: task.id,
+          status: "idle",
+          updatedAt: failedAt,
+        });
+      }
+      this.publishAndProjectTaskEvent(task, { kind: "session.failed", sessionId: targetSession.id, error: toTaskError(errorMessage(error)) }, { ts: failedAt, sessionId: targetSession.id });
+      throw error instanceof AppError && error.code === "continuation_context_too_large"
+        ? error
+        : new AppError("rollover_failed", `rollover_failed: ${errorMessage(error)}`);
     }
   }
 
@@ -803,76 +1122,32 @@ export class Orchestrator {
     if (!task) {
       throw new Error(`Unknown task: ${input.taskId}`);
     }
-    if (!task.backendThreadId) {
-      throw new Error(`Task ${task.id} has no backend thread to resume`);
+    const session = this.db.getCurrentSession(task.id);
+    if (!session?.backendThreadId) {
+      throw new AppError("session_unavailable", "session_unavailable");
     }
-
-    const runtime = this.runtimes[task.runtime];
-    if (!runtime) {
-      throw new Error(`Runtime adapter not configured for ${task.runtime}`);
-    }
-
     const latestTurn = this.db.getLatestTurn(task.id);
     if (!this.canResumeTask(task, latestTurn)) {
       const now = new Date().toISOString();
       this.db.updateTaskRuntimeState({
         taskId: task.id,
         status: "reconcile_required",
-        backendThreadId: task.backendThreadId,
         updatedAt: now,
       });
-      throw new Error(`Task ${task.id} requires reconciliation before resume`);
+      throw new AppError("not_recoverable", "not_recoverable");
     }
-
-    const resumedAt = new Date().toISOString();
-    const handle = await runtime.resumeTask({
-      taskId: task.id,
-      profileId: task.profileId,
-      model: task.model,
-      cwd: task.cwd,
-      backendThreadId: task.backendThreadId,
-    });
-
-    this.db.updateTaskRuntimeState({
-      taskId: task.id,
-      status: "running",
-      backendThreadId: handle.backendThreadId,
-      updatedAt: resumedAt,
-    });
-    this.publishTaskEvent(task, {
-      kind: "task.started",
-      profileId: task.profileId,
-      model: task.model,
-      cwd: task.cwd,
-    }, { ts: resumedAt });
-
     const turnPrompt = input.prompt ?? latestTurn?.promptRedacted;
     if (!turnPrompt) {
       throw new Error(`Task ${task.id} has no resumable prompt`);
     }
-
-    const turnId = await this.beginTurn(task.id, turnPrompt, resumedAt);
-
-    try {
-      await this.consumeTurn(task, runtime, {
-        taskId: task.id,
-        turnId,
-        profileId: task.profileId,
-        model: task.model,
-        cwd: task.cwd,
-        prompt: turnPrompt,
-      }, turnId, handle.backendThreadId);
-    } catch (error) {
-      if (this.pauseRequests.has(task.id)) {
-        await this.markTaskPaused(task);
-        return;
-      }
-      await this.failTask(task.id, handle.backendThreadId, error, false);
-      throw error;
-    } finally {
-      await runtime.closeTask(task.id);
-      this.pauseRequests.delete(task.id);
-    }
+    await this.submitTurn({
+      task,
+      session,
+      prompt: turnPrompt,
+      mode: "recovery",
+      requestId: input.requestId,
+      markInterruptedOnFailure: false,
+    });
   }
 
   async pauseTask(taskId: string): Promise<void> {
@@ -884,38 +1159,103 @@ export class Orchestrator {
       throw new AppError("validation_failed", `Task ${task.id} is not running and cannot be paused`);
     }
 
-    const runtime = this.runtimes[task.runtime];
+    const session = this.db.getCurrentSession(task.id);
+    if (!session) {
+      throw new AppError("validation_failed", `Task ${task.id} has no active session to pause`);
+    }
+    const runtime = this.runtimes[session.runtime];
     if (!runtime) {
-      throw new Error(`Runtime adapter not configured for ${task.runtime}`);
+      throw new Error(`Runtime adapter not configured for ${session.runtime}`);
     }
 
     this.pauseRequests.add(task.id);
-    await runtime.pauseTask(task.id);
+    await runtime.pauseTask(session.id);
     await this.markTaskPaused(task);
   }
 
-  async cancelTask(taskId: string): Promise<void> {
+  async cancelTask(taskId: string, reason?: string): Promise<void> {
     const task = this.db.getTask(taskId);
     if (!task) {
       throw new Error(`Unknown task: ${taskId}`);
     }
-
-    const runtime = this.runtimes[task.runtime];
-    if (!runtime) {
-      throw new Error(`Runtime adapter not configured for ${task.runtime}`);
+    if (task.status === "failed" || task.status === "closed") {
+      throw new AppError("validation_failed", "task_terminal");
+    }
+    if (task.status === "cancelling") {
+      throw new AppError("task_busy", "task_busy");
     }
 
     this.pauseRequests.delete(task.id);
-    await runtime.cancelTask(task.id);
     const now = new Date().toISOString();
     this.db.updateTaskRuntimeState({
       taskId: task.id,
-      status: "cancelled",
-      backendThreadId: task.backendThreadId,
+      status: "cancelling",
       updatedAt: now,
-      completedAt: now,
     });
-    this.publishTaskEvent(task, { kind: "task.cancelled" }, { ts: now });
+    this.publishAndProjectTaskEvent(task, { kind: "task.cancellation_requested", taskId: task.id, ...(reason ? { reason } : {}) }, { ts: now });
+
+    const activeSessions = this.db.listRuntimeSessionsByStatus(task.id, "active");
+    await Promise.allSettled(activeSessions.map(async (session) => {
+      const runtime = this.runtimes[session.runtime];
+      if (runtime) {
+        await runtime.cancelTask(session.id);
+        await runtime.closeTask(session.id);
+      }
+      this.db.updateRuntimeSession({
+        sessionId: session.id,
+        status: "closed",
+        closeReason: "cancelled",
+        closedAt: now,
+      });
+      this.publishAndProjectTaskEvent(task, { kind: "session.closed", sessionId: session.id, reason: "cancelled" }, { ts: now });
+    }));
+    const latestTurn = this.db.getLatestTurn(task.id);
+    if (latestTurn?.status === "running" || latestTurn?.status === "paused") {
+      this.db.updateTurn({
+        turnId: latestTurn.id,
+        status: "cancelled",
+        completedAt: now,
+      });
+    }
+    this.db.updateTaskRuntimeState({
+      taskId: task.id,
+      status: "interrupted",
+      updatedAt: now,
+    });
+    const current = this.db.getTask(task.id) ?? task;
+    this.publishAndProjectTaskEvent(current, { kind: "task.cancelled", taskId: task.id, ...(reason ? { reason } : {}) }, { ts: now });
+  }
+
+  async closeTask(taskId: string, summary?: string): Promise<void> {
+    const task = this.requireTask(taskId);
+    if (task.status === "running" || task.status === "cancelling") {
+      throw new AppError("validation_failed", "task_busy");
+    }
+    if (task.status === "closed") {
+      return;
+    }
+    const now = new Date().toISOString();
+    for (const session of this.db.listRuntimeSessionsByStatus(task.id, "active")) {
+      const runtime = this.runtimes[session.runtime];
+      if (runtime) {
+        await runtime.closeTask(session.id);
+      }
+      this.db.updateRuntimeSession({
+        sessionId: session.id,
+        status: "closed",
+        closeReason: "task_closed",
+        closedAt: now,
+      });
+      this.publishAndProjectTaskEvent(task, { kind: "session.closed", sessionId: session.id, reason: "task_closed" }, { ts: now });
+    }
+    this.db.updateTaskRuntimeState({
+      taskId: task.id,
+      status: "closed",
+      updatedAt: now,
+      closedAt: now,
+    });
+    const current = this.db.getTask(task.id) ?? task;
+    this.publishAndProjectTaskEvent(current, { kind: "task.closed", taskId: task.id, ...(summary ? { summary } : {}) }, { ts: now });
   }
 
   async close(): Promise<void> {
@@ -1128,7 +1468,108 @@ export class Orchestrator {
     };
   }
 
-  private async beginTurn(taskId: string, prompt: string, startedAt: string): Promise<string> {
+  private async submitTurn(input: {
+    task: Task;
+    session: RuntimeSession;
+    prompt: string;
+    mode: "first_turn" | "next_turn" | "recovery" | "handoff" | "fork" | "rollover";
+    requestId?: string | undefined;
+    markInterruptedOnFailure: boolean;
+    idleReason?: Extract<CanonicalEvent, { kind: "task.idle" }>["reason"] | undefined;
+    activateSession?: boolean | undefined;
+    projectTaskFailure?: boolean | undefined;
+  }): Promise<void> {
+    if (input.requestId && this.db.getTurnByRequestId(input.task.id, input.requestId)) {
+      return;
+    }
+    if (this.activeTaskActions.has(input.task.id)) {
+      throw new AppError("task_busy", "task_busy");
+    }
+    this.activeTaskActions.add(input.task.id);
+    const profile = this.requireProfile(input.session.profileId);
+    const runtime = this.runtimes[input.session.runtime];
+    if (!runtime) {
+      throw new Error(`Runtime adapter not configured for ${input.session.runtime}`);
+    }
+
+    const rateLimitCheck = await this.rateLimiter.checkLimit(profile.accountId);
+    if (!rateLimitCheck.allowed) {
+      throw new Error(`Rate limit exceeded: ${rateLimitCheck.reason}`);
+    }
+
+    await this.scheduler.acquire(input.task.id, profile.accountId);
+    this.rateLimiter.recordRequest(profile.accountId);
+
+    const startedAt = new Date().toISOString();
+    let handle;
+    try {
+      handle = input.session.backendThreadId
+        ? await runtime.resumeTask({
+            taskId: input.task.id,
+            sessionId: input.session.id,
+            profileId: input.session.profileId,
+            model: input.session.model,
+            cwd: input.session.cwd,
+            backendThreadId: input.session.backendThreadId,
+          })
+        : await runtime.startTask({
+            taskId: input.task.id,
+            sessionId: input.session.id,
+            profileId: input.session.profileId,
+            model: input.session.model,
+            cwd: input.session.cwd,
+          });
+
+      if (handle.backendThreadId) {
+        this.db.updateRuntimeSession({
+          sessionId: input.session.id,
+          status: input.activateSession === false ? input.session.status : "active",
+          backendThreadId: handle.backendThreadId,
+        });
+        input.session.backendThreadId = handle.backendThreadId;
+      }
+
+      this.db.updateTaskRuntimeState({
+        taskId: input.task.id,
+        status: "running",
+        updatedAt: startedAt,
+      });
+      const runningTask = this.db.getTask(input.task.id) ?? input.task;
+      this.publishTaskEvent(runningTask, {
+        kind: "task.started",
+        profileId: input.session.profileId,
+        model: input.session.model,
+        cwd: input.session.cwd,
+      }, { ts: startedAt, sessionId: input.session.id });
+
+      const turnId = await this.beginTurn(input.task.id, input.session.id, input.prompt, startedAt, input.requestId);
+      await this.consumeTurn(input.task, input.session, runtime, {
+        taskId: input.task.id,
+        sessionId: input.session.id,
+        turnId,
+        profileId: input.session.profileId,
+        model: input.session.model,
+        cwd: input.session.cwd,
+        prompt: input.prompt,
+      }, turnId, input.idleReason, input.activateSession !== false);
+    } catch (error) {
+      if (this.pauseRequests.has(input.task.id)) {
+        await this.markTaskPaused(input.task);
+        return;
+      }
+      if (input.projectTaskFailure !== false) {
+        await this.failTask(input.task.id, error, input.markInterruptedOnFailure);
+      }
+      throw error;
+    } finally {
+      this.scheduler.recordComplete(input.task.id);
+      await runtime.closeTask(input.session.id);
+      this.pauseRequests.delete(input.task.id);
+      this.activeTaskActions.delete(input.task.id);
+    }
+  }
+
+  private async beginTurn(taskId: string, sessionId: string, prompt: string, startedAt: string, requestId?: string | undefined): Promise<string> {
     const turnId = randomUUID();
     const promptRedacted = redactText(prompt, { additionalPatterns: this.config.redaction.additionalPatterns });
     const rawCipher = buildRawTranscriptCipher({
@@ -1139,6 +1580,9 @@ export class Orchestrator {
     this.db.createTurn({
       id: turnId,
       taskId,
+      sessionId,
+      turnNumber: this.db.nextTurnNumber(taskId),
+      ...(requestId ? { requestId } : {}),
       promptRedacted,
       status: "running",
       startedAt,
@@ -1149,12 +1593,14 @@ export class Orchestrator {
 
   private async consumeTurn(
     task: Task,
+    session: RuntimeSession,
     runtime: RuntimeAdapter,
-    input: { taskId: string; turnId: string; profileId: string; model: string; cwd: string; prompt: string },
+    input: { taskId: string; sessionId: string; turnId: string; profileId: string; model: string; cwd: string; prompt: string },
     turnId: string,
-    backendThreadId?: string | undefined,
+    idleReason: Extract<CanonicalEvent, { kind: "task.idle" }>["reason"] = "turn_completed",
+    activateSession = true,
   ): Promise<void> {
-    const profile = this.requireProfile(task.profileId);
+    const profile = this.requireProfile(session.profileId);
     const policy = this.requirePolicy(profile.policyId);
 
     for await (const output of runtime.runTurn(input)) {
@@ -1239,24 +1685,24 @@ export class Orchestrator {
     if (currentTask?.status === "paused") {
       return;
     }
-    if (currentTask && !["awaiting_approval", "failed", "interrupted", "cancelled"].includes(currentTask.status)) {
+    if (currentTask && !["awaiting_approval", "failed", "interrupted", "closed", "cancelling"].includes(currentTask.status)) {
+      const latestSession = this.db.getRuntimeSession(session.id) ?? session;
+      this.db.updateRuntimeSession({
+        sessionId: session.id,
+        status: activateSession ? "active" : latestSession.status,
+        lastUsedAt: completedAt,
+      });
       this.db.updateTaskRuntimeState({
         taskId: task.id,
-        status: "completed",
-        backendThreadId,
+        status: "idle",
         updatedAt: completedAt,
-        completedAt,
       });
-      this.publishTaskEvent(currentTask, {
-        kind: "task.completed",
-        summary: "Run completed",
-      }, { ts: completedAt });
+      this.publishAndProjectTaskEvent(currentTask, { kind: "task.idle", reason: idleReason }, { ts: completedAt, sessionId: session.id });
     }
   }
 
   private async failTask(
     taskId: string,
-    backendThreadId: string | undefined,
     error: unknown,
     markInterrupted: boolean,
   ): Promise<void> {
@@ -1288,6 +1734,191 @@ export class Orchestrator {
     }
 
     this.publishAndProjectTaskEvent(current, { kind: "task.paused" }, { ts: pausedAt });
+  }
+
+  private assertCanSendTurn(task: Task): void {
+    if (task.status === "running" || task.status === "cancelling") {
+      throw new AppError("task_busy", "task_busy");
+    }
+    if (task.status === "awaiting_approval") {
+      throw new AppError("approval_required", "approval_required");
+    }
+    if (task.status === "closed" || task.status === "failed") {
+      throw new AppError("task_terminal", "task_terminal");
+    }
+    if (task.status === "paused" || task.status === "interrupted" || task.status === "reconcile_required") {
+      throw new AppError("not_recoverable", "not_recoverable");
+    }
+    if (!fs.existsSync(task.cwd)) {
+      throw new AppError("workspace_unavailable", `workspace_unavailable:${task.cwd}`);
+    }
+  }
+
+  private assertCanRunSaga(task: Task): void {
+    if (task.status === "running" || task.status === "cancelling") {
+      throw new AppError("task_busy", "task_busy");
+    }
+    if (task.status === "awaiting_approval") {
+      throw new AppError("approval_required", "approval_required");
+    }
+    if (task.status === "closed" || task.status === "failed") {
+      throw new AppError("task_terminal", "task_terminal");
+    }
+    if (!fs.existsSync(task.cwd)) {
+      throw new AppError("workspace_unavailable", `workspace_unavailable:${task.cwd}`);
+    }
+    if (this.db.listPendingApprovals(task.id).length > 0) {
+      throw new AppError("approval_required", "approval_required");
+    }
+  }
+
+  private createInitialSession(task: Task, now: string): RuntimeSession {
+    return this.createRuntimeSession({
+      task,
+      profileId: task.profileId,
+      model: task.model,
+      runtime: task.runtime,
+      cwd: task.cwd,
+      status: "active",
+      now,
+    });
+  }
+
+  private createRuntimeSession(input: {
+    task: Task;
+    profileId: string;
+    model: string;
+    runtime: Task["runtime"];
+    cwd: string;
+    status: RuntimeSession["status"];
+    now: string;
+    parentSessionId?: string | undefined;
+    forkedFromTurnId?: string | undefined;
+    handoffFromSessionId?: string | undefined;
+    rolloverFromSessionId?: string | undefined;
+  }): RuntimeSession {
+    const session: RuntimeSession = {
+      id: randomUUID(),
+      taskId: input.task.id,
+      runtime: input.runtime,
+      profileId: input.profileId,
+      model: input.model,
+      cwd: input.cwd,
+      ...(input.parentSessionId ? { parentSessionId: input.parentSessionId } : {}),
+      ...(input.forkedFromTurnId ? { forkedFromTurnId: input.forkedFromTurnId } : {}),
+      ...(input.handoffFromSessionId ? { handoffFromSessionId: input.handoffFromSessionId } : {}),
+      ...(input.rolloverFromSessionId ? { rolloverFromSessionId: input.rolloverFromSessionId } : {}),
+      status: input.status,
+      createdAt: input.now,
+    };
+    this.db.createRuntimeSession(session);
+    this.publishAndProjectTaskEvent(input.task, {
+      kind: "session.opened",
+      sessionId: session.id,
+      runtime: session.runtime,
+      profileId: session.profileId,
+      model: session.model,
+    }, { ts: input.now, sessionId: session.id });
+    return session;
+  }
+
+  private requireCurrentSession(taskId: string): RuntimeSession {
+    const session = this.db.getCurrentSession(taskId);
+    if (!session) {
+      throw new AppError("session_unavailable", "session_unavailable");
+    }
+    return session;
+  }
+
+  private createContinuationContext(input: {
+    kind: "handoff" | "fork" | "rollover";
+    task: Task;
+    sourceSession: RuntimeSession;
+    sourceTurnId?: string | undefined;
+    policyId: string;
+    prompt?: string | undefined;
+    handoffReason?: string | undefined;
+    rolloverReason?: string | undefined;
+  }) {
+    const workspace = this.requireWorkspace(input.task.workspaceId);
+    const changes = workspace.baseRef ? this.workspaceManager.listChanges(workspace) : [];
+    return buildContinuationContext({
+      kind: input.kind,
+      task: {
+        id: input.task.id,
+        name: input.task.name,
+        objective: input.task.name ?? this.db.getLatestTurn(input.task.id)?.promptRedacted ?? input.prompt ?? input.task.id,
+      },
+      source: {
+        runtime: input.sourceSession.runtime,
+        profileId: input.sourceSession.profileId,
+        sessionId: input.sourceSession.id,
+        turnId: input.sourceTurnId,
+      },
+      policyId: input.policyId,
+      budgetRemaining: input.task.budget,
+      pendingApprovalIds: this.db.listPendingApprovals(input.task.id).map((approval) => approval.id),
+      cwd: input.task.cwd,
+      latestMessage: this.db.getLatestCompletedMessage(input.task.id),
+      terminalError: this.db.getLatestTerminalError(input.task.id),
+      workspaceChanges: changes,
+      handoffReason: input.handoffReason,
+      rolloverReason: input.rolloverReason,
+      userPrompt: input.prompt,
+    });
+  }
+
+  private async closeRuntimeSessionHandle(session: RuntimeSession): Promise<void> {
+    const runtime = this.runtimes[session.runtime];
+    if (runtime) {
+      await runtime.closeTask(session.id);
+    }
+  }
+
+  private createForkChildTask(sourceTask: Task, name: string | undefined, now: string): Task {
+    const childTaskId = randomUUID();
+    const profile = this.requireProfile(sourceTask.profileId);
+    const policy = this.requirePolicy(profile.policyId);
+    const parentWorkspace = this.requireWorkspace(sourceTask.workspaceId);
+    const inspectedParentWorkspace = {
+      ...parentWorkspace,
+      ...this.workspaceManager.inspectWorkspace(parentWorkspace),
+    };
+    const childWorkspacePlan = this.workspaceManager.resolveWorkspacePlan({
+      taskKind: "child",
+      cwd: sourceTask.cwd,
+      parentWorkspace: inspectedParentWorkspace,
+      requestedWorkspaceMode: "share",
+    });
+    const workspace = this.workspaceManager.createChildWorkspace({
+      taskId: childTaskId,
+      cwd: sourceTask.cwd,
+      parentWorkspace: inspectedParentWorkspace,
+      plan: childWorkspacePlan,
+      createdAt: now,
+    });
+    const childTask: Task = {
+      id: childTaskId,
+      name: name ?? `${sourceTask.name ?? sourceTask.id}:fork`,
+      profileId: sourceTask.profileId,
+      runtime: sourceTask.runtime,
+      model: sourceTask.model,
+      cwd: workspace.path,
+      workspaceId: workspace.id,
+      parentTaskId: sourceTask.id,
+      delegationDepth: nextDelegationDepth(sourceTask.delegationDepth),
+      delegationChain: buildDelegationChain(sourceTask.delegationChain, sourceTask.id),
+      status: "idle",
+      budget: toBudgetSnapshot(policy),
+      triggeredBy: `delegate:${sourceTask.id}`,
+      createdAt: now,
+      updatedAt: now,
+    };
+    this.db.createTaskRecord({ task: childTask, workspace });
+    this.publishTaskEvent(childTask, { kind: "task.queued" }, { ts: now });
+    this.db.updateTaskRuntimeState({ taskId: childTask.id, status: "idle", updatedAt: now });
+    this.publishAndProjectTaskEvent(childTask, { kind: "task.idle", reason: "recovered" }, { ts: now });
+    return childTask;
   }
 
   private async continueTaskAfterApproval(taskId: string, prompt?: string | undefined): Promise<void> {
@@ -1345,10 +1976,11 @@ export class Orchestrator {
   }
 
   private canResumeTask(task: Task, latestTurn: ReturnType<AppDatabase["getLatestTurn"]>): boolean {
-    if (!task.backendThreadId) {
+    const session = this.db.getCurrentSession(task.id);
+    if (!session?.backendThreadId) {
       return false;
     }
-    const resumableStatuses: Task["status"][] = ["paused", "interrupted", "reconcile_required", "queued", "awaiting_approval"];
+    const resumableStatuses: Task["status"][] = ["paused", "interrupted", "reconcile_required", "awaiting_approval"];
     if (!resumableStatuses.includes(task.status)) {
       return false;
     }
@@ -1359,10 +1991,10 @@ export class Orchestrator {
       return false;
     }
     if (task.status === "reconcile_required") {
-      return latestTurn?.status === "failed" || latestTurn?.status === "completed";
+      return latestTurn?.status === "failed" || latestTurn?.status === "completed" || latestTurn?.status === "cancelled";
     }
     if (task.status === "paused") {
-      return latestTurn?.status === "paused" || latestTurn?.status === "failed" || latestTurn?.status === "completed";
+      return latestTurn?.status === "paused" || latestTurn?.status === "failed" || latestTurn?.status === "cancelled";
     }
     if (latestTurn?.status === "running") {
       return false;
@@ -1424,48 +2056,87 @@ export class Orchestrator {
       return;
     }
 
-    if (event.kind === "task.backend_thread") {
-      const current = this.db.getTask(task.id);
-      this.db.updateTaskRuntimeState({
-        taskId: task.id,
-        status: current?.status ?? "running",
+    if (event.kind === "session.backend_thread") {
+      this.db.updateRuntimeSession({
+        sessionId: event.sessionId,
         backendThreadId: event.backendThreadId,
-        updatedAt: envelope.ts,
+        status: this.db.getRuntimeSession(event.sessionId)?.status === "opening" ? "opening" : "active",
+        lastUsedAt: envelope.ts,
       });
       return;
     }
 
     if (event.kind === "task.interrupted") {
-      const current = this.db.getTask(task.id);
       this.db.updateTaskRuntimeState({
         taskId: task.id,
         status: "interrupted",
-        backendThreadId: current?.backendThreadId ?? task.backendThreadId,
         updatedAt: envelope.ts,
-        completedAt: envelope.ts,
       });
       return;
     }
 
     if (event.kind === "task.paused") {
-      const current = this.db.getTask(task.id);
       this.db.updateTaskRuntimeState({
         taskId: task.id,
         status: "paused",
-        backendThreadId: current?.backendThreadId ?? task.backendThreadId,
         updatedAt: envelope.ts,
       });
       return;
     }
 
     if (event.kind === "task.failed") {
-      const current = this.db.getTask(task.id);
       this.db.updateTaskRuntimeState({
         taskId: task.id,
         status: "failed",
-        backendThreadId: current?.backendThreadId ?? task.backendThreadId,
         updatedAt: envelope.ts,
-        completedAt: envelope.ts,
+      });
+      return;
+    }
+
+    if (event.kind === "task.cancelled") {
+      this.db.updateTaskRuntimeState({
+        taskId: task.id,
+        status: "interrupted",
+        updatedAt: envelope.ts,
+      });
+      return;
+    }
+
+    if (event.kind === "task.idle") {
+      this.db.updateTaskRuntimeState({
+        taskId: task.id,
+        status: "idle",
+        updatedAt: envelope.ts,
+      });
+      return;
+    }
+
+    if (event.kind === "task.closed") {
+      this.db.updateTaskRuntimeState({
+        taskId: task.id,
+        status: "closed",
+        updatedAt: envelope.ts,
+        closedAt: envelope.ts,
+      });
+      return;
+    }
+
+    if (event.kind === "session.closed") {
+      this.db.updateRuntimeSession({
+        sessionId: event.sessionId,
+        status: "closed",
+        closeReason: event.reason,
+        closedAt: envelope.ts,
+      });
+      return;
+    }
+
+    if (event.kind === "session.failed") {
+      this.db.updateRuntimeSession({
+        sessionId: event.sessionId,
+        status: "failed",
+        closeReason: "failed",
+        closedAt: envelope.ts,
       });
       return;
     }
@@ -1474,7 +2145,6 @@ export class Orchestrator {
       this.db.updateTaskRuntimeState({
         taskId: task.id,
         status: "awaiting_approval",
-        backendThreadId: task.backendThreadId,
         updatedAt: envelope.ts,
       });
     }
@@ -1489,7 +2159,7 @@ export class Orchestrator {
   }
 
   private sessionIdForTask(task: Task): string {
-    return task.backendThreadId ?? task.id;
+    return this.db.getCurrentSession(task.id)?.id ?? task.id;
   }
 
 }
@@ -1516,17 +2186,23 @@ function resolveTaskModel(profile: { id: string; model: string; allowedModels?: 
   return model;
 }
 
-function terminalEventToTaskStatus(type: "task.completed" | "task.failed" | "task.interrupted" | "task.cancelled"): Task["status"] {
+function terminalEventToTaskStatus(type: "task.idle" | "task.failed" | "task.interrupted" | "task.cancelled" | "task.closed"): Task["status"] {
   switch (type) {
-    case "task.completed":
-      return "completed";
+    case "task.idle":
+      return "idle";
     case "task.failed":
       return "failed";
     case "task.interrupted":
       return "interrupted";
     case "task.cancelled":
-      return "cancelled";
+      return "interrupted";
+    case "task.closed":
+      return "closed";
   }
+}
+
+function errorMessage(error: unknown): string {
+  return error instanceof Error ? error.message : String(error);
 }
 
 function toTaskError(message: string, details?: unknown): TaskError {

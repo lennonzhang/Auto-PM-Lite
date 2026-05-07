@@ -32,9 +32,14 @@ export function registerIpcHandlers(ipcMain: Pick<IpcMain, "handle">, runtime: I
     return (await runtime.getServices()).tasks.createChildTaskForSmoke(input);
   }));
   ipcMain.handle(ipcChannels.tasksRun, handleApi(async (_event, input) => jobs.acceptRun(await runtime.getServices(), input)));
+  ipcMain.handle(ipcChannels.tasksSendTurn, handleApi(async (_event, input) => jobs.acceptSendTurn(await runtime.getServices(), input)));
   ipcMain.handle(ipcChannels.tasksResume, handleApi(async (_event, input) => jobs.acceptResume(await runtime.getServices(), input)));
   ipcMain.handle(ipcChannels.tasksPause, handleApi(async (_event, taskId: string) => jobs.acceptPause(await runtime.getServices(), taskId)));
   ipcMain.handle(ipcChannels.tasksCancel, handleApi(async (_event, taskId: string) => (await runtime.getServices()).tasks.cancelTask(taskId)));
+  ipcMain.handle(ipcChannels.tasksClose, handleApi(async (_event, input) => jobs.acceptClose(await runtime.getServices(), input)));
+  ipcMain.handle(ipcChannels.tasksHandoff, handleApi(async (_event, input) => jobs.acceptHandoff(await runtime.getServices(), input)));
+  ipcMain.handle(ipcChannels.tasksFork, handleApi(async (_event, input) => jobs.acceptFork(await runtime.getServices(), input)));
+  ipcMain.handle(ipcChannels.tasksRollover, handleApi(async (_event, input) => jobs.acceptRollover(await runtime.getServices(), input)));
   ipcMain.handle(ipcChannels.approvalsList, handleApi(async (_event, taskId?: string) => (await runtime.getServices()).approvals.listApprovals(taskId)));
   ipcMain.handle(ipcChannels.approvalsResolve, handleApi(async (_event, input) => (await runtime.getServices()).approvals.resolveApproval(input)));
   ipcMain.handle(ipcChannels.workspaceChanges, handleApi(async (_event, taskId: string) => (await runtime.getServices()).workspaces.listChanges(taskId)));

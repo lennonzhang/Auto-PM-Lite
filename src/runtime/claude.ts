@@ -1,9 +1,9 @@
-import { query, type CanUseTool, type Options, type Query } from "@anthropic-ai/claude-agent-sdk";
+import { forkSession, query, type CanUseTool, type Options, type Query } from "@anthropic-ai/claude-agent-sdk";
 import { createClaudeMcpServer } from "../mcp/claude-binding.js";
 import { AutoPmMcpService } from "../mcp/auto-pm-service.js";
 import { allowedClaudeTools, classifyClaudeTool, isClaudeEditTool } from "../orchestrator/policy.js";
 import { BaseRuntimeAdapter, type RuntimeDependencies } from "./base.js";
-import type { ResumeRuntimeTaskInput, RunTurnInput, RuntimeAdapter, RuntimeAdapterOutput, RuntimeTaskHandle, StartRuntimeTaskInput } from "./adapter.js";
+import type { ForkRuntimeSessionInput, ForkRuntimeSessionResult, ResumeRuntimeTaskInput, RunTurnInput, RuntimeAdapter, RuntimeAdapterOutput, RuntimeTaskHandle, StartRuntimeTaskInput } from "./adapter.js";
 import { createClaudeV2NormalizerState, normalizeClaudeMessageV2 } from "./normalize/claude-v2.js";
 
 export interface ClaudeRuntimeDependencies extends RuntimeDependencies {
@@ -33,7 +33,7 @@ export class ClaudeRuntimeAdapter extends BaseRuntimeAdapter implements RuntimeA
     this.writeRuntimeLog(`runtime.task.start runtime=claude taskId=${input.taskId} profileId=${input.profileId}`);
     return {
       taskId: input.taskId,
-      backendThreadId: input.taskId,
+      sessionId: input.sessionId,
     };
   }
 
@@ -56,7 +56,7 @@ export class ClaudeRuntimeAdapter extends BaseRuntimeAdapter implements RuntimeA
       permissionMode: profile.claudePermissionMode,
       ...(profile.claudePermissionMode === "bypassPermissions" ? { allowDangerouslySkipPermissions: true } : {}),
     };
-    const resume = this.resumeIds.get(input.taskId);
+    const resume = this.resumeIds.get(input.sessionId);
     if (resume) {
       options.resume = resume;
     }
@@ -78,12 +78,13 @@ export class ClaudeRuntimeAdapter extends BaseRuntimeAdapter implements RuntimeA
       prompt: input.prompt,
       options,
     });
-    this.sessions.set(input.taskId, session);
+    this.sessions.set(input.sessionId, session);
 
     try {
       for await (const message of session) {
         const events = normalizeClaudeMessageV2({
           taskId: input.taskId,
+          sessionId: input.sessionId,
           turnId: input.turnId,
           cwd: input.cwd,
           message,
@@ -94,36 +95,49 @@ export class ClaudeRuntimeAdapter extends BaseRuntimeAdapter implements RuntimeA
         }
       }
     } finally {
-      this.sessions.delete(input.taskId);
+      this.sessions.delete(input.sessionId);
     }
   }
 
   async resumeTask(input: ResumeRuntimeTaskInput): Promise<RuntimeTaskHandle> {
     this.writeRuntimeLog(`runtime.task.resume runtime=claude taskId=${input.taskId} profileId=${input.profileId}`);
-    this.resumeIds.set(input.taskId, input.backendThreadId);
+    this.resumeIds.set(input.sessionId, input.backendThreadId);
     return {
       taskId: input.taskId,
+      sessionId: input.sessionId,
       backendThreadId: input.backendThreadId,
     };
   }
 
-  async cancelTask(taskId: string): Promise<void> {
-    this.writeRuntimeLog(`runtime.task.cancel runtime=claude taskId=${taskId}`);
-    const session = this.sessions.get(taskId);
+  async forkSession(input: ForkRuntimeSessionInput): Promise<ForkRuntimeSessionResult> {
+    this.writeRuntimeLog(`runtime.session.fork runtime=claude taskId=${input.taskId} sourceSessionId=${input.sourceSessionId} targetSessionId=${input.targetSessionId}`);
+    const result = await forkSession(input.sourceBackendThreadId, {
+      dir: input.cwd,
+      ...(input.upToMessageId ? { upToMessageId: input.upToMessageId } : {}),
+    });
+    return {
+      backendThreadId: result.sessionId,
+      forkKind: "native",
+    };
+  }
+
+  async cancelTask(sessionId: string): Promise<void> {
+    this.writeRuntimeLog(`runtime.task.cancel runtime=claude sessionId=${sessionId}`);
+    const session = this.sessions.get(sessionId);
     if (session) {
       await session.interrupt();
-      this.sessions.delete(taskId);
+      this.sessions.delete(sessionId);
     }
   }
 
-  async pauseTask(taskId: string): Promise<void> {
-    this.writeRuntimeLog(`runtime.task.pause runtime=claude taskId=${taskId}`);
-    await this.cancelTask(taskId);
+  async pauseTask(sessionId: string): Promise<void> {
+    this.writeRuntimeLog(`runtime.task.pause runtime=claude sessionId=${sessionId}`);
+    await this.cancelTask(sessionId);
   }
 
-  async closeTask(taskId: string): Promise<void> {
-    this.sessions.delete(taskId);
-    this.resumeIds.delete(taskId);
+  async closeTask(sessionId: string): Promise<void> {
+    this.sessions.delete(sessionId);
+    this.resumeIds.delete(sessionId);
   }
 }
 

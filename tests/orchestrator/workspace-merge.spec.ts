@@ -16,7 +16,7 @@ class FakeRuntime implements RuntimeAdapter {
   constructor(readonly runtime: RuntimeAdapter["runtime"]) {}
 
   async startTask(input: StartRuntimeTaskInput): Promise<RuntimeTaskHandle> {
-    return { taskId: input.taskId, backendThreadId: `thread-${input.taskId}` };
+    return { taskId: input.taskId, sessionId: input.sessionId, backendThreadId: `thread-${input.taskId}` };
   }
 
   async *runTurn(input: RunTurnInput): AsyncIterable<RuntimeAdapterOutput> {
@@ -27,7 +27,7 @@ class FakeRuntime implements RuntimeAdapter {
   }
 
   async resumeTask(input: ResumeRuntimeTaskInput): Promise<RuntimeTaskHandle> {
-    return { taskId: input.taskId, backendThreadId: input.backendThreadId };
+    return { taskId: input.taskId, sessionId: input.sessionId, backendThreadId: input.backendThreadId };
   }
 
   async pauseTask(_taskId: string): Promise<void> {}
@@ -88,7 +88,7 @@ describe("workspace merge lifecycle", () => {
         "workspace.merged",
       ]));
       const migrations = db.db.prepare(`SELECT id FROM schema_migrations ORDER BY id`).all() as Array<{ id: string }>;
-      expect(migrations.map((row) => row.id)).toEqual(["001_initial", "002_workspace_lifecycle", "003_task_model"]);
+      expect(migrations.map((row) => row.id)).toEqual(["001_initial", "002_workspace_lifecycle", "003_task_model", "004_runtime_sessions"]);
     } finally {
       await orchestrator.close();
     }

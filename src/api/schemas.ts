@@ -15,11 +15,40 @@ export const createTaskRequestSchema = z.object({
 export const runTaskRequestSchema = z.object({
   taskId: taskIdSchema,
   prompt: z.string().min(1),
+  requestId: z.string().min(1).optional(),
 });
+
+export const sendTurnRequestSchema = runTaskRequestSchema;
 
 export const resumeTaskRequestSchema = z.object({
   taskId: taskIdSchema,
   prompt: z.string().optional(),
+  requestId: z.string().min(1).optional(),
+});
+
+export const handoffTaskRequestSchema = z.object({
+  taskId: taskIdSchema,
+  targetProfileId: z.string().min(1),
+  prompt: z.string().optional(),
+  reason: z.string().min(1),
+  requestId: z.string().min(1).optional(),
+});
+
+export const forkTaskRequestSchema = z.object({
+  taskId: taskIdSchema,
+  fromTurnId: z.string().min(1).optional(),
+  name: z.string().optional(),
+  mode: z.enum(["task", "session"]).default("task"),
+  prompt: z.string().optional(),
+  requestId: z.string().min(1).optional(),
+});
+
+export const rolloverSessionRequestSchema = z.object({
+  taskId: taskIdSchema,
+  reason: z.enum(["context_limit", "model_change", "profile_change", "session_corrupt", "manual"]),
+  targetProfileId: z.string().min(1).optional(),
+  carryOverPrompt: z.string().optional(),
+  requestId: z.string().min(1).optional(),
 });
 
 export const pauseTaskRequestSchema = z.object({
@@ -83,6 +112,16 @@ export const errorEnvelopeSchema = z.object({
       "logs_unavailable",
       "runtime_probe_failed",
       "runtime_unavailable",
+      "task_busy",
+      "task_terminal",
+      "not_recoverable",
+      "session_unavailable",
+      "runtime_capability_unavailable",
+      "fork_not_supported",
+      "fork_truncation_required",
+      "handoff_failed",
+      "rollover_failed",
+      "continuation_context_too_large",
       "unknown_error",
     ]),
     message: z.string(),
@@ -107,10 +146,13 @@ export const taskSummarySchema = z.object({
 export const turnViewSchema = z.object({
   id: z.string(),
   taskId: z.string(),
+  sessionId: z.string(),
+  turnNumber: z.number().int().positive(),
+  requestId: z.string().optional(),
   promptRedacted: z.string(),
   promptRawEncrypted: z.string().optional(),
   promptRawTtlAt: z.string().optional(),
-  status: z.enum(["running", "paused", "completed", "failed"]),
+  status: z.enum(["running", "paused", "completed", "failed", "cancelled"]),
   usage: z.object({
     inputTokens: z.number().optional(),
     outputTokens: z.number().optional(),
@@ -177,7 +219,6 @@ export const taskDetailSchema = z.object({
   parentTaskId: z.string().optional(),
   delegationDepth: z.number().int().nonnegative(),
   delegationChain: z.array(z.string()),
-  backendThreadId: z.string().optional(),
   status: z.string(),
   budget: z.object({
     maxTokens: z.number().optional(),
@@ -189,7 +230,7 @@ export const taskDetailSchema = z.object({
   triggeredBy: z.string(),
   createdAt: z.string(),
   updatedAt: z.string(),
-  completedAt: z.string().optional(),
+  closedAt: z.string().optional(),
   turns: z.array(turnViewSchema),
   artifacts: z.array(artifactViewSchema),
   latestMessage: z.string().optional(),
