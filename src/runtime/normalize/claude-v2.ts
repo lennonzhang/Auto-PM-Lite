@@ -5,6 +5,7 @@ export interface ClaudeV2NormalizerState {
   blockByIndex: Map<number, ClaudeBlockState>;
   toolItemByToolUseId: Map<string, string>;
   parentItemByToolUseId: Map<string, string>;
+  toolMetaByToolUseId: Map<string, ClaudeToolMeta>;
 }
 
 interface ClaudeBlockState {
@@ -16,11 +17,20 @@ interface ClaudeBlockState {
   redacted?: boolean | undefined;
 }
 
+interface ClaudeToolMeta {
+  itemId: string;
+  parentItemId?: string | undefined;
+  toolName: string;
+  input: unknown;
+  inputText: string;
+}
+
 export function createClaudeV2NormalizerState(): ClaudeV2NormalizerState {
   return {
     blockByIndex: new Map(),
     toolItemByToolUseId: new Map(),
     parentItemByToolUseId: new Map(),
+    toolMetaByToolUseId: new Map(),
   };
 }
 
@@ -207,6 +217,13 @@ function normalizeStreamEvent(input: {
       if (parentItemId) {
         input.state.parentItemByToolUseId.set(toolUseId, parentItemId);
       }
+      rememberToolMeta(input.state, toolUseId, {
+        itemId,
+        parentItemId,
+        toolName: stringValue(block.name) || "unknown",
+        input: isRecord(block.input) ? block.input : {},
+        inputText: JSON.stringify(block.input ?? {}),
+      });
       return [{
         kind: "item.started",
         item: toolItem({
@@ -255,6 +272,9 @@ function normalizeStreamEvent(input: {
       const baseLength = block.inputJsonBuffer?.length ?? 0;
       block.inputJsonBuffer = `${block.inputJsonBuffer ?? ""}${partialJson}`;
       const partialParsed = parsePartialJson(block.inputJsonBuffer);
+      if (block.toolUseId) {
+        updateToolMetaInput(input.state, block.toolUseId, block.itemId, block.inputJsonBuffer, partialParsed);
+      }
       return partialJson ? [{
         kind: "item.updated",
         itemId: block.itemId,
@@ -333,6 +353,16 @@ function normalizeAssistantFinal(input: {
       const toolUseId = stringValue(block.id) || blockItemId(input.sessionId, input.turnId, index);
       const itemId = input.state.toolItemByToolUseId.get(toolUseId) ?? `claude:${toolUseId}`;
       input.state.toolItemByToolUseId.set(toolUseId, itemId);
+      const parentItemId = input.message.parent_tool_use_id ? input.state.toolItemByToolUseId.get(input.message.parent_tool_use_id) : undefined;
+      const finalInput = isRecord(block.input) ? block.input : {};
+      const finalInputText = JSON.stringify(block.input ?? {});
+      rememberToolMeta(input.state, toolUseId, {
+        itemId,
+        parentItemId,
+        toolName: stringValue(block.name) || input.state.toolMetaByToolUseId.get(toolUseId)?.toolName || "unknown",
+        input: finalInput,
+        inputText: finalInputText,
+      });
       if (!input.state.blockByIndex.get(index)) {
         events.push({
           kind: "item.started",
@@ -341,10 +371,10 @@ function normalizeAssistantFinal(input: {
             sessionId: input.sessionId,
             turnId: input.turnId,
             itemId,
-            parentItemId: input.message.parent_tool_use_id ? input.state.toolItemByToolUseId.get(input.message.parent_tool_use_id) : undefined,
-            toolName: stringValue(block.name) || "unknown",
-            input: isRecord(block.input) ? block.input : {},
-            inputText: JSON.stringify(block.input ?? {}),
+            parentItemId,
+            toolName: input.state.toolMetaByToolUseId.get(toolUseId)?.toolName ?? "unknown",
+            input: finalInput,
+            inputText: finalInputText,
             ts: input.ts,
           }),
         });
@@ -356,10 +386,10 @@ function normalizeAssistantFinal(input: {
           op: "replace_payload",
           itemKind: "tool_call",
           value: {
-            tool: { runtime: "claude", name: stringValue(block.name) || "unknown" },
+            tool: { runtime: "claude", name: input.state.toolMetaByToolUseId.get(toolUseId)?.toolName ?? "unknown" },
             phase: "queued",
-            input: block.input ?? {},
-            inputText: JSON.stringify(block.input ?? {}),
+            input: finalInput,
+            inputText: finalInputText,
           },
           reason: "final_reconcile",
         },
@@ -383,6 +413,7 @@ function normalizeUserMessage(input: {
   }
   const toolUseId = toolUseResultId(result);
   const itemId = toolUseId ? input.state.toolItemByToolUseId.get(toolUseId) : undefined;
+  const toolMeta = toolUseId ? input.state.toolMetaByToolUseId.get(toolUseId) : undefined;
   if (!itemId) {
     return [{
       kind: "item.started",
@@ -412,9 +443,10 @@ function normalizeUserMessage(input: {
         itemId,
         itemKind: "tool_call",
         finalPayload: {
-          tool: { runtime: "claude", name: "unknown" },
+          tool: { runtime: "claude", name: toolMeta?.toolName ?? "unknown" },
           phase: "completed",
-          input: {},
+          input: toolMeta?.input ?? {},
+          ...(toolMeta?.inputText === undefined ? {} : { inputText: toolMeta.inputText }),
           output: result,
         },
         completedAt: input.ts,
@@ -565,6 +597,25 @@ function toolItem(input: {
       inputText: input.inputText,
     },
   };
+}
+
+function rememberToolMeta(state: ClaudeV2NormalizerState, toolUseId: string, meta: ClaudeToolMeta): void {
+  state.toolItemByToolUseId.set(toolUseId, meta.itemId);
+  if (meta.parentItemId) {
+    state.parentItemByToolUseId.set(toolUseId, meta.parentItemId);
+  }
+  state.toolMetaByToolUseId.set(toolUseId, meta);
+}
+
+function updateToolMetaInput(state: ClaudeV2NormalizerState, toolUseId: string, itemId: string, inputText: string, parsed: unknown): void {
+  const current = state.toolMetaByToolUseId.get(toolUseId);
+  state.toolMetaByToolUseId.set(toolUseId, {
+    itemId,
+    parentItemId: current?.parentItemId,
+    toolName: current?.toolName ?? "unknown",
+    input: parsed ?? current?.input ?? {},
+    inputText,
+  });
 }
 
 function systemNoticeItem(input: {

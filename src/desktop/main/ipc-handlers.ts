@@ -1,6 +1,7 @@
 import type { IpcMain, IpcMainInvokeEvent, WebContents } from "electron";
 import { shell } from "electron";
 import { toErrorEnvelope, type EventEnvelope } from "../../api/types.js";
+import { validateEventEnvelope } from "../../core/events.js";
 import type { AppServices } from "../../service/app-services.js";
 import { ipcChannels } from "../shared/ipc.js";
 import { DesktopJobRunner } from "./job-runner.js";
@@ -93,7 +94,7 @@ function handleApi<TArgs extends unknown[], TResult>(
 
 function sendEvent(sender: WebContents, envelope: EventEnvelope): void {
   if (!sender.isDestroyed()) {
-    sender.send(ipcChannels.eventsPush, envelope);
+    sender.send(ipcChannels.eventsPush, validateEventEnvelope(envelope));
   }
 }
 

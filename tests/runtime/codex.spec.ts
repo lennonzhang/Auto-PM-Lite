@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vitest";
+import type { ThreadEvent } from "@openai/codex-sdk";
 import { CodexRuntimeAdapter } from "../../src/runtime/codex.js";
 import type { AppConfig } from "../../src/core/types.js";
+import type { RuntimeAdapterOutput } from "../../src/runtime/adapter.js";
 
 describe("CodexRuntimeAdapter", () => {
   it("maps account extraConfig to Codex provider config like the launcher script", async () => {
@@ -130,6 +132,39 @@ describe("CodexRuntimeAdapter", () => {
     });
     expect(options).not.toHaveProperty("mode");
   });
+
+  it("ignores Windows taskkill parse noise after a Codex turn terminal event", async () => {
+    const adapter = buildAdapterWithThread(fakeThread([
+      turnStarted(),
+      turnCompleted(),
+      new Error("Failed to parse item: SUCCESS: The process with PID 1234 (child process of PID 5678) has been terminated."),
+    ]));
+
+    const outputs = await collectRunTurn(adapter);
+
+    expect(outputs.map((output) => outputEvents(output).map((event) => event.kind))).toEqual([
+      ["turn.started"],
+      ["turn.completed"],
+    ]);
+  });
+
+  it("does not ignore Windows taskkill parse noise before a Codex turn terminal event", async () => {
+    const adapter = buildAdapterWithThread(fakeThread([
+      turnStarted(),
+      new Error("Failed to parse item: SUCCESS: The process with PID 1234 has been terminated."),
+    ]));
+
+    await expect(collectRunTurn(adapter)).rejects.toThrow("Failed to parse item: SUCCESS: The process with PID 1234 has been terminated.");
+  });
+
+  it("does not ignore unrelated parse errors after a Codex turn terminal event", async () => {
+    const adapter = buildAdapterWithThread(fakeThread([
+      turnCompleted(),
+      new Error("Failed to parse item: not json"),
+    ]));
+
+    await expect(collectRunTurn(adapter)).rejects.toThrow("Failed to parse item: not json");
+  });
 });
 
 function buildConfig(overrides?: { secretRef?: string | undefined }): AppConfig {
@@ -177,6 +212,80 @@ function buildConfig(overrides?: { secretRef?: string | undefined }): AppConfig 
     },
     rateLimit: {
       enabled: false,
+    },
+  };
+}
+
+function buildAdapterWithThread(thread: FakeThread): CodexRuntimeAdapter {
+  const adapter = new CodexRuntimeAdapter({
+    config: buildConfig(),
+    configPath: "D:/tmp/auto-pm-lite/config.toml",
+    secretBackend: {
+      async resolve() {
+        return "secret-value";
+      },
+    },
+  });
+  (adapter as unknown as { threads: Map<string, FakeThread> }).threads.set("task-1", thread);
+  return adapter;
+}
+
+async function collectRunTurn(adapter: CodexRuntimeAdapter) {
+  const outputs: RuntimeAdapterOutput[] = [];
+  for await (const output of adapter.runTurn({
+    taskId: "task-1",
+    turnId: "turn-1",
+    profileId: "codex_plan",
+    model: "gpt-5-4",
+    cwd: "D:/Code/Auto-PM-Lite",
+    prompt: "hello",
+  })) {
+    outputs.push(output);
+  }
+  return outputs;
+}
+
+function outputEvents(output: RuntimeAdapterOutput) {
+  return "events" in output ? output.events : [output.event];
+}
+
+interface FakeThread {
+  id?: string | undefined;
+  runStreamed(prompt: string, options: { signal: AbortSignal }): Promise<{ events: AsyncIterable<ThreadEvent> }>;
+}
+
+function fakeThread(events: Array<ThreadEvent | Error>): FakeThread {
+  return {
+    id: "thread-1",
+    async runStreamed() {
+      return {
+        events: fakeEventStream(events),
+      };
+    },
+  };
+}
+
+async function* fakeEventStream(events: Array<ThreadEvent | Error>): AsyncIterable<ThreadEvent> {
+  for (const event of events) {
+    if (event instanceof Error) {
+      throw event;
+    }
+    yield event;
+  }
+}
+
+function turnStarted(): ThreadEvent {
+  return { type: "turn.started" };
+}
+
+function turnCompleted(): ThreadEvent {
+  return {
+    type: "turn.completed",
+    usage: {
+      input_tokens: 1,
+      output_tokens: 2,
+      cached_input_tokens: 0,
+      reasoning_output_tokens: 0,
     },
   };
 }

@@ -19,3 +19,5 @@ approval-check.txt
 *.db
 *.db-shm
 *.db-wal
+
+docs/

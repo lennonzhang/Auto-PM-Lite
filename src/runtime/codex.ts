@@ -1,4 +1,4 @@
-import { Codex, type CodexOptions, type Thread, type ThreadOptions } from "@openai/codex-sdk";
+import { Codex, type CodexOptions, type Thread, type ThreadEvent, type ThreadOptions } from "@openai/codex-sdk";
 import type { Account, CodexProfile, VendorKind } from "../core/types.js";
 import { sanitizeEnvKey } from "../core/credentials.js";
 import { isLocalSecretRef, sourceEnvAuthMode } from "../orchestrator/secrets.js";
@@ -48,10 +48,14 @@ export class CodexRuntimeAdapter extends BaseRuntimeAdapter implements RuntimeAd
     const state = createCodexV2NormalizerState();
     const controller = new AbortController();
     this.abortControllers.set(input.taskId, controller);
+    let sawCodexTurnTerminalEvent = false;
 
     try {
       const streamed = await thread.runStreamed(input.prompt, { signal: controller.signal });
       for await (const event of streamed.events) {
+        if (isCodexTurnTerminalEvent(event)) {
+          sawCodexTurnTerminalEvent = true;
+        }
         const events = normalizeCodexEventV2({
           taskId: input.taskId,
           sessionId: thread.id ?? input.taskId,
@@ -64,6 +68,11 @@ export class CodexRuntimeAdapter extends BaseRuntimeAdapter implements RuntimeAd
           yield { raw: event, events };
         }
       }
+    } catch (error) {
+      if (sawCodexTurnTerminalEvent && isWindowsTaskkillParseNoise(error)) {
+        return;
+      }
+      throw error;
     } finally {
       this.abortControllers.delete(input.taskId);
     }
@@ -344,6 +353,15 @@ function objectExtra(extraConfig: Account["extraConfig"], keys: string[]): Codex
 
 function isCodexConfigObject(value: unknown): value is CodexConfigObject {
   return typeof value === "object" && value !== null && !Array.isArray(value);
+}
+
+function isCodexTurnTerminalEvent(event: ThreadEvent): boolean {
+  return event.type === "turn.completed" || event.type === "turn.failed" || event.type === "error";
+}
+
+function isWindowsTaskkillParseNoise(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error);
+  return /^Failed to parse item: SUCCESS: The process with PID \d+( \(child process of PID \d+\))? has been terminated\.$/.test(message);
 }
 
 function requiresCustomCodexProvider(vendor: VendorKind): boolean {

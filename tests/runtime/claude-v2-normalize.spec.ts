@@ -103,6 +103,52 @@ describe("Claude v2 normalizer", () => {
       kind: "item.completed",
       itemId: "claude:toolu_1",
       itemKind: "tool_call",
+      finalPayload: {
+        tool: { runtime: "claude", name: "Bash" },
+        phase: "completed",
+        input: { command: "pwd" },
+        inputText: "{\"command\":\"pwd\"}",
+        output: { tool_use_id: "toolu_1", content: "ok" },
+      },
+    });
+  });
+
+  it("uses assistant final tool metadata as authoritative tool_result context", () => {
+    const state = createClaudeV2NormalizerState();
+    normalize(streamEvent({
+      type: "content_block_start",
+      index: 0,
+      content_block: { type: "tool_use", id: "toolu_2", name: "unknown", input: {} },
+    }), state);
+    normalize(sdk({
+      type: "assistant",
+      message: {
+        role: "assistant",
+        content: [{ type: "tool_use", id: "toolu_2", name: "Read", input: { file_path: "src/index.ts" } }],
+      },
+      parent_tool_use_id: null,
+      uuid: "assistant-final",
+      session_id: "session-1",
+    }), state);
+    const result = normalize(sdk({
+      type: "user",
+      message: { role: "user", content: [] },
+      parent_tool_use_id: null,
+      tool_use_result: { tool_use_id: "toolu_2", content: "file contents" },
+      uuid: "user-2",
+      session_id: "session-1",
+    }), state);
+
+    expect(result[0]).toMatchObject({
+      kind: "item.completed",
+      itemId: "claude:toolu_2",
+      itemKind: "tool_call",
+      finalPayload: {
+        tool: { runtime: "claude", name: "Read" },
+        input: { file_path: "src/index.ts" },
+        inputText: "{\"file_path\":\"src/index.ts\"}",
+        output: { tool_use_id: "toolu_2", content: "file contents" },
+      },
     });
   });
 

@@ -93,6 +93,27 @@ describe("v2 transcript reducer", () => {
     expect(uncoalesced.items.get("cmd-1")?.payload).toMatchObject({ aggregatedOutput: "hello world" });
     expect(coalesced.items.get("cmd-1")?.payload).toMatchObject({ aggregatedOutput: "hello world" });
   });
+
+  it("reduces every major v2 item kind into the task view model", () => {
+    const items = majorItems();
+    const vm = reduceTaskEvents("task-1", items.map((item, index) => envelope(index + 1, { kind: "item.started", item })));
+
+    expect([...vm.items.values()].map((item) => item.kind)).toEqual([
+      "user_message",
+      "assistant_message",
+      "reasoning",
+      "command_execution",
+      "tool_call",
+      "file_change",
+      "todo_list",
+      "web_search",
+      "delegation",
+      "context_compaction",
+      "system_notice",
+    ]);
+    expect(vm.rootItemOrder).toEqual(items.map((item) => item.id));
+    expect(vm.resyncRequired).toBe(false);
+  });
 });
 
 function envelope(taskSeq: number, event: EventEnvelope["event"]): EventEnvelope {
@@ -141,4 +162,114 @@ function commandItem(id: string): AgentItem<"command_execution"> {
       outputChunks: [],
     },
   };
+}
+
+function majorItems(): AgentItem[] {
+  return [
+    {
+      id: "user-1",
+      taskId: "task-1",
+      sessionId: "session-1",
+      kind: "user_message",
+      status: "completed",
+      startedAt: "2026-05-06T00:00:00.000Z",
+      updatedAt: "2026-05-06T00:00:00.000Z",
+      completedAt: "2026-05-06T00:00:00.000Z",
+      payload: { text: "prompt" },
+    },
+    assistantItem("assistant-1", "answer"),
+    {
+      id: "reasoning-1",
+      taskId: "task-1",
+      sessionId: "session-1",
+      kind: "reasoning",
+      status: "completed",
+      startedAt: "2026-05-06T00:00:00.000Z",
+      updatedAt: "2026-05-06T00:00:00.000Z",
+      completedAt: "2026-05-06T00:00:00.000Z",
+      payload: { summary: ["summary"], content: ["detail"], redacted: false },
+    },
+    commandItem("cmd-1"),
+    {
+      id: "tool-1",
+      taskId: "task-1",
+      sessionId: "session-1",
+      kind: "tool_call",
+      status: "in_progress",
+      startedAt: "2026-05-06T00:00:00.000Z",
+      updatedAt: "2026-05-06T00:00:00.000Z",
+      payload: {
+        tool: { runtime: "claude", name: "Bash" },
+        phase: "running",
+        input: { command: "pwd" },
+        inputText: "{\"command\":\"pwd\"}",
+      },
+    },
+    {
+      id: "file-1",
+      taskId: "task-1",
+      sessionId: "session-1",
+      kind: "file_change",
+      status: "completed",
+      startedAt: "2026-05-06T00:00:00.000Z",
+      updatedAt: "2026-05-06T00:00:00.000Z",
+      completedAt: "2026-05-06T00:00:00.000Z",
+      payload: { changes: [{ path: "a.txt", changeKind: "modify", binary: false }], status: "applied" },
+    },
+    {
+      id: "todo-1",
+      taskId: "task-1",
+      sessionId: "session-1",
+      kind: "todo_list",
+      status: "completed",
+      startedAt: "2026-05-06T00:00:00.000Z",
+      updatedAt: "2026-05-06T00:00:00.000Z",
+      completedAt: "2026-05-06T00:00:00.000Z",
+      payload: { items: [{ text: "done", completed: true }] },
+    },
+    {
+      id: "web-1",
+      taskId: "task-1",
+      sessionId: "session-1",
+      kind: "web_search",
+      status: "completed",
+      startedAt: "2026-05-06T00:00:00.000Z",
+      updatedAt: "2026-05-06T00:00:00.000Z",
+      completedAt: "2026-05-06T00:00:00.000Z",
+      payload: { query: "openai", results: [{ title: "OpenAI", url: "https://openai.com" }] },
+    },
+    {
+      id: "delegation-1",
+      taskId: "task-1",
+      sessionId: "session-1",
+      kind: "delegation",
+      status: "completed",
+      startedAt: "2026-05-06T00:00:00.000Z",
+      updatedAt: "2026-05-06T00:00:00.000Z",
+      completedAt: "2026-05-06T00:00:00.000Z",
+      payload: { childTaskId: "child-task", status: "completed", prompt: "delegate", finalResponse: "done" },
+    },
+    {
+      id: "compact-1",
+      taskId: "task-1",
+      sessionId: "session-1",
+      kind: "context_compaction",
+      status: "completed",
+      startedAt: "2026-05-06T00:00:00.000Z",
+      updatedAt: "2026-05-06T00:00:00.000Z",
+      completedAt: "2026-05-06T00:00:00.000Z",
+      payload: { trigger: "auto", preTokens: 100, postTokens: 40, status: "completed" },
+    },
+    {
+      id: "notice-1",
+      taskId: "task-1",
+      sessionId: "session-1",
+      kind: "system_notice",
+      status: "completed",
+      startedAt: "2026-05-06T00:00:00.000Z",
+      updatedAt: "2026-05-06T00:00:00.000Z",
+      completedAt: "2026-05-06T00:00:00.000Z",
+      payload: { level: "info", code: "runtime_notice", message: "notice" },
+    },
+  ];
 }
