@@ -18,9 +18,9 @@ export interface CreateTaskRecordInput {
 export interface StoredTask {
   id: string;
   name?: string | undefined;
-  profileId: string;
-  runtime: Task["runtime"];
-  model: string;
+  defaultProfileId: string;
+  defaultRuntime: Task["defaultRuntime"];
+  defaultModel: string;
   cwd: string;
   workspaceId: string;
   parentTaskId?: string | undefined;
@@ -36,6 +36,11 @@ export interface StoredTask {
 
 export interface StoredTurn extends TurnRecord {}
 export interface StoredRuntimeSession extends RuntimeSession {}
+export interface StoredTurnAssistantMessage {
+  turnId: string;
+  assistantMessageId: string;
+  createdAt: string;
+}
 
 export interface StoredApproval {
   id: string;
@@ -176,8 +181,8 @@ export class AppDatabase {
     `);
 
     const insertTask = this.db.prepare(`
-      INSERT INTO tasks (id, name, profile_id, runtime, model, parent_task_id, delegation_depth, delegation_chain_json, workspace_id, cwd, status, budget_json, triggered_by, created_at, updated_at, closed_at)
-      VALUES (@id, @name, @profile_id, @runtime, @model, @parent_task_id, @delegation_depth, @delegation_chain_json, @workspace_id, @cwd, @status, @budget_json, @triggered_by, @created_at, @updated_at, @closed_at)
+      INSERT INTO tasks (id, name, profile_id, runtime, model, default_profile_id, default_runtime, default_model, parent_task_id, delegation_depth, delegation_chain_json, workspace_id, cwd, status, budget_json, triggered_by, created_at, updated_at, closed_at)
+      VALUES (@id, @name, @profile_id, @runtime, @model, @default_profile_id, @default_runtime, @default_model, @parent_task_id, @delegation_depth, @delegation_chain_json, @workspace_id, @cwd, @status, @budget_json, @triggered_by, @created_at, @updated_at, @closed_at)
     `);
 
     const tx = this.db.transaction(() => {
@@ -203,9 +208,12 @@ export class AppDatabase {
       insertTask.run({
         id: input.task.id,
         name: input.task.name ?? null,
-        profile_id: input.task.profileId,
-        runtime: input.task.runtime,
-        model: input.task.model,
+        profile_id: input.task.defaultProfileId,
+        runtime: input.task.defaultRuntime,
+        model: input.task.defaultModel,
+        default_profile_id: input.task.defaultProfileId,
+        default_runtime: input.task.defaultRuntime,
+        default_model: input.task.defaultModel,
         parent_task_id: input.task.parentTaskId ?? null,
         delegation_depth: input.task.delegationDepth,
         delegation_chain_json: JSON.stringify(input.task.delegationChain),
@@ -226,9 +234,9 @@ export class AppDatabase {
   listTasks(): Array<{
     id: string;
     name: string | null;
-    profileId: string;
-    runtime: string;
-    model: string;
+    defaultProfileId: string;
+    defaultRuntime: string;
+    defaultModel: string;
     status: string;
     cwd: string;
     parentTaskId?: string | undefined;
@@ -239,7 +247,7 @@ export class AppDatabase {
     terminalError?: string | undefined;
   }> {
     const rows = this.db.prepare(`
-      SELECT id, name, profile_id, runtime, model, parent_task_id, delegation_depth, status, cwd, triggered_by, created_at
+      SELECT id, name, default_profile_id, default_runtime, default_model, parent_task_id, delegation_depth, status, cwd, triggered_by, created_at
       FROM tasks
       ORDER BY created_at DESC
     `).all() as Array<Record<string, unknown>>;
@@ -249,9 +257,9 @@ export class AppDatabase {
       return {
         id,
         name: row.name === null ? null : String(row.name),
-        profileId: String(row.profile_id),
-        runtime: String(row.runtime),
-        model: String(row.model),
+        defaultProfileId: String(row.default_profile_id),
+        defaultRuntime: String(row.default_runtime),
+        defaultModel: String(row.default_model),
         status: String(row.status),
         cwd: String(row.cwd),
         ...(row.parent_task_id === null ? {} : { parentTaskId: String(row.parent_task_id) }),
@@ -279,7 +287,7 @@ export class AppDatabase {
 
   getTask(taskId: string): StoredTask | null {
     const row = this.db.prepare(`
-      SELECT id, name, profile_id, runtime, model, cwd, workspace_id, parent_task_id, delegation_depth, delegation_chain_json, status, budget_json, triggered_by, created_at, updated_at, closed_at
+      SELECT id, name, default_profile_id, default_runtime, default_model, cwd, workspace_id, parent_task_id, delegation_depth, delegation_chain_json, status, budget_json, triggered_by, created_at, updated_at, closed_at
       FROM tasks
       WHERE id = ?
     `).get(taskId) as Record<string, unknown> | undefined;
@@ -291,9 +299,9 @@ export class AppDatabase {
     return {
       id: String(row.id),
       ...(row.name === null ? {} : { name: String(row.name) }),
-      profileId: String(row.profile_id),
-      runtime: String(row.runtime) as Task["runtime"],
-      model: String(row.model),
+      defaultProfileId: String(row.default_profile_id),
+      defaultRuntime: String(row.default_runtime) as Task["defaultRuntime"],
+      defaultModel: String(row.default_model),
       cwd: String(row.cwd),
       workspaceId: String(row.workspace_id),
       ...(row.parent_task_id === null ? {} : { parentTaskId: String(row.parent_task_id) }),
@@ -501,6 +509,35 @@ export class AppDatabase {
     `).all(taskId) as Array<Record<string, unknown>>;
 
     return rows.map(rowToTurn);
+  }
+
+  upsertTurnAssistantMessage(input: StoredTurnAssistantMessage): void {
+    this.db.prepare(`
+      INSERT INTO turn_assistant_messages (turn_id, assistant_message_id, created_at)
+      VALUES (@turn_id, @assistant_message_id, @created_at)
+      ON CONFLICT(turn_id) DO UPDATE SET
+        assistant_message_id = excluded.assistant_message_id,
+        created_at = excluded.created_at
+    `).run({
+      turn_id: input.turnId,
+      assistant_message_id: input.assistantMessageId,
+      created_at: input.createdAt,
+    });
+  }
+
+  getTurnAssistantMessage(turnId: string): StoredTurnAssistantMessage | null {
+    const row = this.db.prepare(`
+      SELECT turn_id, assistant_message_id, created_at
+      FROM turn_assistant_messages
+      WHERE turn_id = ?
+    `).get(turnId) as Record<string, unknown> | undefined;
+    return row
+      ? {
+          turnId: String(row.turn_id),
+          assistantMessageId: String(row.assistant_message_id),
+          createdAt: String(row.created_at),
+        }
+      : null;
   }
 
   getTurnByRequestId(taskId: string, requestId: string): StoredTurn | null {
@@ -749,6 +786,20 @@ export class AppDatabase {
     });
   }
 
+  listFileChanges(taskId: string): Array<{ path: string; changeKind: "create" | "modify" | "delete"; ts: string }> {
+    const rows = this.db.prepare(`
+      SELECT path, change_kind, ts
+      FROM file_changes
+      WHERE task_id = ?
+      ORDER BY ts DESC, path ASC
+    `).all(taskId) as Array<{ path: string; change_kind: string; ts: string }>;
+    return rows.map((row) => ({
+      path: row.path,
+      changeKind: row.change_kind as "create" | "modify" | "delete",
+      ts: row.ts,
+    }));
+  }
+
   getWorkspace(workspaceId: string): Workspace | null {
     const row = this.db.prepare(`
       SELECT id, repo_root, path, branch, head, dirty, base_ref, parent_workspace_id, status, unsafe_direct_cwd, created_at, merge_requested_at, merge_approval_id, merged_at, discarded_at, merge_error_json
@@ -905,6 +956,9 @@ export class AppDatabase {
         profile_id TEXT NOT NULL REFERENCES profiles(id),
         runtime TEXT NOT NULL,
         model TEXT NOT NULL,
+        default_profile_id TEXT,
+        default_runtime TEXT,
+        default_model TEXT,
         parent_task_id TEXT REFERENCES tasks(id),
         delegation_depth INTEGER NOT NULL,
         delegation_chain_json TEXT NOT NULL,
@@ -988,6 +1042,12 @@ export class AppDatabase {
         description TEXT,
         ts TEXT NOT NULL
       );
+
+      CREATE TABLE IF NOT EXISTS turn_assistant_messages (
+        turn_id TEXT PRIMARY KEY REFERENCES turns(id),
+        assistant_message_id TEXT NOT NULL,
+        created_at TEXT NOT NULL
+      );
     `);
     this.ensureColumn("workspaces", "head", "TEXT");
     this.ensureColumn("workspaces", "dirty", "INTEGER");
@@ -998,16 +1058,22 @@ export class AppDatabase {
     this.ensureColumn("workspaces", "merge_error_json", "TEXT");
     this.ensureColumn("tasks", "model", "TEXT");
     this.ensureColumn("tasks", "runtime", "TEXT");
+    this.ensureColumn("tasks", "default_profile_id", "TEXT");
+    this.ensureColumn("tasks", "default_runtime", "TEXT");
+    this.ensureColumn("tasks", "default_model", "TEXT");
     this.ensureColumn("tasks", "closed_at", "TEXT");
     this.ensureColumn("turns", "session_id", "TEXT");
     this.ensureColumn("turns", "turn_number", "INTEGER");
     this.ensureColumn("turns", "request_id", "TEXT");
     this.backfillTaskModels();
+    this.backfillTaskDefaults();
     this.backfillTurnSessionColumns();
     this.recordMigration("001_initial");
     this.recordMigration("002_workspace_lifecycle");
     this.recordMigration("003_task_model");
     this.recordMigration("004_runtime_sessions");
+    this.recordMigration("005_task_defaults");
+    this.recordMigration("006_turn_assistant_messages");
   }
 
   private backfillTaskModels(): void {
@@ -1019,6 +1085,18 @@ export class AppDatabase {
         ''
       )
       WHERE model IS NULL OR model = ''
+    `).run();
+  }
+
+  private backfillTaskDefaults(): void {
+    this.db.prepare(`
+      UPDATE tasks
+      SET default_profile_id = COALESCE(NULLIF(default_profile_id, ''), profile_id),
+          default_runtime = COALESCE(NULLIF(default_runtime, ''), runtime),
+          default_model = COALESCE(NULLIF(default_model, ''), model)
+      WHERE default_profile_id IS NULL OR default_profile_id = ''
+         OR default_runtime IS NULL OR default_runtime = ''
+         OR default_model IS NULL OR default_model = ''
     `).run();
   }
 
@@ -1036,9 +1114,9 @@ export class AppDatabase {
     }
 
     const tasks = this.db.prepare(`
-      SELECT id, runtime, profile_id, model, cwd, created_at
+      SELECT id, default_runtime, default_profile_id, default_model, cwd, created_at
       FROM tasks
-    `).all() as Array<{ id: string; runtime: string; profile_id: string; model: string; cwd: string; created_at: string }>;
+    `).all() as Array<{ id: string; default_runtime: string; default_profile_id: string; default_model: string; cwd: string; created_at: string }>;
     const insertSession = this.db.prepare(`
       INSERT OR IGNORE INTO runtime_sessions (id, task_id, runtime, profile_id, model, cwd, status, created_at)
       VALUES (@id, @task_id, @runtime, @profile_id, @model, @cwd, 'active', @created_at)
@@ -1051,9 +1129,9 @@ export class AppDatabase {
       insertSession.run({
         id: sessionId,
         task_id: task.id,
-        runtime: task.runtime,
-        profile_id: task.profile_id,
-        model: task.model,
+        runtime: task.default_runtime,
+        profile_id: task.default_profile_id,
+        model: task.default_model,
         cwd: task.cwd,
         created_at: task.created_at,
       });

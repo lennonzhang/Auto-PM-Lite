@@ -7,7 +7,7 @@ import { Orchestrator } from "../../orchestrator/orchestrator.js";
 import { createAppServices, type AppServices } from "../../service/app-services.js";
 import { loadConfig } from "../../core/config.js";
 import type { AppConfig } from "../../core/types.js";
-import type { ResumeRuntimeTaskInput, RunTurnInput, RuntimeAdapter, RuntimeAdapterOutput, RuntimeTaskHandle, StartRuntimeTaskInput } from "../../runtime/adapter.js";
+import type { ResumeRuntimeTaskInput, RunTurnInput, RuntimeAdapter, RuntimeAdapterOutput, RuntimeSessionControlInput, RuntimeTaskHandle, StartRuntimeTaskInput } from "../../runtime/adapter.js";
 
 export async function openDesktopSmokeServices(configPath: string): Promise<AppServices> {
   await ensureDesktopSmokeConfig(configPath);
@@ -23,7 +23,7 @@ export async function openDesktopSmokeServices(configPath: string): Promise<AppS
     codex: new DesktopSmokeRuntime("codex", config),
   });
   orchestrator.syncConfig();
-  orchestrator.recoverStaleRunningTasks();
+  await orchestrator.recoverStaleRunningTasks();
   return createAppServices(config, orchestrator);
 }
 
@@ -164,9 +164,9 @@ class DesktopSmokeRuntime implements RuntimeAdapter {
     return { taskId: input.taskId, sessionId: input.sessionId, backendThreadId: input.backendThreadId };
   }
 
-  async pauseTask(_taskId: string): Promise<void> {}
-  async cancelTask(_taskId: string): Promise<void> {}
-  async closeTask(_taskId: string): Promise<void> {}
+  async pauseSession(_input: RuntimeSessionControlInput): Promise<void> {}
+  async interruptSession(_input: RuntimeSessionControlInput): Promise<void> {}
+  async closeSession(_input: RuntimeSessionControlInput): Promise<void> {}
 }
 
 async function prepareSmokeGitWorkspace(config: AppConfig): Promise<void> {

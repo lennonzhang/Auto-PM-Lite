@@ -51,6 +51,11 @@ export interface ForkRuntimeSessionResult {
   forkKind: "native" | "logical";
 }
 
+export interface RuntimeSessionControlInput {
+  sessionId: string;
+  backendThreadId?: string | undefined;
+}
+
 export type RuntimeAdapterOutput =
   | { raw?: unknown | undefined; event: CanonicalEvent }
   | { raw?: unknown | undefined; events: CanonicalEvent[] };
@@ -61,7 +66,7 @@ export interface RuntimeAdapter {
   runTurn(input: RunTurnInput): AsyncIterable<RuntimeAdapterOutput>;
   resumeTask(input: ResumeRuntimeTaskInput): Promise<RuntimeTaskHandle>;
   forkSession?(input: ForkRuntimeSessionInput): Promise<ForkRuntimeSessionResult>;
-  pauseTask(sessionId: string): Promise<void>;
-  cancelTask(sessionId: string): Promise<void>;
-  closeTask(sessionId: string): Promise<void>;
+  pauseSession(input: RuntimeSessionControlInput): Promise<void>;
+  interruptSession(input: RuntimeSessionControlInput): Promise<void>;
+  closeSession(input: RuntimeSessionControlInput): Promise<void>;
 }

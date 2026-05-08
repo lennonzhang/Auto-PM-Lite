@@ -192,9 +192,9 @@ export interface WorkspaceMergeResult {
 export interface Task {
   id: string;
   name?: string | undefined;
-  profileId: string;
-  runtime: RuntimeKind;
-  model: string;
+  defaultProfileId: string;
+  defaultRuntime: RuntimeKind;
+  defaultModel: string;
   cwd: string;
   workspaceId: string;
   parentTaskId?: string | undefined;

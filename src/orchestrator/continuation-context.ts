@@ -1,6 +1,10 @@
 import { AppError } from "../api/types.js";
 import type { BudgetSnapshot, RuntimeKind, WorkspaceChange } from "../core/types.js";
 
+export interface ContinuationWorkspaceChange extends WorkspaceChange {
+  ts?: string | undefined;
+}
+
 export const CONTINUATION_CONTEXT_TOKEN_LIMIT = 2048;
 
 export interface ContinuationContext {
@@ -52,7 +56,7 @@ export interface ContinuationContextInput {
   cwd: string;
   latestMessage?: string | undefined;
   terminalError?: string | undefined;
-  workspaceChanges: WorkspaceChange[];
+  workspaceChanges: ContinuationWorkspaceChange[];
   handoffReason?: string | undefined;
   rolloverReason?: string | undefined;
   userPrompt?: string | undefined;
@@ -67,7 +71,7 @@ export interface SerializedContinuationContext {
 export function buildContinuationContext(input: ContinuationContextInput): SerializedContinuationContext {
   const modifiedFiles = input.workspaceChanges
     .slice()
-    .sort((a, b) => a.path.length - b.path.length || a.path.localeCompare(b.path))
+    .sort((a, b) => compareChangeRecency(a, b) || a.path.length - b.path.length || a.path.localeCompare(b.path))
     .slice(0, 20)
     .map((change) => change.oldPath ? `${change.changeKind}:${change.oldPath}->${change.path}` : `${change.changeKind}:${change.path}`);
 
@@ -78,9 +82,9 @@ export function buildContinuationContext(input: ContinuationContextInput): Seria
     source: input.source,
     progress: {
       completed: tail(input.latestMessage ? [input.latestMessage] : [], 10),
-      currentFindings: [],
-      pending: input.userPrompt ? [input.userPrompt] : [],
-      blockers: input.terminalError ? [input.terminalError] : [],
+      currentFindings: tail(extractFindings(input.latestMessage), 10),
+      pending: [],
+      blockers: tail(input.terminalError ? [input.terminalError] : [], 10),
     },
     workspace: {
       cwd: input.cwd,
@@ -121,9 +125,18 @@ export function serializeContinuationContext(context: ContinuationContext): Seri
 
 export function withContinuationPrompt(xml: string, userPrompt?: string | undefined): string {
   const prompt = userPrompt?.trim();
-  return prompt
+  const wrapped = prompt
     ? `${xml}\n<user_prompt>\n${escapeXml(prompt)}\n</user_prompt>`
     : xml;
+  const tokenEstimate = estimateTokens(wrapped);
+  if (tokenEstimate > CONTINUATION_CONTEXT_TOKEN_LIMIT) {
+    throw new AppError(
+      "continuation_context_too_large",
+      `continuation_context_too_large: ${tokenEstimate} tokens > ${CONTINUATION_CONTEXT_TOKEN_LIMIT}`,
+      { tokenEstimate, limit: CONTINUATION_CONTEXT_TOKEN_LIMIT },
+    );
+  }
+  return wrapped;
 }
 
 function renderXml(context: ContinuationContext): string {
@@ -146,7 +159,6 @@ function renderXml(context: ContinuationContext): string {
     renderList("pending_approval_ids", context.constraints.pendingApprovalIds),
     "  </constraints>",
     context.lineage ? `  <lineage${context.lineage.handoffReason ? ` handoff_reason="${escapeXml(context.lineage.handoffReason)}"` : ""}${context.lineage.rolloverReason ? ` rollover_reason="${escapeXml(context.lineage.rolloverReason)}"` : ""}/>` : "",
-    context.userPrompt ? `  <user_prompt>${escapeXml(context.userPrompt)}</user_prompt>` : "",
     "</continuation_context>",
   ];
   return lines.filter((line) => line !== "").join("\n");
@@ -169,6 +181,25 @@ function estimateTokens(value: string): number {
 
 function tail<T>(values: T[], limit: number): T[] {
   return values.length > limit ? values.slice(values.length - limit) : values;
+}
+
+function compareChangeRecency(left: ContinuationWorkspaceChange, right: ContinuationWorkspaceChange): number {
+  const leftTime = left.ts ? Date.parse(left.ts) : 0;
+  const rightTime = right.ts ? Date.parse(right.ts) : 0;
+  return rightTime - leftTime;
+}
+
+function extractFindings(latestMessage?: string | undefined): string[] {
+  if (!latestMessage) {
+    return [];
+  }
+  return latestMessage
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) => /^[-*]\s+/.test(line) || /^\d+\.\s+/.test(line))
+    .map((line) => line.replace(/^[-*]\s+/, "").replace(/^\d+\.\s+/, "").trim())
+    .filter(Boolean)
+    .slice(0, 10);
 }
 
 function escapeXml(value: string): string {

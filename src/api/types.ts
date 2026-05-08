@@ -4,6 +4,7 @@ import type {
   ClaudePermissionMode,
   CodexApprovalPolicy,
   CodexSandboxMode,
+  RuntimeSession,
   Task,
   TurnRecord,
   Workspace,
@@ -70,9 +71,10 @@ export class AppError extends Error {
 export interface TaskSummary {
   id: string;
   name: string | null;
-  profileId: string;
-  runtime: string;
-  model: string;
+  defaultProfileId: string;
+  defaultRuntime: string;
+  defaultModel: string;
+  currentSession?: RuntimeSession | undefined;
   status: string;
   cwd: string;
   parentTaskId?: string | undefined;
@@ -156,9 +158,10 @@ export interface TaskResultView {
   taskId: string;
   parentTaskId?: string | undefined;
   status: string;
-  runtime: string;
-  profileId: string;
-  model: string;
+  defaultRuntime: string;
+  defaultProfileId: string;
+  defaultModel: string;
+  currentSession?: RuntimeSession | undefined;
   latestMessage?: string | undefined;
   terminalError?: string | undefined;
   artifacts: ArtifactView[];

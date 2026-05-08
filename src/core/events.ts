@@ -47,6 +47,7 @@ export type LifecycleEvent =
   | { kind: "task.failed"; error: TaskError }
   | { kind: "task.interrupted"; error: TaskError }
   | { kind: "turn.started"; turnId: string; promptRedacted?: string | undefined }
+  | { kind: "turn.assistant_message_mapped"; turnId: string; assistantMessageId: string }
   | { kind: "turn.completed"; turnId: string; usage?: TurnUsage | undefined }
   | { kind: "turn.failed"; turnId: string; error: TaskError };
 
@@ -628,6 +629,7 @@ export const lifecycleEventSchema: z.ZodType<LifecycleEvent> = z.discriminatedUn
   z.object({ kind: z.literal("task.failed"), error: taskErrorSchema }),
   z.object({ kind: z.literal("task.interrupted"), error: taskErrorSchema }),
   z.object({ kind: z.literal("turn.started"), turnId: z.string(), promptRedacted: z.string().optional() }),
+  z.object({ kind: z.literal("turn.assistant_message_mapped"), turnId: z.string(), assistantMessageId: z.string() }),
   z.object({
     kind: z.literal("turn.completed"),
     turnId: z.string(),

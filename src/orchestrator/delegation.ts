@@ -1,4 +1,4 @@
-import type { PermissionMode, Policy, Profile, RuntimeKind, Task, TaskReference, Workspace } from "../core/types.js";
+import type { PermissionMode, Policy, Profile, RuntimeKind, RuntimeSession, Task, TaskReference, Workspace } from "../core/types.js";
 
 export interface DelegateTaskInput {
   targetProfileId?: string | undefined;
@@ -51,7 +51,7 @@ export type DelegationPolicyResult =
       workspaceMode?: "share" | "new-worktree" | undefined;
     };
 
-export function resolveDelegationTargetProfile(config: { profiles: Record<string, Profile> }, parentTask: Task, input: DelegateTaskInput): Profile {
+export function resolveDelegationTargetProfile(config: { profiles: Record<string, Profile> }, parentRuntime: RuntimeKind, input: DelegateTaskInput): Profile {
   if (input.targetProfileId) {
     const profile = config.profiles[input.targetProfileId];
     if (!profile) {
@@ -63,7 +63,7 @@ export function resolveDelegationTargetProfile(config: { profiles: Record<string
     return profile;
   }
 
-  const preferredRuntime = input.targetRuntime ?? oppositeRuntime(parentTask.runtime);
+  const preferredRuntime = input.targetRuntime ?? oppositeRuntime(parentRuntime);
   const candidates = Object.values(config.profiles)
     .filter((profile) => profile.runtime === preferredRuntime)
     .sort((left, right) => left.id.localeCompare(right.id));
@@ -119,8 +119,17 @@ export function exceedsDelegationDepth(parentDepth: number, maxDepth: number): b
   return parentDepth + 1 > maxDepth;
 }
 
-export function wouldCreateDelegationCycle(lineage: Task[], targetProfile: Profile): boolean {
-  return lineage.some((task) => task.profileId === targetProfile.id || task.runtime === targetProfile.runtime);
+export function wouldCreateDelegationCycle(
+  lineage: Task[],
+  targetProfile: Profile,
+  listSessions: (taskId: string) => RuntimeSession[] = () => [],
+): boolean {
+  return lineage.some((task) => {
+    if (task.defaultProfileId === targetProfile.id || task.defaultRuntime === targetProfile.runtime) {
+      return true;
+    }
+    return listSessions(task.id).some((session) => session.profileId === targetProfile.id || session.runtime === targetProfile.runtime);
+  });
 }
 
 export function canAccessTaskLineage(requesterTaskId: string, candidate: Task, lookupTask: (taskId: string) => Task | null): boolean {

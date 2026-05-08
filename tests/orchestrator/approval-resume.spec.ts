@@ -5,7 +5,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { loadConfig } from "../../src/core/config.js";
 import { AppDatabase } from "../../src/storage/db.js";
 import { Orchestrator } from "../../src/orchestrator/orchestrator.js";
-import type { RuntimeAdapter, RuntimeAdapterOutput, RuntimeTaskHandle, RunTurnInput, StartRuntimeTaskInput, ResumeRuntimeTaskInput } from "../../src/runtime/adapter.js";
+import type { RuntimeAdapter, RuntimeAdapterOutput, RuntimeSessionControlInput, RuntimeTaskHandle, RunTurnInput, StartRuntimeTaskInput, ResumeRuntimeTaskInput } from "../../src/runtime/adapter.js";
 import { fileChanged, messageCompleted, turnCompleted, turnStarted } from "../helpers/v2-runtime.js";
 
 const tempPaths: string[] = [];
@@ -33,9 +33,9 @@ class FakeAdapter implements RuntimeAdapter {
     return { taskId: input.taskId, sessionId: input.sessionId, backendThreadId: input.backendThreadId };
   }
 
-  async pauseTask(_taskId: string): Promise<void> {}
-  async cancelTask(_taskId: string): Promise<void> {}
-  async closeTask(_taskId: string): Promise<void> {}
+  async pauseSession(_input: RuntimeSessionControlInput): Promise<void> {}
+  async interruptSession(_input: RuntimeSessionControlInput): Promise<void> {}
+  async closeSession(_input: RuntimeSessionControlInput): Promise<void> {}
 }
 
 class FakeCodexAdapter implements RuntimeAdapter {
@@ -58,9 +58,9 @@ class FakeCodexAdapter implements RuntimeAdapter {
     return { taskId: input.taskId, sessionId: input.sessionId, backendThreadId: input.backendThreadId };
   }
 
-  async pauseTask(_taskId: string): Promise<void> {}
-  async cancelTask(_taskId: string): Promise<void> {}
-  async closeTask(_taskId: string): Promise<void> {}
+  async pauseSession(_input: RuntimeSessionControlInput): Promise<void> {}
+  async interruptSession(_input: RuntimeSessionControlInput): Promise<void> {}
+  async closeSession(_input: RuntimeSessionControlInput): Promise<void> {}
 }
 
 class ThrowingStartAdapter extends FakeAdapter {
@@ -196,7 +196,7 @@ describe("budget auto-pause + approval-resume", () => {
 
     try {
       const task = await orchestrator.createTask({ profileId: "claude_main", cwd: root });
-      await orchestrator.runTask({ taskId: task.id, prompt: "go" });
+      await orchestrator.sendTurn({ taskId: task.id, prompt: "go" });
 
       const stored = db.getTask(task.id);
       expect(stored?.status).toBe("awaiting_approval");
@@ -215,7 +215,7 @@ describe("budget auto-pause + approval-resume", () => {
 
     try {
       const task = await orchestrator.createTask({ profileId: "claude_main", cwd: root });
-      await orchestrator.runTask({ taskId: task.id, prompt: "go" });
+      await orchestrator.sendTurn({ taskId: task.id, prompt: "go" });
 
       const approval = orchestrator.listApprovals(task.id).find((a) => a.kind === "budget_increase");
       expect(approval).toBeDefined();
@@ -223,7 +223,7 @@ describe("budget auto-pause + approval-resume", () => {
       await orchestrator.resolveApproval({ approvalId: approval!.id, approved: true });
 
       const stored = db.getTask(task.id);
-      expect(["queued", "running", "completed", "awaiting_approval"]).toContain(stored?.status);
+      expect(["queued", "running", "idle", "awaiting_approval"]).toContain(stored?.status);
       expect(stored?.budget.inputTokens).toBe(0);
       expect(stored?.budget.outputTokens).toBe(0);
     } finally {
@@ -237,7 +237,7 @@ describe("budget auto-pause + approval-resume", () => {
 
     try {
       const task = await orchestrator.createTask({ profileId: "claude_main", cwd: root });
-      await orchestrator.runTask({ taskId: task.id, prompt: "go" });
+      await orchestrator.sendTurn({ taskId: task.id, prompt: "go" });
 
       const approval = orchestrator.listApprovals(task.id).find((a) => a.kind === "budget_increase");
       await orchestrator.resolveApproval({ approvalId: approval!.id, approved: false });
@@ -255,7 +255,7 @@ describe("budget auto-pause + approval-resume", () => {
 
     try {
       const task = await orchestrator.createTask({ profileId: "claude_main", cwd: root });
-      await orchestrator.runTask({ taskId: task.id, prompt: "go" });
+      await orchestrator.sendTurn({ taskId: task.id, prompt: "go" });
 
       const approval = orchestrator.listApprovals(task.id).find((a) => a.kind === "budget_increase");
       expect(approval).toBeDefined();
@@ -275,7 +275,7 @@ describe("budget auto-pause + approval-resume", () => {
 
     try {
       const task = await orchestrator.createTask({ profileId: "claude_main", cwd: root });
-      await orchestrator.runTask({ taskId: task.id, prompt: "go" });
+      await orchestrator.sendTurn({ taskId: task.id, prompt: "go" });
 
       const extraApprovalId = orchestrator.createApproval({
         taskId: task.id,
@@ -327,7 +327,7 @@ describe("budget auto-pause + approval-resume", () => {
 
       expect(db.getTask(parent.id)?.status).toBe("queued");
       expect(codex.startCount).toBe(0);
-      expect(db.listTasks().filter((task) => task.runtime === "codex")).toHaveLength(0);
+      expect(db.listTasks().filter((task) => task.defaultRuntime === "codex")).toHaveLength(0);
     } finally {
       await orchestrator.close();
     }
@@ -345,7 +345,7 @@ describe("failure semantics", () => {
         liveTypes.push(event.event.kind);
       });
 
-      await expect(orchestrator.runTask({ taskId: task.id, prompt: "go" })).rejects.toThrow("start exploded");
+      await expect(orchestrator.sendTurn({ taskId: task.id, prompt: "go" })).rejects.toThrow("start exploded");
       unsubscribe();
 
       expect(db.getTask(task.id)?.status).toBe("interrupted");
@@ -362,7 +362,7 @@ describe("failure semantics", () => {
 
     try {
       const task = await orchestrator.createTask({ profileId: "claude_main", cwd: root });
-      await orchestrator.runTask({ taskId: task.id, prompt: "seed" });
+      await orchestrator.sendTurn({ taskId: task.id, prompt: "seed" });
 
       db.updateTaskRuntimeState({
         taskId: task.id,
@@ -393,7 +393,7 @@ describe("event replay", () => {
 
     try {
       const task = await orchestrator.createTask({ profileId: "claude_main", cwd: root });
-      await orchestrator.runTask({ taskId: task.id, prompt: "go" });
+      await orchestrator.sendTurn({ taskId: task.id, prompt: "go" });
 
       const seenTypes: string[] = [];
       const durableSeqs: number[] = [];
@@ -467,7 +467,7 @@ describe("event replay", () => {
 
     try {
       const task = await orchestrator.createTask({ profileId: "claude_main", cwd: root });
-      await orchestrator.runTask({ taskId: task.id, prompt: "go" });
+      await orchestrator.sendTurn({ taskId: task.id, prompt: "go" });
       const approval = orchestrator.listApprovals(task.id).find((a) => a.kind === "budget_increase");
       expect(approval).toBeDefined();
 

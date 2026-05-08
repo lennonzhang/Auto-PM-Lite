@@ -180,10 +180,14 @@ function App() {
   const selectedNewTaskProfile = config?.profiles.find((profile) => profile.id === newTaskProfile) ?? null;
   const selectedNewTaskModelOptions = modelOptionsForProfile(selectedNewTaskProfile);
   const latestTurnId = taskDetail?.turns[taskDetail.turns.length - 1]?.id;
+  const focusedSession = taskDetail?.currentSession ?? selectedTask?.currentSession ?? null;
+  const focusedProfileId = focusedSession?.profileId ?? taskDetail?.defaultProfileId ?? selectedTask?.defaultProfileId;
+  const focusedRuntime = focusedSession?.runtime ?? taskDetail?.defaultRuntime ?? selectedTask?.defaultRuntime;
+  const focusedModel = focusedSession?.model ?? taskDetail?.defaultModel ?? selectedTask?.defaultModel;
   const focusedProfile = taskDetail
-    ? config?.profiles.find((profile) => profile.id === taskDetail.profileId) ?? null
+    ? config?.profiles.find((profile) => profile.id === focusedProfileId) ?? null
     : selectedTask
-      ? config?.profiles.find((profile) => profile.id === selectedTask.profileId) ?? null
+      ? config?.profiles.find((profile) => profile.id === focusedProfileId) ?? null
       : null;
 
   return (
@@ -191,15 +195,20 @@ function App() {
       <header className="brandBar">
         <div className="brandLeft">
           <span className="brandMark" />
-          <span className="brandName">Auto-PM</span>
-          <span className="brandSuffix">Lite</span>
+          <div className="brandStack">
+            <div>
+              <span className="brandName">Auto-PM</span>
+              <span className="brandSuffix">Lite</span>
+            </div>
+            <small className="brandTagline">Desktop control surface for supervised Claude and Codex runtimes</small>
+          </div>
         </div>
         <div className="brandRight">
           <span className={`runtimeIndicator ${healthSummary.available > 0 ? "live" : ""}`}>
             <span className="indicatorDot" />
-            {healthSummary.available}/{runtimeHealth.length}
+            {healthSummary.available}/{runtimeHealth.length} runtime ready
           </span>
-          <span className="apiBadge">v{config?.apiVersion ?? "-"}</span>
+          <span className="apiBadge">api v{config?.apiVersion ?? "-"}</span>
         </div>
       </header>
 
@@ -280,7 +289,15 @@ function App() {
                   </span>
                 ) : null}
               </div>
-              <p>{taskDetail ? `${taskDetail.profileId} · ${taskDetail.model} · ${profilePermissionText(focusedProfile)} · ${taskDetail.cwd}` : config?.workspace.rootDir}</p>
+              <p>{taskDetail ? `${focusedProfileId} · ${focusedModel} · ${profilePermissionText(focusedProfile)} · ${taskDetail.cwd}` : config?.workspace.rootDir}</p>
+              {taskDetail ? (
+                <div className="heroMeta">
+                  <span>runtime {focusedRuntime}</span>
+                  <span>turns {taskDetail.turns.length}</span>
+                  <span>artifacts {taskDetail.artifacts.length}</span>
+                  <span>{budgetSummary.tokens} tokens</span>
+                </div>
+              ) : null}
             </div>
           </div>
 
@@ -419,7 +436,7 @@ function App() {
               <button type="button" className="childRow" key={child.id} onClick={() => setSelectedTaskId(child.id)}>
                 <span className={`statusDot ${child.status}`} />
                 <span>{child.name ?? child.id.slice(0, 8)}</span>
-                <small>{child.runtime}</small>
+                <small>{child.currentSession?.runtime ?? child.defaultRuntime}</small>
               </button>
             ))}
             {selectedChildren.length === 0 ? <div className="empty">No child tasks</div> : null}
@@ -604,12 +621,12 @@ function TaskTreeItem(props: {
       <button
         type="button"
         className={`taskRow ${props.node.task.id === props.selectedTaskId ? "selected" : ""}`}
-        style={{ paddingLeft: 14 + depth * 16 }}
+        style={{ paddingLeft: 16 + depth * 18 }}
         onClick={() => props.onSelect(props.node.task.id)}
       >
         <span className={`statusDot ${props.node.task.status}`} />
         <span className="taskName">{props.node.task.name ?? props.node.task.id.slice(0, 8)}</span>
-        <span className="taskRuntime">{props.node.task.runtime} · {props.node.task.model}</span>
+        <span className="taskRuntime">{props.node.task.currentSession?.runtime ?? props.node.task.defaultRuntime} · {props.node.task.currentSession?.model ?? props.node.task.defaultModel}</span>
       </button>
       {props.node.children.map((child) => (
         <TaskTreeItem

@@ -316,7 +316,10 @@ function normalizeAssistantFinal(input: {
   ts: string;
 }): CanonicalEvent[] {
   const content = Array.isArray(input.message.message.content) ? input.message.message.content : [];
-  const events: CanonicalEvent[] = [];
+  const assistantMessageId = stringValue(input.message.message.id) || stringValue(input.message.uuid);
+  const events: CanonicalEvent[] = assistantMessageId
+    ? [{ kind: "turn.assistant_message_mapped", turnId: input.turnId, assistantMessageId }]
+    : [];
   content.forEach((block, index) => {
     if (!isRecord(block) || typeof block.type !== "string") {
       return;

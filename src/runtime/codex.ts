@@ -5,7 +5,7 @@ import { isLocalSecretRef, sourceEnvAuthMode } from "../orchestrator/secrets.js"
 import { createCodexMcpServerConfig } from "../mcp/codex-binding.js";
 import { BaseRuntimeAdapter, type RuntimeDependencies } from "./base.js";
 import { getRuntimeEnvKey } from "./env.js";
-import type { ResumeRuntimeTaskInput, RunTurnInput, RuntimeAdapter, RuntimeAdapterOutput, RuntimeTaskHandle, StartRuntimeTaskInput } from "./adapter.js";
+import type { ResumeRuntimeTaskInput, RunTurnInput, RuntimeAdapter, RuntimeAdapterOutput, RuntimeSessionControlInput, RuntimeTaskHandle, StartRuntimeTaskInput } from "./adapter.js";
 import { createCodexV2NormalizerState, normalizeCodexEventV2 } from "./normalize/codex-v2.js";
 
 type CodexConfigPrimitive = string | number | boolean;
@@ -97,23 +97,24 @@ export class CodexRuntimeAdapter extends BaseRuntimeAdapter implements RuntimeAd
     };
   }
 
-  async cancelTask(sessionId: string): Promise<void> {
-    this.writeRuntimeLog(`runtime.task.cancel runtime=codex sessionId=${sessionId}`);
-    const controller = this.abortControllers.get(sessionId);
+  async interruptSession(input: RuntimeSessionControlInput): Promise<void> {
+    this.writeRuntimeLog(`runtime.session.interrupt runtime=codex sessionId=${input.sessionId} backendThreadId=${input.backendThreadId ?? ""}`);
+    const controller = this.abortControllers.get(input.sessionId);
     if (controller) {
       controller.abort();
-      this.abortControllers.delete(sessionId);
+      this.abortControllers.delete(input.sessionId);
     }
   }
 
-  async pauseTask(sessionId: string): Promise<void> {
-    this.writeRuntimeLog(`runtime.task.pause runtime=codex sessionId=${sessionId}`);
-    await this.cancelTask(sessionId);
+  async pauseSession(input: RuntimeSessionControlInput): Promise<void> {
+    this.writeRuntimeLog(`runtime.session.pause runtime=codex sessionId=${input.sessionId} backendThreadId=${input.backendThreadId ?? ""}`);
+    await this.interruptSession(input);
   }
 
-  async closeTask(sessionId: string): Promise<void> {
-    this.abortControllers.delete(sessionId);
-    this.threads.delete(sessionId);
+  async closeSession(input: RuntimeSessionControlInput): Promise<void> {
+    this.writeRuntimeLog(`runtime.session.close runtime=codex sessionId=${input.sessionId} backendThreadId=${input.backendThreadId ?? ""}`);
+    this.abortControllers.delete(input.sessionId);
+    this.threads.delete(input.sessionId);
   }
 
   private async buildCodexOptions(accountId: string, taskId: string, cwd?: string): Promise<CodexOptions> {

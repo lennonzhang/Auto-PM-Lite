@@ -6,7 +6,7 @@ import { loadConfig } from "../../src/core/config.js";
 import { AppDatabase } from "../../src/storage/db.js";
 import { Orchestrator } from "../../src/orchestrator/orchestrator.js";
 import { WorkspaceManager } from "../../src/orchestrator/workspace.js";
-import type { RuntimeAdapter, RuntimeAdapterOutput, RuntimeTaskHandle, RunTurnInput, StartRuntimeTaskInput, ResumeRuntimeTaskInput } from "../../src/runtime/adapter.js";
+import type { RuntimeAdapter, RuntimeAdapterOutput, RuntimeSessionControlInput, RuntimeTaskHandle, RunTurnInput, StartRuntimeTaskInput, ResumeRuntimeTaskInput } from "../../src/runtime/adapter.js";
 import { fileChanged, messageCompleted, turnCompleted, turnStarted } from "../helpers/v2-runtime.js";
 
 const tempPaths: string[] = [];
@@ -53,15 +53,15 @@ class FakeRuntimeAdapter implements RuntimeAdapter {
     };
   }
 
-  async cancelTask(_taskId: string): Promise<void> {
+  async interruptSession(_input: RuntimeSessionControlInput): Promise<void> {
     this.cancelCalls += 1;
   }
 
-  async pauseTask(_taskId: string): Promise<void> {
+  async pauseSession(_input: RuntimeSessionControlInput): Promise<void> {
     this.cancelCalls += 1;
   }
 
-  async closeTask(_taskId: string): Promise<void> {}
+  async closeSession(_input: RuntimeSessionControlInput): Promise<void> {}
 }
 
 class FakeCodexRuntimeAdapter extends FakeRuntimeAdapter {
@@ -239,7 +239,7 @@ claude_permission_mode = "dontAsk"
         name: "runtime-check",
       });
 
-      await orchestrator.runTask({
+      await orchestrator.sendTurn({
         taskId: task.id,
         prompt: "hello",
       });
@@ -333,7 +333,7 @@ claude_permission_mode = "dontAsk"
         cwd: root,
         name: "approval-check",
       });
-      await orchestrator.runTask({ taskId: task.id, prompt: "seed" });
+      await orchestrator.sendTurn({ taskId: task.id, prompt: "seed" });
       const session = db.getCurrentSession(task.id);
       if (!session) {
         throw new Error("missing session");
@@ -464,7 +464,7 @@ codex_network_access_enabled = false
       const childTaskId = delegated.childTaskId!;
       const childTask = orchestrator.getTask(childTaskId);
       expect(childTask?.parentTaskId).toBe(parent.id);
-      expect(childTask?.runtime).toBe("codex");
+      expect(childTask?.defaultRuntime).toBe("codex");
       expect(childTask?.cwd).toBe(parent.cwd);
       expect(childTask?.status).toBe("idle");
       expect(delegated.finalResponse).toBe("echo:review this");
@@ -565,7 +565,7 @@ codex_network_access_enabled = false
       expect(result.status).toBe("awaiting_approval");
       expect(result.approvalId).toBeDefined();
       expect(orchestrator.listApprovals(parent.id)).toHaveLength(1);
-      expect(orchestrator.listTasks().filter((task) => task.runtime === "codex")).toHaveLength(0);
+      expect(orchestrator.listTasks().filter((task) => task.defaultRuntime === "codex")).toHaveLength(0);
     } finally {
       await orchestrator.close();
     }

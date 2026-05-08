@@ -3,7 +3,7 @@ import { createClaudeMcpServer } from "../mcp/claude-binding.js";
 import { AutoPmMcpService } from "../mcp/auto-pm-service.js";
 import { allowedClaudeTools, classifyClaudeTool, isClaudeEditTool } from "../orchestrator/policy.js";
 import { BaseRuntimeAdapter, type RuntimeDependencies } from "./base.js";
-import type { ForkRuntimeSessionInput, ForkRuntimeSessionResult, ResumeRuntimeTaskInput, RunTurnInput, RuntimeAdapter, RuntimeAdapterOutput, RuntimeTaskHandle, StartRuntimeTaskInput } from "./adapter.js";
+import type { ForkRuntimeSessionInput, ForkRuntimeSessionResult, ResumeRuntimeTaskInput, RunTurnInput, RuntimeAdapter, RuntimeAdapterOutput, RuntimeSessionControlInput, RuntimeTaskHandle, StartRuntimeTaskInput } from "./adapter.js";
 import { createClaudeV2NormalizerState, normalizeClaudeMessageV2 } from "./normalize/claude-v2.js";
 
 export interface ClaudeRuntimeDependencies extends RuntimeDependencies {
@@ -121,23 +121,24 @@ export class ClaudeRuntimeAdapter extends BaseRuntimeAdapter implements RuntimeA
     };
   }
 
-  async cancelTask(sessionId: string): Promise<void> {
-    this.writeRuntimeLog(`runtime.task.cancel runtime=claude sessionId=${sessionId}`);
-    const session = this.sessions.get(sessionId);
+  async interruptSession(input: RuntimeSessionControlInput): Promise<void> {
+    this.writeRuntimeLog(`runtime.session.interrupt runtime=claude sessionId=${input.sessionId} backendThreadId=${input.backendThreadId ?? ""}`);
+    const session = this.sessions.get(input.sessionId);
     if (session) {
       await session.interrupt();
-      this.sessions.delete(sessionId);
+      this.sessions.delete(input.sessionId);
     }
   }
 
-  async pauseTask(sessionId: string): Promise<void> {
-    this.writeRuntimeLog(`runtime.task.pause runtime=claude sessionId=${sessionId}`);
-    await this.cancelTask(sessionId);
+  async pauseSession(input: RuntimeSessionControlInput): Promise<void> {
+    this.writeRuntimeLog(`runtime.session.pause runtime=claude sessionId=${input.sessionId} backendThreadId=${input.backendThreadId ?? ""}`);
+    await this.interruptSession(input);
   }
 
-  async closeTask(sessionId: string): Promise<void> {
-    this.sessions.delete(sessionId);
-    this.resumeIds.delete(sessionId);
+  async closeSession(input: RuntimeSessionControlInput): Promise<void> {
+    this.writeRuntimeLog(`runtime.session.close runtime=claude sessionId=${input.sessionId} backendThreadId=${input.backendThreadId ?? ""}`);
+    this.sessions.delete(input.sessionId);
+    this.resumeIds.delete(input.sessionId);
   }
 }
 

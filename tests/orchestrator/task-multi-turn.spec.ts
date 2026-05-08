@@ -5,8 +5,8 @@ import { afterEach, describe, expect, it } from "vitest";
 import { loadConfig } from "../../src/core/config.js";
 import { AppDatabase } from "../../src/storage/db.js";
 import { Orchestrator } from "../../src/orchestrator/orchestrator.js";
-import type { ForkRuntimeSessionInput, ForkRuntimeSessionResult, ResumeRuntimeTaskInput, RunTurnInput, RuntimeAdapter, RuntimeAdapterOutput, RuntimeTaskHandle, StartRuntimeTaskInput } from "../../src/runtime/adapter.js";
-import { messageCompleted, turnCompleted, turnStarted } from "../helpers/v2-runtime.js";
+import type { ForkRuntimeSessionInput, ForkRuntimeSessionResult, ResumeRuntimeTaskInput, RunTurnInput, RuntimeAdapter, RuntimeAdapterOutput, RuntimeSessionControlInput, RuntimeTaskHandle, StartRuntimeTaskInput } from "../../src/runtime/adapter.js";
+import { fileChanged, messageCompleted, turnCompleted, turnStarted } from "../helpers/v2-runtime.js";
 
 const tempPaths: string[] = [];
 
@@ -20,6 +20,7 @@ class MultiTurnRuntime implements RuntimeAdapter {
   readonly forks: ForkRuntimeSessionInput[] = [];
   delayMs = 0;
   failNextTurn = false;
+  fileChanges: Array<{ path: string; changeKind: "create" | "modify" | "delete"; binary: boolean }> = [];
 
   constructor(runtime: RuntimeAdapter["runtime"] = "claude") {
     this.runtime = runtime;
@@ -42,6 +43,9 @@ class MultiTurnRuntime implements RuntimeAdapter {
       throw new Error("runtime exploded");
     }
     yield messageCompleted(input, `reply:${input.prompt}`, ts);
+    for (const change of this.fileChanges) {
+      yield fileChanged(input, change, ts);
+    }
     yield turnCompleted(input, { inputTokens: 1, outputTokens: 1 }, ts);
   }
 
@@ -55,16 +59,16 @@ class MultiTurnRuntime implements RuntimeAdapter {
     return { backendThreadId: `forked-${input.targetSessionId}`, forkKind: "native" };
   }
 
-  async pauseTask(sessionId: string): Promise<void> {
-    this.cancels.push(sessionId);
+  async pauseSession(input: RuntimeSessionControlInput): Promise<void> {
+    this.cancels.push(input.sessionId);
   }
 
-  async cancelTask(sessionId: string): Promise<void> {
-    this.cancels.push(sessionId);
+  async interruptSession(input: RuntimeSessionControlInput): Promise<void> {
+    this.cancels.push(input.sessionId);
   }
 
-  async closeTask(sessionId: string): Promise<void> {
-    this.closes.push(sessionId);
+  async closeSession(input: RuntimeSessionControlInput): Promise<void> {
+    this.closes.push(input.sessionId);
   }
 }
 
@@ -166,6 +170,10 @@ describe("task multi-turn lifecycle", () => {
       expect(sessions).toHaveLength(2);
       expect(sessions.find((session) => session.id === sourceSession?.id)?.closeReason).toBe("handoff");
       expect(db.getCurrentSession(task.id)?.runtime).toBe("codex");
+      const detail = orchestrator.getTask(task.id);
+      const summary = orchestrator.listTasks().find((entry) => entry.id === task.id);
+      expect(detail?.defaultRuntime).toBe("claude");
+      expect(summary?.currentSession?.runtime).toBe("codex");
       expect(db.getTask(task.id)?.status).toBe("idle");
       expect(db.listTaskEvents({ taskId: task.id }).map((row) => row.event.kind)).toEqual(expect.arrayContaining([
         "task.handoff_started",
@@ -263,6 +271,51 @@ describe("task multi-turn lifecycle", () => {
     }
   });
 
+  it("passes Claude assistant message UUID when forking from a specific turn", async () => {
+    const claude = new MultiTurnRuntime("claude");
+    const { db, orchestrator, root } = await buildEnv({ claude });
+    try {
+      const task = await orchestrator.createTask({ profileId: "claude_main", cwd: root, name: "mapped fork" });
+      await orchestrator.sendTurn({ taskId: task.id, prompt: "seed" });
+      const turn = db.getLatestTurn(task.id);
+      expect(turn).toBeDefined();
+      db.upsertTurnAssistantMessage({
+        turnId: turn!.id,
+        assistantMessageId: "assistant-uuid-1",
+        createdAt: new Date().toISOString(),
+      });
+
+      await orchestrator.forkTask({ taskId: task.id, fromTurnId: turn!.id });
+
+      expect(claude.forks[0]?.upToMessageId).toBe("assistant-uuid-1");
+    } finally {
+      await orchestrator.close();
+    }
+  });
+
+  it("recovers stale cancelling tasks to interrupted and closes active sessions", async () => {
+    const { db, orchestrator, runtime, root } = await buildEnv();
+    try {
+      const task = await orchestrator.createTask({ profileId: "claude_main", cwd: root, name: "recover cancel" });
+      await orchestrator.sendTurn({ taskId: task.id, prompt: "seed" });
+      const sessionId = db.getCurrentSession(task.id)?.id;
+      db.updateTaskRuntimeState({
+        taskId: task.id,
+        status: "cancelling",
+        updatedAt: new Date().toISOString(),
+      });
+
+      const recovered = await orchestrator.recoverStaleRunningTasks();
+
+      expect(recovered.recoveredTaskIds).toEqual([task.id]);
+      expect(db.getTask(task.id)?.status).toBe("interrupted");
+      expect(db.getRuntimeSession(sessionId ?? "")?.closeReason).toBe("cancelled");
+      expect(runtime.closes).toContain(sessionId);
+    } finally {
+      await orchestrator.close();
+    }
+  });
+
   it("fork mode session records a non-active branch without replacing current session", async () => {
     const { db, orchestrator, root } = await buildEnv();
     try {
@@ -293,6 +346,45 @@ describe("task multi-turn lifecycle", () => {
         reason: "manual",
         carryOverPrompt: "x".repeat(9000),
       })).rejects.toMatchObject({ code: "continuation_context_too_large" });
+    } finally {
+      await orchestrator.close();
+    }
+  });
+
+  it("builds deterministic continuation context fields and orders modified files by recency", async () => {
+    const claude = new MultiTurnRuntime("claude");
+    const codex = new MultiTurnRuntime("codex");
+    const { db, orchestrator, root } = await buildEnv({ claude, codex });
+    try {
+      const task = await orchestrator.createTask({ profileId: "claude_main", cwd: root, name: "context" });
+      claude.fileChanges = [
+        { path: "older-long-name.txt", changeKind: "modify", binary: false },
+      ];
+      await orchestrator.sendTurn({ taskId: task.id, prompt: "seed" });
+      const olderTs = new Date(Date.now() - 60_000).toISOString();
+      db.insertFileChange({
+        taskId: task.id,
+        workspaceId: task.workspaceId,
+        path: "older-long-name.txt",
+        changeKind: "modify",
+        ts: olderTs,
+      });
+      db.insertFileChange({
+        taskId: task.id,
+        workspaceId: task.workspaceId,
+        path: "new.ts",
+        changeKind: "modify",
+        ts: new Date().toISOString(),
+      });
+
+      await orchestrator.handoffTask({ taskId: task.id, targetProfileId: "codex_main", reason: "switch", prompt: "continue" });
+
+      const prompt = codex.turns[0]?.prompt ?? "";
+      expect(prompt).toContain("<pending/>");
+      expect(prompt).not.toContain("<item>continue</item>");
+      expect(prompt.match(/<user_prompt>/g)).toHaveLength(1);
+      expect(prompt).toContain("continue");
+      expect(prompt.indexOf("modify:new.ts")).toBeLessThan(prompt.indexOf("modify:older-long-name.txt"));
     } finally {
       await orchestrator.close();
     }

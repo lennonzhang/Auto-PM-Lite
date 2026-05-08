@@ -89,9 +89,10 @@ export interface TaskResultSnapshot {
   taskId: string;
   parentTaskId?: string | undefined;
   status: Task["status"];
-  runtime: Task["runtime"];
-  profileId: string;
-  model: string;
+  defaultRuntime: Task["defaultRuntime"];
+  defaultProfileId: string;
+  defaultModel: string;
+  currentSession?: RuntimeSession | undefined;
   latestMessage?: string | undefined;
   terminalError?: string | undefined;
   artifacts: StoredArtifact[];
@@ -140,13 +141,11 @@ export class Orchestrator {
     return this.config.redaction.additionalPatterns;
   }
 
-  recoverStaleRunningTasks(): { recoveredTaskIds: string[] } {
+  async recoverStaleRunningTasks(): Promise<{ recoveredTaskIds: string[] }> {
     const now = new Date().toISOString();
-    const staleTasks = [
-      ...this.db.listTasksByStatus("running"),
-      ...this.db.listTasksByStatus("cancelling"),
-    ];
-    for (const task of staleTasks) {
+    const runningTasks = this.db.listTasksByStatus("running");
+    const cancellingTasks = this.db.listTasksByStatus("cancelling");
+    for (const task of runningTasks) {
       const terminalEvent = this.db.getLatestTerminalTaskEvent(task.id);
       if (terminalEvent) {
         const status = terminalEventToTaskStatus(terminalEvent.type);
@@ -164,7 +163,10 @@ export class Orchestrator {
         updatedAt: now,
       });
     }
-    return { recoveredTaskIds: staleTasks.map((task) => task.id) };
+    for (const task of cancellingTasks) {
+      await this.convergeCancellation(task, "startup_recovery", now);
+    }
+    return { recoveredTaskIds: [...runningTasks, ...cancellingTasks].map((task) => task.id) };
   }
 
   async createTask(input: CreateTaskInput): Promise<Task> {
@@ -192,9 +194,9 @@ export class Orchestrator {
     const task: Task = {
       id: taskId,
       name: input.name,
-      profileId: profile.id,
-      runtime: profile.runtime,
-      model,
+      defaultProfileId: profile.id,
+      defaultRuntime: profile.runtime,
+      defaultModel: model,
       cwd: workspace.path,
       workspaceId: workspace.id,
       delegationDepth: 0,
@@ -211,12 +213,19 @@ export class Orchestrator {
     return task;
   }
 
-  listTasks(): ReturnType<AppDatabase["listTasks"]> {
-    return this.db.listTasks();
+  listTasks(): Array<ReturnType<AppDatabase["listTasks"]>[number] & { currentSession?: RuntimeSession | undefined }> {
+    return this.db.listTasks().map((task) => ({
+      ...task,
+      ...(this.db.getCurrentSession(task.id) ? { currentSession: this.db.getCurrentSession(task.id)! } : {}),
+    }));
   }
 
   getTask(taskId: string): ReturnType<AppDatabase["getTask"]> {
     return this.db.getTask(taskId);
+  }
+
+  getCurrentSession(taskId: string): ReturnType<AppDatabase["getCurrentSession"]> {
+    return this.db.getCurrentSession(taskId);
   }
 
   listTurns(taskId: string): ReturnType<AppDatabase["listTurns"]> {
@@ -528,7 +537,9 @@ export class Orchestrator {
 
   async delegateTask(input: DelegateTaskInput): Promise<DelegateToResult> {
     const parentTask = this.requireTask(input.parentTaskId);
-    const parentProfile = this.requireProfile(parentTask.profileId);
+    const parentSession = this.db.getCurrentSession(parentTask.id);
+    const parentRuntime = parentSession?.runtime ?? parentTask.defaultRuntime;
+    const parentProfile = this.requireProfile(parentSession?.profileId ?? parentTask.defaultProfileId);
     const parentPolicy = this.requirePolicy(parentProfile.policyId);
 
     if (!parentPolicy.allowCrossHarnessDelegation) {
@@ -537,11 +548,11 @@ export class Orchestrator {
 
     let targetProfile;
     try {
-      targetProfile = resolveDelegationTargetProfile(this.config, parentTask, input);
+      targetProfile = resolveDelegationTargetProfile(this.config, parentRuntime, input);
     } catch (error) {
       return { status: "failed", message: error instanceof Error ? error.message : String(error) };
     }
-    if (targetProfile.runtime === parentTask.runtime) {
+    if (targetProfile.runtime === parentRuntime) {
       return deniedDelegation("cross_harness_delegation_required");
     }
 
@@ -567,7 +578,7 @@ export class Orchestrator {
     }
 
     const lineage = this.getTaskLineage(parentTask);
-    if (wouldCreateDelegationCycle(lineage, targetProfile)) {
+    if (wouldCreateDelegationCycle(lineage, targetProfile, (taskId) => this.db.listRuntimeSessions(taskId))) {
       return { status: "cycle_detected", denialCode: "cycle_detected", message: "cycle_detected" };
     }
 
@@ -625,9 +636,9 @@ export class Orchestrator {
     const childTask: Task = {
       id: childTaskId,
       name: `${input.taskType}:${targetProfile.runtime}`,
-      profileId: targetProfile.id,
-      runtime: targetProfile.runtime,
-      model: resolveTaskModel(targetProfile),
+      defaultProfileId: targetProfile.id,
+      defaultRuntime: targetProfile.runtime,
+      defaultModel: resolveTaskModel(targetProfile),
       cwd: workspace.path,
       workspaceId: workspace.id,
       parentTaskId: parentTask.id,
@@ -892,7 +903,7 @@ export class Orchestrator {
       if (existingTurn) {
         const existingSession = this.db.getRuntimeSession(existingTurn.sessionId);
         return {
-          forkKind: sourceTask.runtime === "claude" ? "native" : "logical",
+          forkKind: existingSession?.runtime === "claude" ? "native" : "logical",
           sourceTaskId: sourceTask.id,
           sourceSessionId: existingSession?.parentSessionId ?? existingTurn.sessionId,
           sourceTurnId: existingTurn.id,
@@ -937,31 +948,52 @@ export class Orchestrator {
           throw new AppError("runtime_capability_unavailable", "runtime_capability_unavailable");
         }
         if (input.fromTurnId) {
-          throw new AppError("fork_truncation_required", "fork_truncation_required");
+          const mapping = this.db.getTurnAssistantMessage(input.fromTurnId);
+          if (!mapping) {
+            throw new AppError("fork_truncation_required", "fork_truncation_required");
+          }
+          const result = await runtime.forkSession({
+            taskId: childTask.id,
+            sourceSessionId: sourceSession.id,
+            targetSessionId: targetSession.id,
+            profileId: sourceSession.profileId,
+            model: sourceSession.model,
+            cwd: childTask.cwd,
+            sourceBackendThreadId: sourceSession.backendThreadId,
+            upToMessageId: mapping.assistantMessageId,
+          });
+          this.db.updateRuntimeSession({
+            sessionId: targetSession.id,
+            status: mode === "task" ? "active" : "closed",
+            backendThreadId: result.backendThreadId,
+            lastUsedAt: now,
+          });
+          forkKind = result.forkKind;
+        } else {
+          const result = await runtime.forkSession({
+            taskId: childTask.id,
+            sourceSessionId: sourceSession.id,
+            targetSessionId: targetSession.id,
+            profileId: sourceSession.profileId,
+            model: sourceSession.model,
+            cwd: childTask.cwd,
+            sourceBackendThreadId: sourceSession.backendThreadId,
+          });
+          this.db.updateRuntimeSession({
+            sessionId: targetSession.id,
+            status: mode === "task" ? "active" : "closed",
+            backendThreadId: result.backendThreadId,
+            lastUsedAt: now,
+          });
+          forkKind = result.forkKind;
         }
-        const result = await runtime.forkSession({
-          taskId: childTask.id,
-          sourceSessionId: sourceSession.id,
-          targetSessionId: targetSession.id,
-          profileId: sourceSession.profileId,
-          model: sourceSession.model,
-          cwd: childTask.cwd,
-          sourceBackendThreadId: sourceSession.backendThreadId,
-        });
-      this.db.updateRuntimeSession({
-        sessionId: targetSession.id,
-        status: mode === "task" ? "active" : "closed",
-        backendThreadId: result.backendThreadId,
-        lastUsedAt: now,
-      });
-        forkKind = result.forkKind;
-      if (mode === "session") {
-        this.db.updateRuntimeSession({
-          sessionId: targetSession.id,
-          closeReason: "forked",
-          closedAt: now,
-        });
-      }
+        if (mode === "session") {
+          this.db.updateRuntimeSession({
+            sessionId: targetSession.id,
+            closeReason: "forked",
+            closedAt: now,
+          });
+        }
       }
 
       if (sourceSession.runtime === "codex") {
@@ -1169,7 +1201,7 @@ export class Orchestrator {
     }
 
     this.pauseRequests.add(task.id);
-    await runtime.pauseTask(session.id);
+    await runtime.pauseSession({ sessionId: session.id, backendThreadId: session.backendThreadId });
     await this.markTaskPaused(task);
   }
 
@@ -1194,12 +1226,16 @@ export class Orchestrator {
     });
     this.publishAndProjectTaskEvent(task, { kind: "task.cancellation_requested", taskId: task.id, ...(reason ? { reason } : {}) }, { ts: now });
 
+    await this.convergeCancellation(task, reason, now);
+  }
+
+  private async convergeCancellation(task: Task, reason: string | undefined, now = new Date().toISOString()): Promise<void> {
     const activeSessions = this.db.listRuntimeSessionsByStatus(task.id, "active");
     await Promise.allSettled(activeSessions.map(async (session) => {
       const runtime = this.runtimes[session.runtime];
       if (runtime) {
-        await runtime.cancelTask(session.id);
-        await runtime.closeTask(session.id);
+        await runtime.interruptSession({ sessionId: session.id, backendThreadId: session.backendThreadId });
+        await runtime.closeSession({ sessionId: session.id, backendThreadId: session.backendThreadId });
       }
       this.db.updateRuntimeSession({
         sessionId: session.id,
@@ -1238,7 +1274,7 @@ export class Orchestrator {
     for (const session of this.db.listRuntimeSessionsByStatus(task.id, "active")) {
       const runtime = this.runtimes[session.runtime];
       if (runtime) {
-        await runtime.closeTask(session.id);
+        await runtime.closeSession({ sessionId: session.id, backendThreadId: session.backendThreadId });
       }
       this.db.updateRuntimeSession({
         sessionId: session.id,
@@ -1408,7 +1444,7 @@ export class Orchestrator {
         return `reference_unknown:${reference.taskId}`;
       }
 
-      const targetProfile = this.config.profiles[targetTask.profileId];
+      const targetProfile = this.config.profiles[targetTask.defaultProfileId];
       const targetTrust = targetProfile
         ? policyTrustLevel(this.requirePolicy(targetProfile.policyId))
         : policyTrustLevel(input.targetPolicy);
@@ -1443,13 +1479,15 @@ export class Orchestrator {
   }
 
   private buildTaskResult(task: Task): TaskResultSnapshot {
+    const currentSession = this.db.getCurrentSession(task.id);
     return {
       taskId: task.id,
       ...(task.parentTaskId ? { parentTaskId: task.parentTaskId } : {}),
       status: task.status,
-      runtime: task.runtime,
-      profileId: task.profileId,
-      model: task.model,
+      defaultRuntime: task.defaultRuntime,
+      defaultProfileId: task.defaultProfileId,
+      defaultModel: task.defaultModel,
+      ...(currentSession ? { currentSession } : {}),
       ...(this.db.getLatestCompletedMessage(task.id) ? { latestMessage: this.db.getLatestCompletedMessage(task.id) } : {}),
       ...(this.db.getLatestTerminalError(task.id) ? { terminalError: this.db.getLatestTerminalError(task.id) } : {}),
       artifacts: this.db.listArtifacts(task.id),
@@ -1563,7 +1601,7 @@ export class Orchestrator {
       throw error;
     } finally {
       this.scheduler.recordComplete(input.task.id);
-      await runtime.closeTask(input.session.id);
+      await runtime.closeSession({ sessionId: input.session.id, backendThreadId: input.session.backendThreadId });
       this.pauseRequests.delete(input.task.id);
       this.activeTaskActions.delete(input.task.id);
     }
@@ -1775,9 +1813,9 @@ export class Orchestrator {
   private createInitialSession(task: Task, now: string): RuntimeSession {
     return this.createRuntimeSession({
       task,
-      profileId: task.profileId,
-      model: task.model,
-      runtime: task.runtime,
+      profileId: task.defaultProfileId,
+      model: task.defaultModel,
+      runtime: task.defaultRuntime,
       cwd: task.cwd,
       status: "active",
       now,
@@ -1788,7 +1826,7 @@ export class Orchestrator {
     task: Task;
     profileId: string;
     model: string;
-    runtime: Task["runtime"];
+    runtime: Task["defaultRuntime"];
     cwd: string;
     status: RuntimeSession["status"];
     now: string;
@@ -1842,6 +1880,18 @@ export class Orchestrator {
   }) {
     const workspace = this.requireWorkspace(input.task.workspaceId);
     const changes = workspace.baseRef ? this.workspaceManager.listChanges(workspace) : [];
+    const fileChanges = this.db.listFileChanges(input.task.id);
+    const changeTimes = new Map(fileChanges.map((change) => [change.path, change.ts]));
+    const changesByPath = new Map(changes.map((change) => [change.path, change]));
+    for (const fileChange of fileChanges) {
+      if (!changesByPath.has(fileChange.path)) {
+        changesByPath.set(fileChange.path, {
+          path: fileChange.path,
+          changeKind: fileChange.changeKind,
+          binary: false,
+        });
+      }
+    }
     return buildContinuationContext({
       kind: input.kind,
       task: {
@@ -1861,7 +1911,10 @@ export class Orchestrator {
       cwd: input.task.cwd,
       latestMessage: this.db.getLatestCompletedMessage(input.task.id),
       terminalError: this.db.getLatestTerminalError(input.task.id),
-      workspaceChanges: changes,
+      workspaceChanges: Array.from(changesByPath.values()).map((change) => ({
+        ...change,
+        ...(changeTimes.get(change.path) ? { ts: changeTimes.get(change.path)! } : {}),
+      })),
       handoffReason: input.handoffReason,
       rolloverReason: input.rolloverReason,
       userPrompt: input.prompt,
@@ -1871,13 +1924,13 @@ export class Orchestrator {
   private async closeRuntimeSessionHandle(session: RuntimeSession): Promise<void> {
     const runtime = this.runtimes[session.runtime];
     if (runtime) {
-      await runtime.closeTask(session.id);
+      await runtime.closeSession({ sessionId: session.id, backendThreadId: session.backendThreadId });
     }
   }
 
   private createForkChildTask(sourceTask: Task, name: string | undefined, now: string): Task {
     const childTaskId = randomUUID();
-    const profile = this.requireProfile(sourceTask.profileId);
+    const profile = this.requireProfile(sourceTask.defaultProfileId);
     const policy = this.requirePolicy(profile.policyId);
     const parentWorkspace = this.requireWorkspace(sourceTask.workspaceId);
     const inspectedParentWorkspace = {
@@ -1900,9 +1953,9 @@ export class Orchestrator {
     const childTask: Task = {
       id: childTaskId,
       name: name ?? `${sourceTask.name ?? sourceTask.id}:fork`,
-      profileId: sourceTask.profileId,
-      runtime: sourceTask.runtime,
-      model: sourceTask.model,
+      defaultProfileId: sourceTask.defaultProfileId,
+      defaultRuntime: sourceTask.defaultRuntime,
+      defaultModel: sourceTask.defaultModel,
       cwd: workspace.path,
       workspaceId: workspace.id,
       parentTaskId: sourceTask.id,
@@ -2004,7 +2057,7 @@ export class Orchestrator {
 
   private publishTaskEvent(task: Task, event: CanonicalEvent, options: PublishTaskEventOptions = {}): EventEnvelope {
     return this.eventHub.publish({
-      runtime: task.runtime,
+      runtime: this.db.getCurrentSession(task.id)?.runtime ?? task.defaultRuntime,
       taskId: task.id,
       sessionId: options.sessionId ?? this.sessionIdForTask(task),
       turnId: options.turnId,
@@ -2062,6 +2115,15 @@ export class Orchestrator {
         backendThreadId: event.backendThreadId,
         status: this.db.getRuntimeSession(event.sessionId)?.status === "opening" ? "opening" : "active",
         lastUsedAt: envelope.ts,
+      });
+      return;
+    }
+
+    if (event.kind === "turn.assistant_message_mapped") {
+      this.db.upsertTurnAssistantMessage({
+        turnId: event.turnId,
+        assistantMessageId: event.assistantMessageId,
+        createdAt: envelope.ts,
       });
       return;
     }

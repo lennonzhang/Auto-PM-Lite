@@ -112,9 +112,9 @@ describe("desktop workbench view model", () => {
       taskId: detail.id,
       parentTaskId: "parent",
       status: "awaiting_approval",
-      runtime: "claude",
-      profileId: "profile",
-      model: "claude-opus-4-7",
+      defaultRuntime: "claude",
+      defaultProfileId: "profile",
+      defaultModel: "claude-opus-4-7",
       latestMessage: "done",
       artifacts: [artifact],
       pendingApprovalIds: ["approval-1"],
@@ -132,14 +132,14 @@ describe("desktop workbench view model", () => {
   it("maps task detail results and profile model options for the desktop form", () => {
     const detail: TaskDetail = {
       ...detailTask("task-1", "active"),
-      model: "claude-sonnet-4-6",
+      defaultModel: "claude-sonnet-4-6",
       status: "interrupted" as TaskDetail["status"],
       latestMessage: "partial answer",
       terminalError: "provider unavailable",
     };
     const result = taskDetailResult(detail);
 
-    expect(result?.model).toBe("claude-sonnet-4-6");
+    expect(result?.defaultModel).toBe("claude-sonnet-4-6");
     expect(taskResultSummary(result)).toBe("interrupted: returned partial answer");
     expect(defaultModelForProfile({
       id: "claude",
@@ -185,9 +185,9 @@ function task(id: string, status: string, parentTaskId?: string): TaskSummary {
   return {
     id,
     name: null,
-    profileId: "profile",
-    runtime: "claude",
-    model: "claude-opus-4-7",
+    defaultProfileId: "profile",
+    defaultRuntime: "claude",
+    defaultModel: "claude-opus-4-7",
     status,
     cwd: "cwd",
     ...(parentTaskId ? { parentTaskId } : {}),
@@ -200,9 +200,9 @@ function task(id: string, status: string, parentTaskId?: string): TaskSummary {
 function detailTask(id: string, workspaceStatus: NonNullable<TaskDetail["workspace"]>["status"]): TaskDetail {
   return {
     id,
-    profileId: "profile",
-    runtime: "claude",
-    model: "claude-opus-4-7",
+    defaultProfileId: "profile",
+    defaultRuntime: "claude",
+    defaultModel: "claude-opus-4-7",
     cwd: "cwd",
     workspaceId: "ws",
     delegationDepth: 0,

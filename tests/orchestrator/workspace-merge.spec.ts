@@ -7,7 +7,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { AppDatabase } from "../../src/storage/db.js";
 import { Orchestrator } from "../../src/orchestrator/orchestrator.js";
 import type { AppConfig } from "../../src/core/types.js";
-import type { RuntimeAdapter, RuntimeAdapterOutput, RuntimeTaskHandle, RunTurnInput, StartRuntimeTaskInput, ResumeRuntimeTaskInput } from "../../src/runtime/adapter.js";
+import type { RuntimeAdapter, RuntimeAdapterOutput, RuntimeSessionControlInput, RuntimeTaskHandle, RunTurnInput, StartRuntimeTaskInput, ResumeRuntimeTaskInput } from "../../src/runtime/adapter.js";
 import { fileChanged, messageCompleted, turnCompleted, turnStarted } from "../helpers/v2-runtime.js";
 
 const tempPaths: string[] = [];
@@ -30,9 +30,9 @@ class FakeRuntime implements RuntimeAdapter {
     return { taskId: input.taskId, sessionId: input.sessionId, backendThreadId: input.backendThreadId };
   }
 
-  async pauseTask(_taskId: string): Promise<void> {}
-  async cancelTask(_taskId: string): Promise<void> {}
-  async closeTask(_taskId: string): Promise<void> {}
+  async pauseSession(_input: RuntimeSessionControlInput): Promise<void> {}
+  async interruptSession(_input: RuntimeSessionControlInput): Promise<void> {}
+  async closeSession(_input: RuntimeSessionControlInput): Promise<void> {}
 }
 
 afterEach(async () => {
@@ -88,7 +88,14 @@ describe("workspace merge lifecycle", () => {
         "workspace.merged",
       ]));
       const migrations = db.db.prepare(`SELECT id FROM schema_migrations ORDER BY id`).all() as Array<{ id: string }>;
-      expect(migrations.map((row) => row.id)).toEqual(["001_initial", "002_workspace_lifecycle", "003_task_model", "004_runtime_sessions"]);
+      expect(migrations.map((row) => row.id)).toEqual([
+        "001_initial",
+        "002_workspace_lifecycle",
+        "003_task_model",
+        "004_runtime_sessions",
+        "005_task_defaults",
+        "006_turn_assistant_messages",
+      ]);
     } finally {
       await orchestrator.close();
     }

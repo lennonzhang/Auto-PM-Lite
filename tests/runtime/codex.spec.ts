@@ -148,6 +148,23 @@ describe("CodexRuntimeAdapter", () => {
     ]);
   });
 
+  it("normalizes thread.started so orchestrator can backfill an initially null thread id", async () => {
+    const adapter = buildAdapterWithThread(fakeThread([
+      threadStarted("thread-from-event"),
+      turnStarted(),
+      turnCompleted(),
+    ], undefined));
+
+    const outputs = await collectRunTurn(adapter);
+    const events = outputs.flatMap(outputEvents);
+
+    expect(events[0]).toEqual({
+      kind: "session.backend_thread",
+      sessionId: "session-1",
+      backendThreadId: "thread-from-event",
+    });
+  });
+
   it("does not ignore Windows taskkill parse noise before a Codex turn terminal event", async () => {
     const adapter = buildAdapterWithThread(fakeThread([
       turnStarted(),
@@ -255,9 +272,9 @@ interface FakeThread {
   runStreamed(prompt: string, options: { signal: AbortSignal }): Promise<{ events: AsyncIterable<ThreadEvent> }>;
 }
 
-function fakeThread(events: Array<ThreadEvent | Error>): FakeThread {
+function fakeThread(events: Array<ThreadEvent | Error>, id: string | undefined = "thread-1"): FakeThread {
   return {
-    id: "thread-1",
+    ...(id ? { id } : {}),
     async runStreamed() {
       return {
         events: fakeEventStream(events),
@@ -277,6 +294,10 @@ async function* fakeEventStream(events: Array<ThreadEvent | Error>): AsyncIterab
 
 function turnStarted(): ThreadEvent {
   return { type: "turn.started" };
+}
+
+function threadStarted(threadId: string): ThreadEvent {
+  return { type: "thread.started", thread_id: threadId };
 }
 
 function turnCompleted(): ThreadEvent {

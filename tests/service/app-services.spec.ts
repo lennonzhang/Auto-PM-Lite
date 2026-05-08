@@ -25,7 +25,7 @@ import {
   workspaceMergeResultSchema,
 } from "../../src/api/schemas.js";
 import type { AppConfig } from "../../src/core/types.js";
-import type { RuntimeAdapter, RuntimeAdapterOutput, RuntimeTaskHandle, RunTurnInput, StartRuntimeTaskInput, ResumeRuntimeTaskInput } from "../../src/runtime/adapter.js";
+import type { RuntimeAdapter, RuntimeAdapterOutput, RuntimeSessionControlInput, RuntimeTaskHandle, RunTurnInput, StartRuntimeTaskInput, ResumeRuntimeTaskInput } from "../../src/runtime/adapter.js";
 import { fileChanged, messageCompleted, turnCompleted, turnStarted } from "../helpers/v2-runtime.js";
 
 const tempPaths: string[] = [];
@@ -55,9 +55,9 @@ class FakeRuntime implements RuntimeAdapter {
     return { taskId: input.taskId, sessionId: input.sessionId, backendThreadId: input.backendThreadId };
   }
 
-  async pauseTask(_taskId: string): Promise<void> {}
-  async cancelTask(_taskId: string): Promise<void> {}
-  async closeTask(_taskId: string): Promise<void> {}
+  async pauseSession(_input: RuntimeSessionControlInput): Promise<void> {}
+  async interruptSession(_input: RuntimeSessionControlInput): Promise<void> {}
+  async closeSession(_input: RuntimeSessionControlInput): Promise<void> {}
 }
 
 afterEach(async () => {
@@ -81,7 +81,7 @@ describe("AppServices", () => {
       });
 
       expect(taskDetailSchema.parse(task).id).toBe(task.id);
-      expect(task.model).toBe("claude-opus-4-7");
+      expect(task.defaultModel).toBe("claude-opus-4-7");
       expect(task.workspace).toBeDefined();
       expect(task.turns).toEqual([]);
       expect(services.tasks.listTasks()).toHaveLength(1);
@@ -106,8 +106,8 @@ describe("AppServices", () => {
         model: "claude-sonnet-4-6",
       });
 
-      expect(task.model).toBe("claude-sonnet-4-6");
-      await services.tasks.runTask({ taskId: task.id, prompt: "selected model" });
+      expect(task.defaultModel).toBe("claude-sonnet-4-6");
+      await services.tasks.sendTurn({ taskId: task.id, prompt: "selected model" });
 
       expect(runtimes.claude.started[0]?.model).toBe("claude-sonnet-4-6");
       expect(runtimes.claude.turns[0]?.model).toBe("claude-sonnet-4-6");
@@ -146,7 +146,7 @@ describe("AppServices", () => {
         cwd: services.config.getMetadata().workspace.rootDir,
       });
 
-      await expect(services.tasks.runTask({ taskId: task.id, prompt: "go" })).rejects.toMatchObject({
+      await expect(services.tasks.sendTurn({ taskId: task.id, prompt: "go" })).rejects.toMatchObject({
         code: "runtime_unavailable",
       });
     } finally {
@@ -411,7 +411,7 @@ CODEX__AUTO_CODE_VIP__KEY__CX_PRO=sk-codex
         updatedAt: new Date().toISOString(),
       });
 
-      const recovered = services.orchestrator.recoverStaleRunningTasks();
+      const recovered = await services.orchestrator.recoverStaleRunningTasks();
       expect(recovered.recoveredTaskIds).toEqual([task.id]);
       expect(services.tasks.getTask(task.id).status).toBe("reconcile_required");
     } finally {
@@ -484,7 +484,7 @@ CODEX__AUTO_CODE_VIP__KEY__CX_PRO=sk-codex
         profileId: "claude_main",
         cwd: services.config.getMetadata().workspace.rootDir,
       });
-      await services.tasks.runTask({ taskId: task.id, prompt: "debug event" });
+      await services.tasks.sendTurn({ taskId: task.id, prompt: "debug event" });
 
       const debug = services.events.listEvents({ sinceGlobalSeq: 0, taskId: task.id, kind: "item.completed" });
       expect(debug.events.some((event) => event.event.kind === "item.completed")).toBe(true);

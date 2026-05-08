@@ -91,8 +91,10 @@ export class TaskService {
       throw new Error(`Unknown task: ${taskId}`);
     }
     const workspace = this.orchestrator.getWorkspace(task.workspaceId);
+    const currentSession = this.orchestrator.getCurrentSession(task.id);
     return {
       ...task,
+      ...(currentSession ? { currentSession } : {}),
       turns: this.orchestrator.listTurns(task.id),
       artifacts: this.orchestrator.listArtifacts(task.id),
       ...(this.orchestrator.getLatestCompletedMessage(task.id) ? { latestMessage: this.orchestrator.getLatestCompletedMessage(task.id) } : {}),
@@ -440,9 +442,11 @@ export class RuntimeService {
     if (!task) {
       throw new AppError("task_not_found", `Unknown task: ${taskId}`);
     }
-    const profile = this.config.profiles[task.profileId];
+    const session = this.orchestrator?.getCurrentSession(task.id);
+    const profileId = session?.profileId ?? task.defaultProfileId;
+    const profile = this.config.profiles[profileId];
     if (!profile) {
-      throw new AppError("runtime_unavailable", `Task profile is missing: ${task.profileId}`);
+      throw new AppError("runtime_unavailable", `Task profile is missing: ${profileId}`);
     }
     const account = this.config.accounts[profile.accountId];
     if (!account) {
@@ -614,7 +618,7 @@ export async function openAppServices(configPath: string, options: AppServicesOp
     codex,
   });
   orchestrator.syncConfig();
-  orchestrator.recoverStaleRunningTasks();
+  await orchestrator.recoverStaleRunningTasks();
   return createAppServicesWithRuntimeEnv(config, orchestrator, sourceEnv, launcherEnv, options);
 }
 
