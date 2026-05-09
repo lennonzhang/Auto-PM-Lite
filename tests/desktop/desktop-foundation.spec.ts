@@ -2,14 +2,15 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { describe, expect, it } from "vitest";
+import { describe, expect, expectTypeOf, it } from "vitest";
 import { ensureDefaultConfig } from "../../src/service/app-services.js";
-import { ipcChannels } from "../../src/desktop/shared/ipc.js";
+import { ipcChannels, type DesktopApi } from "../../src/desktop/shared/ipc.js";
 import { loadConfig } from "../../src/core/config.js";
 import { registerIpcHandlers } from "../../src/desktop/main/ipc-handlers.js";
+import { DesktopJobRunner } from "../../src/desktop/main/job-runner.js";
 import { initializeDesktopLogging, resolveDesktopLogPaths } from "../../src/desktop/main/logging.js";
 import type { AppServices } from "../../src/service/app-services.js";
-import type { ConfigMetadata, ErrorEnvelope, EventEnvelope } from "../../src/api/types.js";
+import { AppError, type ConfigMetadata, type ErrorEnvelope, type EventEnvelope, type TaskActionAccepted } from "../../src/api/types.js";
 import type { IpcMain, IpcMainInvokeEvent } from "electron";
 
 describe("desktop foundation", () => {
@@ -137,6 +138,13 @@ claude_permission_mode = "dontAsk"
     ]));
     expect(Object.values(ipcChannels).some((channel) => channel.includes("secret"))).toBe(false);
     expect(Object.values(ipcChannels).some((channel) => channel.includes("env"))).toBe(false);
+  });
+
+  it("types long-running desktop actions as accepted acknowledgements", () => {
+    expectTypeOf<Awaited<ReturnType<DesktopApi["closeTask"]>>>().toEqualTypeOf<TaskActionAccepted>();
+    expectTypeOf<Awaited<ReturnType<DesktopApi["handoffTask"]>>>().toEqualTypeOf<TaskActionAccepted>();
+    expectTypeOf<Awaited<ReturnType<DesktopApi["forkTask"]>>>().toEqualTypeOf<TaskActionAccepted>();
+    expectTypeOf<Awaited<ReturnType<DesktopApi["rolloverSession"]>>>().toEqualTypeOf<TaskActionAccepted>();
   });
 
   it("keeps desktop dev script launching the full Electron app", async () => {
@@ -515,6 +523,179 @@ claude_permission_mode = "dontAsk"
     expect(accepted).toMatchObject({ ok: true, accepted: true, taskId: "task-1", action: "pause" });
     await new Promise((resolve) => setTimeout(resolve, 0));
     expect(paused).toBe(true);
+  });
+
+  it("returns accepted acknowledgements for long-running desktop job runner actions", async () => {
+    const jobs = new DesktopJobRunner();
+    const calls: string[] = [];
+    const services = {
+      tasks: {
+        closeTask: async () => {
+          calls.push("close");
+          return { ok: true, taskId: "task-1", closed: true };
+        },
+        handoffTask: async () => {
+          calls.push("handoff");
+          return { ok: true, taskId: "task-1", handoff: true };
+        },
+        forkTask: async () => {
+          calls.push("fork");
+          return {
+            forkKind: "logical",
+            sourceTaskId: "task-1",
+            sourceSessionId: "session-1",
+            sourceTurnId: "turn-1",
+            childTaskId: "task-child",
+            childSessionId: "session-child",
+          };
+        },
+        rolloverSession: async () => {
+          calls.push("rollover");
+          return { ok: true, taskId: "task-1", rollover: true };
+        },
+      },
+      runtime: {
+        assertProfileAvailable: () => {},
+      },
+    } as unknown as AppServices;
+
+    const accepted = [
+      jobs.acceptClose(services, { taskId: "task-1", summary: "done" }),
+      jobs.acceptHandoff(services, { taskId: "task-1", targetProfileId: "codex_main", reason: "switch" }),
+      jobs.acceptFork(services, { taskId: "task-1", mode: "task" }),
+      jobs.acceptRollover(services, { taskId: "task-1", reason: "manual" }),
+    ];
+
+    expect(accepted).toEqual([
+      expect.objectContaining({ ok: true, accepted: true, taskId: "task-1", action: "close", actionId: expect.any(String) }),
+      expect.objectContaining({ ok: true, accepted: true, taskId: "task-1", action: "handoff", actionId: expect.any(String) }),
+      expect.objectContaining({ ok: true, accepted: true, taskId: "task-1", action: "fork", actionId: expect.any(String) }),
+      expect.objectContaining({ ok: true, accepted: true, taskId: "task-1", action: "rollover", actionId: expect.any(String) }),
+    ]);
+    for (const entry of accepted) {
+      expect(entry).not.toHaveProperty("closed");
+      expect(entry).not.toHaveProperty("handoff");
+      expect(entry).not.toHaveProperty("rollover");
+      expect(entry).not.toHaveProperty("childTaskId");
+      expect(entry).not.toHaveProperty("childSessionId");
+    }
+
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(calls.sort()).toEqual(["close", "fork", "handoff", "rollover"]);
+  });
+
+  it("routes long-running desktop IPC actions through accepted acknowledgements", async () => {
+    const handlers = new Map<string, Parameters<Pick<IpcMain, "handle">["handle"]>[1]>();
+    const calls: string[] = [];
+    const services = {
+      tasks: {
+        closeTask: async () => {
+          calls.push("close");
+          return { ok: true, taskId: "task-1", closed: true };
+        },
+        handoffTask: async () => {
+          calls.push("handoff");
+          return { ok: true, taskId: "task-1", handoff: true };
+        },
+        forkTask: async () => {
+          calls.push("fork");
+          return {
+            forkKind: "logical",
+            sourceTaskId: "task-1",
+            sourceSessionId: "session-1",
+            sourceTurnId: "turn-1",
+            childTaskId: "task-child",
+            childSessionId: "session-child",
+          };
+        },
+        rolloverSession: async () => {
+          calls.push("rollover");
+          return { ok: true, taskId: "task-1", rollover: true };
+        },
+      },
+      runtime: {
+        assertProfileAvailable: () => {},
+      },
+      close: async () => {},
+    } as unknown as AppServices;
+
+    registerIpcHandlers({
+      handle: (channel, handler) => {
+        handlers.set(channel, handler);
+      },
+    }, {
+      getServices: async () => services,
+      getNextSubscriptionId: () => 1,
+    });
+
+    const fakeEvent = {} as IpcMainInvokeEvent;
+    const accepted = [
+      await handlers.get(ipcChannels.tasksClose)!(fakeEvent, { taskId: "task-1", summary: "done" }),
+      await handlers.get(ipcChannels.tasksHandoff)!(fakeEvent, { taskId: "task-1", targetProfileId: "codex_main", reason: "switch" }),
+      await handlers.get(ipcChannels.tasksFork)!(fakeEvent, { taskId: "task-1", mode: "task" }),
+      await handlers.get(ipcChannels.tasksRollover)!(fakeEvent, { taskId: "task-1", reason: "manual" }),
+    ];
+
+    expect(accepted).toEqual([
+      expect.objectContaining({ ok: true, accepted: true, taskId: "task-1", action: "close", actionId: expect.any(String) }),
+      expect.objectContaining({ ok: true, accepted: true, taskId: "task-1", action: "handoff", actionId: expect.any(String) }),
+      expect.objectContaining({ ok: true, accepted: true, taskId: "task-1", action: "fork", actionId: expect.any(String) }),
+      expect.objectContaining({ ok: true, accepted: true, taskId: "task-1", action: "rollover", actionId: expect.any(String) }),
+    ]);
+    for (const entry of accepted) {
+      expect(entry).not.toHaveProperty("closed");
+      expect(entry).not.toHaveProperty("handoff");
+      expect(entry).not.toHaveProperty("rollover");
+      expect(entry).not.toHaveProperty("childTaskId");
+      expect(entry).not.toHaveProperty("childSessionId");
+    }
+
+    await new Promise((resolve) => setTimeout(resolve, 0));
+    expect(calls.sort()).toEqual(["close", "fork", "handoff", "rollover"]);
+  });
+
+  it("returns an error envelope instead of accepting when desktop action preflight fails", async () => {
+    const handlers = new Map<string, Parameters<Pick<IpcMain, "handle">["handle"]>[1]>();
+    let handoffStarted = false;
+    const services = {
+      tasks: {
+        handoffTask: async () => {
+          handoffStarted = true;
+          return { ok: true, taskId: "task-1", handoff: true };
+        },
+      },
+      runtime: {
+        assertProfileAvailable: () => {
+          throw new AppError("runtime_unavailable", "runtime unavailable");
+        },
+      },
+      close: async () => {},
+    } as unknown as AppServices;
+
+    registerIpcHandlers({
+      handle: (channel, handler) => {
+        handlers.set(channel, handler);
+      },
+    }, {
+      getServices: async () => services,
+      getNextSubscriptionId: () => 1,
+    });
+
+    const result = await handlers.get(ipcChannels.tasksHandoff)!({} as IpcMainInvokeEvent, {
+      taskId: "task-1",
+      targetProfileId: "missing_profile",
+      reason: "switch",
+    });
+
+    expect(result).toMatchObject({
+      apiVersion: 1,
+      error: {
+        code: "runtime_unavailable",
+        message: "runtime unavailable",
+      },
+    });
+    expect(result).not.toHaveProperty("accepted");
+    expect(handoffStarted).toBe(false);
   });
 
   it("keeps renderer source isolated from Node, Electron, services, and runtime imports", async () => {

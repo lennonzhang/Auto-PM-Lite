@@ -5,7 +5,7 @@ import { isLocalSecretRef, sourceEnvAuthMode } from "../orchestrator/secrets.js"
 import { createCodexMcpServerConfig } from "../mcp/codex-binding.js";
 import { BaseRuntimeAdapter, type RuntimeDependencies } from "./base.js";
 import { getRuntimeEnvKey } from "./env.js";
-import type { ResumeRuntimeTaskInput, RunTurnInput, RuntimeAdapter, RuntimeAdapterOutput, RuntimeSessionControlInput, RuntimeTaskHandle, StartRuntimeTaskInput } from "./adapter.js";
+import type { OpenRuntimeSessionInput, RunTurnInput, RuntimeAdapter, RuntimeAdapterOutput, RuntimeSessionControlInput, RuntimeTaskHandle } from "./adapter.js";
 import { createCodexV2NormalizerState, normalizeCodexEventV2 } from "./normalize/codex-v2.js";
 
 type CodexConfigPrimitive = string | number | boolean;
@@ -21,21 +21,31 @@ export class CodexRuntimeAdapter extends BaseRuntimeAdapter implements RuntimeAd
     super(deps);
   }
 
-  async startTask(input: StartRuntimeTaskInput): Promise<RuntimeTaskHandle> {
-    this.writeRuntimeLog(`runtime.task.start runtime=codex taskId=${input.taskId} profileId=${input.profileId}`);
+  async openSession(input: OpenRuntimeSessionInput): Promise<RuntimeTaskHandle> {
+    this.writeRuntimeLog(`runtime.session.open runtime=codex taskId=${input.taskId} sessionId=${input.sessionId} profileId=${input.profileId} backendThreadId=${input.backendThreadId ?? ""}`);
+    const existing = this.threads.get(input.sessionId);
+    if (existing) {
+      return {
+        taskId: input.taskId,
+        sessionId: input.sessionId,
+        ...(existing.id ? { backendThreadId: existing.id } : input.backendThreadId ? { backendThreadId: input.backendThreadId } : {}),
+      };
+    }
+
     const profile = this.getProfile(input.profileId);
     if (profile.runtime !== "codex") {
       throw new Error(`Profile ${profile.id} is not a Codex profile`);
     }
-    const account = this.getAccount(profile.accountId);
-    const codex = new Codex(await this.buildCodexOptions(account.id, input.taskId, input.cwd));
-    const thread = codex.startThread(this.toThreadOptions(profile, input.model, input.cwd));
+    const codex = await this.createCodexClient(profile.accountId, input.taskId, input.cwd);
+    const thread = input.backendThreadId
+      ? codex.resumeThread(input.backendThreadId, this.toThreadOptions(profile, input.model, input.cwd))
+      : codex.startThread(this.toThreadOptions(profile, input.model, input.cwd));
     this.threads.set(input.sessionId, thread);
 
     return {
       taskId: input.taskId,
       sessionId: input.sessionId,
-      ...(thread.id ? { backendThreadId: thread.id } : {}),
+      ...(thread.id ? { backendThreadId: thread.id } : input.backendThreadId ? { backendThreadId: input.backendThreadId } : {}),
     };
   }
 
@@ -79,26 +89,8 @@ export class CodexRuntimeAdapter extends BaseRuntimeAdapter implements RuntimeAd
     }
   }
 
-  async resumeTask(input: ResumeRuntimeTaskInput): Promise<RuntimeTaskHandle> {
-    this.writeRuntimeLog(`runtime.task.resume runtime=codex taskId=${input.taskId} profileId=${input.profileId}`);
-    const profile = this.getProfile(input.profileId);
-    if (profile.runtime !== "codex") {
-      throw new Error(`Profile ${profile.id} is not a Codex profile`);
-    }
-    const account = this.getAccount(profile.accountId);
-    const codex = new Codex(await this.buildCodexOptions(account.id, input.taskId, input.cwd));
-    const thread = codex.resumeThread(input.backendThreadId, this.toThreadOptions(profile, input.model, input.cwd));
-    this.threads.set(input.sessionId, thread);
-
-    return {
-      taskId: input.taskId,
-      sessionId: input.sessionId,
-      backendThreadId: input.backendThreadId,
-    };
-  }
-
-  async interruptSession(input: RuntimeSessionControlInput): Promise<void> {
-    this.writeRuntimeLog(`runtime.session.interrupt runtime=codex sessionId=${input.sessionId} backendThreadId=${input.backendThreadId ?? ""}`);
+  async interruptTurn(input: RuntimeSessionControlInput): Promise<void> {
+    this.writeRuntimeLog(`runtime.turn.interrupt runtime=codex sessionId=${input.sessionId} backendThreadId=${input.backendThreadId ?? ""}`);
     const controller = this.abortControllers.get(input.sessionId);
     if (controller) {
       controller.abort();
@@ -106,15 +98,23 @@ export class CodexRuntimeAdapter extends BaseRuntimeAdapter implements RuntimeAd
     }
   }
 
-  async pauseSession(input: RuntimeSessionControlInput): Promise<void> {
-    this.writeRuntimeLog(`runtime.session.pause runtime=codex sessionId=${input.sessionId} backendThreadId=${input.backendThreadId ?? ""}`);
-    await this.interruptSession(input);
-  }
-
-  async closeSession(input: RuntimeSessionControlInput): Promise<void> {
-    this.writeRuntimeLog(`runtime.session.close runtime=codex sessionId=${input.sessionId} backendThreadId=${input.backendThreadId ?? ""}`);
+  async terminateSession(input: RuntimeSessionControlInput): Promise<void> {
+    this.writeRuntimeLog(`runtime.session.terminate runtime=codex sessionId=${input.sessionId} backendThreadId=${input.backendThreadId ?? ""}`);
+    await this.interruptTurn(input);
     this.abortControllers.delete(input.sessionId);
     this.threads.delete(input.sessionId);
+  }
+
+  hasLiveSession(sessionId: string): boolean {
+    return this.threads.has(sessionId);
+  }
+
+  async shutdown(): Promise<void> {
+    for (const controller of this.abortControllers.values()) {
+      controller.abort();
+    }
+    this.abortControllers.clear();
+    this.threads.clear();
   }
 
   private async buildCodexOptions(accountId: string, taskId: string, cwd?: string): Promise<CodexOptions> {
@@ -156,6 +156,10 @@ export class CodexRuntimeAdapter extends BaseRuntimeAdapter implements RuntimeAd
       env,
       config,
     };
+  }
+
+  protected async createCodexClient(accountId: string, taskId: string, cwd?: string): Promise<Codex> {
+    return new Codex(await this.buildCodexOptions(accountId, taskId, cwd));
   }
 
   private toThreadOptions(profile: CodexProfile, model: string, cwd: string | undefined): ThreadOptions {

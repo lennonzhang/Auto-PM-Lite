@@ -7,7 +7,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { AppDatabase } from "../../src/storage/db.js";
 import { Orchestrator } from "../../src/orchestrator/orchestrator.js";
 import type { AppConfig } from "../../src/core/types.js";
-import type { RuntimeAdapter, RuntimeAdapterOutput, RuntimeSessionControlInput, RuntimeTaskHandle, RunTurnInput, StartRuntimeTaskInput, ResumeRuntimeTaskInput } from "../../src/runtime/adapter.js";
+import type { RuntimeAdapter, RuntimeAdapterOutput, RuntimeSessionControlInput, RuntimeTaskHandle, RunTurnInput, OpenRuntimeSessionInput } from "../../src/runtime/adapter.js";
 import { fileChanged, messageCompleted, turnCompleted, turnStarted } from "../helpers/v2-runtime.js";
 
 const tempPaths: string[] = [];
@@ -15,8 +15,8 @@ const tempPaths: string[] = [];
 class FakeRuntime implements RuntimeAdapter {
   constructor(readonly runtime: RuntimeAdapter["runtime"]) {}
 
-  async startTask(input: StartRuntimeTaskInput): Promise<RuntimeTaskHandle> {
-    return { taskId: input.taskId, sessionId: input.sessionId, backendThreadId: `thread-${input.taskId}` };
+  async openSession(input: OpenRuntimeSessionInput): Promise<RuntimeTaskHandle> {
+    return { taskId: input.taskId, sessionId: input.sessionId, backendThreadId: input.backendThreadId ?? `thread-${input.taskId}` };
   }
 
   async *runTurn(input: RunTurnInput): AsyncIterable<RuntimeAdapterOutput> {
@@ -26,13 +26,8 @@ class FakeRuntime implements RuntimeAdapter {
     yield turnCompleted(input, { inputTokens: 1, outputTokens: 1 }, ts);
   }
 
-  async resumeTask(input: ResumeRuntimeTaskInput): Promise<RuntimeTaskHandle> {
-    return { taskId: input.taskId, sessionId: input.sessionId, backendThreadId: input.backendThreadId };
-  }
-
-  async pauseSession(_input: RuntimeSessionControlInput): Promise<void> {}
-  async interruptSession(_input: RuntimeSessionControlInput): Promise<void> {}
-  async closeSession(_input: RuntimeSessionControlInput): Promise<void> {}
+  async interruptTurn(_input: RuntimeSessionControlInput): Promise<void> {}
+  async terminateSession(_input: RuntimeSessionControlInput): Promise<void> {}
 }
 
 afterEach(async () => {
@@ -95,6 +90,7 @@ describe("workspace merge lifecycle", () => {
         "004_runtime_sessions",
         "005_task_defaults",
         "006_turn_assistant_messages",
+        "007_pending_actions",
       ]);
     } finally {
       await orchestrator.close();

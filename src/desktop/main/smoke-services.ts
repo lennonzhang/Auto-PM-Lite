@@ -7,7 +7,7 @@ import { Orchestrator } from "../../orchestrator/orchestrator.js";
 import { createAppServices, type AppServices } from "../../service/app-services.js";
 import { loadConfig } from "../../core/config.js";
 import type { AppConfig } from "../../core/types.js";
-import type { ResumeRuntimeTaskInput, RunTurnInput, RuntimeAdapter, RuntimeAdapterOutput, RuntimeSessionControlInput, RuntimeTaskHandle, StartRuntimeTaskInput } from "../../runtime/adapter.js";
+import type { RunTurnInput, RuntimeAdapter, RuntimeAdapterOutput, RuntimeSessionControlInput, RuntimeTaskHandle, OpenRuntimeSessionInput } from "../../runtime/adapter.js";
 
 export async function openDesktopSmokeServices(configPath: string): Promise<AppServices> {
   await ensureDesktopSmokeConfig(configPath);
@@ -98,8 +98,8 @@ codex_network_access_enabled = false
 class DesktopSmokeRuntime implements RuntimeAdapter {
   constructor(readonly runtime: RuntimeAdapter["runtime"], private readonly config: AppConfig) {}
 
-  async startTask(input: StartRuntimeTaskInput): Promise<RuntimeTaskHandle> {
-    return { taskId: input.taskId, sessionId: input.sessionId, backendThreadId: `smoke-thread-${input.taskId}` };
+  async openSession(input: OpenRuntimeSessionInput): Promise<RuntimeTaskHandle> {
+    return { taskId: input.taskId, sessionId: input.sessionId, backendThreadId: input.backendThreadId ?? `smoke-thread-${input.taskId}` };
   }
 
   async *runTurn(input: RunTurnInput): AsyncIterable<RuntimeAdapterOutput> {
@@ -160,13 +160,8 @@ class DesktopSmokeRuntime implements RuntimeAdapter {
     yield { event: { kind: "turn.completed", turnId: input.turnId, usage: { inputTokens: 1, outputTokens: 1 } } };
   }
 
-  async resumeTask(input: ResumeRuntimeTaskInput): Promise<RuntimeTaskHandle> {
-    return { taskId: input.taskId, sessionId: input.sessionId, backendThreadId: input.backendThreadId };
-  }
-
-  async pauseSession(_input: RuntimeSessionControlInput): Promise<void> {}
-  async interruptSession(_input: RuntimeSessionControlInput): Promise<void> {}
-  async closeSession(_input: RuntimeSessionControlInput): Promise<void> {}
+  async interruptTurn(_input: RuntimeSessionControlInput): Promise<void> {}
+  async terminateSession(_input: RuntimeSessionControlInput): Promise<void> {}
 }
 
 async function prepareSmokeGitWorkspace(config: AppConfig): Promise<void> {

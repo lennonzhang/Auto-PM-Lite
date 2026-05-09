@@ -5,8 +5,8 @@ import type { AppConfig, ApprovalKind, ArtifactRef, BudgetSnapshot, DelegateToRe
 import type { AutoPmMcpHandlers, McpToolResult } from "../mcp/auto-pm-service.js";
 import { redactText } from "../core/redaction.js";
 import { canAccessReference, policyTrustLevel } from "../core/reference.js";
-import { buildRawTranscriptCipher } from "../core/transcript.js";
-import { AppDatabase, type StoredApproval, type StoredArtifact } from "../storage/db.js";
+import { buildRawTranscriptCipher, decryptRawTranscript, isRawTranscriptExpired } from "../core/transcript.js";
+import { AppDatabase, type StoredApproval, type StoredArtifact, type StoredPendingAction } from "../storage/db.js";
 import { AppError } from "../api/types.js";
 import type { RuntimeAdapter } from "../runtime/adapter.js";
 import { shouldRequireApproval } from "./policy.js";
@@ -102,7 +102,10 @@ export interface TaskResultSnapshot {
 type ApprovalContinuation =
   | { kind: "resolve_only" }
   | { kind: "requeue" }
-  | { kind: "auto_resume"; prompt?: string | undefined };
+  | { kind: "auto_resume"; prompt?: string | undefined }
+  | { kind: "continue_pending_action"; pendingActionId: string };
+
+type CrossHarnessDelegationPendingPayload = DelegateTaskInput & Record<string, unknown>;
 
 export class Orchestrator {
   private readonly workspaceManager: WorkspaceManager;
@@ -443,6 +446,7 @@ export class Orchestrator {
     const approvalRecords = this.db.listApprovals();
     const approval = approvalRecords.find((entry) => entry.id === input.approvalId);
     const resolvedAt = new Date().toISOString();
+    const pendingAction = this.db.getPendingActionByApprovalId(input.approvalId);
     this.db.resolveApproval({
       approvalId: input.approvalId,
       status: input.approved ? "approved" : "denied",
@@ -465,6 +469,17 @@ export class Orchestrator {
     }
 
     if (!input.approved || !task) {
+      if (!input.approved && pendingAction?.status === "pending") {
+        this.db.denyPendingAction(pendingAction.id, resolvedAt);
+        if (task?.status === "awaiting_approval" && this.db.listPendingApprovals(task.id).length === 0) {
+          this.db.updateTaskRuntimeState({
+            taskId: task.id,
+            status: "idle",
+            updatedAt: resolvedAt,
+          });
+          this.publishAndProjectTaskEvent(task, { kind: "task.idle", reason: "recovered" }, { ts: resolvedAt });
+        }
+      }
       return;
     }
 
@@ -475,6 +490,7 @@ export class Orchestrator {
       task,
       latestTurn,
       remainingPendingApprovals,
+      pendingAction,
     });
 
     if (approval.kind === "budget_increase") {
@@ -487,6 +503,16 @@ export class Orchestrator {
     }
 
     if (continuation.kind === "resolve_only") {
+      return;
+    }
+
+    if (continuation.kind === "continue_pending_action") {
+      const pending = this.continuePendingAction(continuation.pendingActionId)
+        .catch(() => {})
+        .finally(() => {
+          this.pendingContinuations.delete(pending);
+        });
+      this.pendingContinuations.add(pending);
       return;
     }
 
@@ -536,6 +562,10 @@ export class Orchestrator {
   }
 
   async delegateTask(input: DelegateTaskInput): Promise<DelegateToResult> {
+    return this.delegateTaskInternal(input, { skipApprovalGate: false });
+  }
+
+  private async delegateTaskInternal(input: DelegateTaskInput, options: { skipApprovalGate: boolean }): Promise<DelegateToResult> {
     const parentTask = this.requireTask(input.parentTaskId);
     const parentSession = this.db.getCurrentSession(parentTask.id);
     const parentRuntime = parentSession?.runtime ?? parentTask.defaultRuntime;
@@ -594,7 +624,7 @@ export class Orchestrator {
       }
     }
 
-    if (shouldRequireApproval(parentPolicy, "cross_harness_delegation")) {
+    if (!options.skipApprovalGate && shouldRequireApproval(parentPolicy, "cross_harness_delegation")) {
       const approvalId = this.createApproval({
         taskId: parentTask.id,
         kind: "cross_harness_delegation",
@@ -606,6 +636,16 @@ export class Orchestrator {
         },
       });
       const now = new Date().toISOString();
+      this.db.createPendingAction({
+        id: randomUUID(),
+        taskId: parentTask.id,
+        approvalId,
+        kind: "cross_harness_delegation",
+        status: "pending",
+        ...this.buildPendingDelegationActionPayload(input, now),
+        createdAt: now,
+        updatedAt: now,
+      });
       const approval = this.requireApproval(approvalId);
       this.publishAndProjectTaskEvent(parentTask, {
         kind: "approval.requested",
@@ -852,7 +892,7 @@ export class Orchestrator {
         projectTaskFailure: false,
       });
       const completedAt = new Date().toISOString();
-      await this.closeRuntimeSessionHandle(sourceSession);
+      await this.terminateRuntimeSession(sourceSession);
       this.db.updateRuntimeSession({
         sessionId: sourceSession.id,
         status: "closed",
@@ -1017,6 +1057,7 @@ export class Orchestrator {
       });
       if (mode === "session") {
         const forkedAt = new Date().toISOString();
+        await this.terminateRuntimeSession(targetSession);
         this.db.updateRuntimeSession({
           sessionId: targetSession.id,
           status: "closed",
@@ -1111,7 +1152,7 @@ export class Orchestrator {
         projectTaskFailure: false,
       });
       const completedAt = new Date().toISOString();
-      await this.closeRuntimeSessionHandle(sourceSession);
+      await this.terminateRuntimeSession(sourceSession);
       this.db.updateRuntimeSession({
         sessionId: sourceSession.id,
         status: "closed",
@@ -1201,7 +1242,7 @@ export class Orchestrator {
     }
 
     this.pauseRequests.add(task.id);
-    await runtime.pauseSession({ sessionId: session.id, backendThreadId: session.backendThreadId });
+    await runtime.interruptTurn({ sessionId: session.id, backendThreadId: session.backendThreadId });
     await this.markTaskPaused(task);
   }
 
@@ -1234,8 +1275,8 @@ export class Orchestrator {
     await Promise.allSettled(activeSessions.map(async (session) => {
       const runtime = this.runtimes[session.runtime];
       if (runtime) {
-        await runtime.interruptSession({ sessionId: session.id, backendThreadId: session.backendThreadId });
-        await runtime.closeSession({ sessionId: session.id, backendThreadId: session.backendThreadId });
+        await runtime.interruptTurn({ sessionId: session.id, backendThreadId: session.backendThreadId });
+        await runtime.terminateSession({ sessionId: session.id, backendThreadId: session.backendThreadId });
       }
       this.db.updateRuntimeSession({
         sessionId: session.id,
@@ -1274,7 +1315,7 @@ export class Orchestrator {
     for (const session of this.db.listRuntimeSessionsByStatus(task.id, "active")) {
       const runtime = this.runtimes[session.runtime];
       if (runtime) {
-        await runtime.closeSession({ sessionId: session.id, backendThreadId: session.backendThreadId });
+        await runtime.terminateSession({ sessionId: session.id, backendThreadId: session.backendThreadId });
       }
       this.db.updateRuntimeSession({
         sessionId: session.id,
@@ -1297,6 +1338,7 @@ export class Orchestrator {
   async close(): Promise<void> {
     this.closed = true;
     await Promise.allSettled(Array.from(this.pendingContinuations));
+    await Promise.allSettled(Object.values(this.runtimes).map(async (runtime) => runtime.shutdown?.()));
     this.eventHub.close();
     this.db.close();
   }
@@ -1541,22 +1583,14 @@ export class Orchestrator {
     const startedAt = new Date().toISOString();
     let handle;
     try {
-      handle = input.session.backendThreadId
-        ? await runtime.resumeTask({
-            taskId: input.task.id,
-            sessionId: input.session.id,
-            profileId: input.session.profileId,
-            model: input.session.model,
-            cwd: input.session.cwd,
-            backendThreadId: input.session.backendThreadId,
-          })
-        : await runtime.startTask({
-            taskId: input.task.id,
-            sessionId: input.session.id,
-            profileId: input.session.profileId,
-            model: input.session.model,
-            cwd: input.session.cwd,
-          });
+      handle = await runtime.openSession({
+        taskId: input.task.id,
+        sessionId: input.session.id,
+        profileId: input.session.profileId,
+        model: input.session.model,
+        cwd: input.session.cwd,
+        ...(input.session.backendThreadId ? { backendThreadId: input.session.backendThreadId } : {}),
+      });
 
       if (handle.backendThreadId) {
         this.db.updateRuntimeSession({
@@ -1601,7 +1635,6 @@ export class Orchestrator {
       throw error;
     } finally {
       this.scheduler.recordComplete(input.task.id);
-      await runtime.closeSession({ sessionId: input.session.id, backendThreadId: input.session.backendThreadId });
       this.pauseRequests.delete(input.task.id);
       this.activeTaskActions.delete(input.task.id);
     }
@@ -1921,10 +1954,10 @@ export class Orchestrator {
     });
   }
 
-  private async closeRuntimeSessionHandle(session: RuntimeSession): Promise<void> {
+  private async terminateRuntimeSession(session: RuntimeSession): Promise<void> {
     const runtime = this.runtimes[session.runtime];
     if (runtime) {
-      await runtime.closeSession({ sessionId: session.id, backendThreadId: session.backendThreadId });
+      await runtime.terminateSession({ sessionId: session.id, backendThreadId: session.backendThreadId });
     }
   }
 
@@ -2003,18 +2036,71 @@ export class Orchestrator {
     }
   }
 
+  private async continuePendingAction(actionId: string): Promise<void> {
+    if (this.closed) {
+      return;
+    }
+    const claimedAt = new Date().toISOString();
+    const action = this.db.claimPendingAction(actionId, claimedAt);
+    if (!action) {
+      return;
+    }
+
+    try {
+      if (action.kind === "cross_harness_delegation") {
+        const payload = this.parsePendingDelegationActionPayload(action);
+        const result = await this.delegateTaskInternal(payload, { skipApprovalGate: true });
+        const completedAt = new Date().toISOString();
+        if (result.status !== "completed" && result.status !== "started" && result.status !== "awaiting_approval") {
+          this.db.failPendingAction(action.id, completedAt, {
+            status: result.status,
+            message: result.message ?? result.denialCode ?? result.status,
+          });
+          const task = this.db.getTask(action.taskId);
+          if (task?.status === "awaiting_approval") {
+            this.db.updateTaskRuntimeState({ taskId: task.id, status: "idle", updatedAt: completedAt });
+            this.publishAndProjectTaskEvent(task, { kind: "task.idle", reason: "recovered" }, { ts: completedAt });
+          }
+          return;
+        }
+        this.db.completePendingAction(action.id, completedAt);
+        const task = this.db.getTask(action.taskId);
+        if (task?.status === "awaiting_approval") {
+          this.db.updateTaskRuntimeState({ taskId: task.id, status: "idle", updatedAt: completedAt });
+          this.publishAndProjectTaskEvent(task, { kind: "task.idle", reason: "recovered" }, { ts: completedAt });
+        }
+        return;
+      }
+      throw new AppError("validation_failed", `Unsupported pending action kind: ${action.kind}`);
+    } catch (error) {
+      const failedAt = new Date().toISOString();
+      this.db.failPendingAction(action.id, failedAt, {
+        message: errorMessage(error),
+      });
+      const task = this.db.getTask(action.taskId);
+      if (task?.status === "awaiting_approval") {
+        this.db.updateTaskRuntimeState({ taskId: task.id, status: "idle", updatedAt: failedAt });
+        this.publishAndProjectTaskEvent(task, { kind: "task.idle", reason: "recovered" }, { ts: failedAt });
+      }
+      throw error;
+    }
+  }
+
   private decideApprovalContinuation(input: {
     approval: ReturnType<AppDatabase["listApprovals"]>[number];
     task: Task;
     latestTurn: ReturnType<AppDatabase["getLatestTurn"]>;
     remainingPendingApprovals: number;
+    pendingAction: StoredPendingAction | null;
   }): ApprovalContinuation {
     if (input.remainingPendingApprovals > 0) {
       return { kind: "resolve_only" };
     }
 
     if (input.approval.kind === "cross_harness_delegation") {
-      return { kind: "requeue" };
+      return input.pendingAction?.status === "pending"
+        ? { kind: "continue_pending_action", pendingActionId: input.pendingAction.id }
+        : { kind: "resolve_only" };
     }
 
     if (input.approval.kind === "budget_increase") {
@@ -2026,6 +2112,36 @@ export class Orchestrator {
     return this.canResumeTask(input.task, input.latestTurn)
       ? { kind: "auto_resume" }
       : { kind: "requeue" };
+  }
+
+  private buildPendingDelegationActionPayload(input: DelegateTaskInput, now: string): {
+    payload: CrossHarnessDelegationPendingPayload;
+    payloadRawEncrypted?: string | undefined;
+    payloadRawTtlAt?: string | undefined;
+  } {
+    const fullPayload = toCrossHarnessDelegationPayload(input);
+    const redactedPayload = JSON.parse(redactText(JSON.stringify(fullPayload), {
+      additionalPatterns: this.config.redaction.additionalPatterns,
+    })) as CrossHarnessDelegationPendingPayload;
+    const rawCipher = buildRawTranscriptCipher({
+      prompt: JSON.stringify(fullPayload),
+      config: this.config.transcript,
+      now: new Date(now),
+    });
+    return {
+      payload: redactedPayload,
+      ...(rawCipher ? { payloadRawEncrypted: rawCipher.encrypted, payloadRawTtlAt: rawCipher.ttlAt } : {}),
+    };
+  }
+
+  private parsePendingDelegationActionPayload(action: StoredPendingAction): DelegateTaskInput {
+    if (action.payloadRawEncrypted && !isRawTranscriptExpired({ promptRawTtlAt: action.payloadRawTtlAt })) {
+      const decrypted = decryptRawTranscript(action.payloadRawEncrypted);
+      if (decrypted) {
+        return parseCrossHarnessDelegationPayload(JSON.parse(decrypted) as Record<string, unknown>);
+      }
+    }
+    return parseCrossHarnessDelegationPayload(action.payload);
   }
 
   private canResumeTask(task: Task, latestTurn: ReturnType<AppDatabase["getLatestTurn"]>): boolean {
@@ -2395,6 +2511,52 @@ function deniedDelegation(denialCode: string, message = denialCode): DelegateToR
     denialCode,
     message,
   };
+}
+
+function toCrossHarnessDelegationPayload(input: DelegateTaskInput): CrossHarnessDelegationPendingPayload {
+  return {
+    parentTaskId: input.parentTaskId,
+    ...(input.targetProfileId ? { targetProfileId: input.targetProfileId } : {}),
+    ...(input.targetRuntime ? { targetRuntime: input.targetRuntime } : {}),
+    taskType: input.taskType,
+    prompt: input.prompt,
+    reason: input.reason,
+    ...(input.requestedPermissionMode ? { requestedPermissionMode: input.requestedPermissionMode } : {}),
+    ...(input.workspaceMode ? { workspaceMode: input.workspaceMode } : {}),
+    ...(input.timeoutMs !== undefined ? { timeoutMs: input.timeoutMs } : {}),
+    ...(input.references ? { references: input.references } : {}),
+  };
+}
+
+function parseCrossHarnessDelegationPayload(payload: Record<string, unknown>): DelegateTaskInput {
+  if (
+    typeof payload.parentTaskId !== "string"
+    || !isDelegationTaskType(payload.taskType)
+    || typeof payload.prompt !== "string"
+    || typeof payload.reason !== "string"
+  ) {
+    throw new AppError("validation_failed", "pending_action_payload_invalid");
+  }
+  return {
+    parentTaskId: payload.parentTaskId,
+    ...(typeof payload.targetProfileId === "string" ? { targetProfileId: payload.targetProfileId } : {}),
+    ...(payload.targetRuntime === "claude" || payload.targetRuntime === "codex" ? { targetRuntime: payload.targetRuntime } : {}),
+    taskType: payload.taskType,
+    prompt: payload.prompt,
+    reason: payload.reason,
+    ...(isPermissionMode(payload.requestedPermissionMode) ? { requestedPermissionMode: payload.requestedPermissionMode } : {}),
+    ...(payload.workspaceMode === "share" || payload.workspaceMode === "new-worktree" ? { workspaceMode: payload.workspaceMode } : {}),
+    ...(typeof payload.timeoutMs === "number" ? { timeoutMs: payload.timeoutMs } : {}),
+    ...(Array.isArray(payload.references) ? { references: payload.references as TaskReference[] } : {}),
+  };
+}
+
+function isDelegationTaskType(value: unknown): value is DelegateTaskInput["taskType"] {
+  return value === "ask" || value === "review" || value === "edit" || value === "fix" || value === "test";
+}
+
+function isPermissionMode(value: unknown): value is NonNullable<DelegateTaskInput["requestedPermissionMode"]> {
+  return value === "read-only" || value === "edit" || value === "full";
 }
 
 function toArtifactRefs(artifacts: StoredArtifact[]): ArtifactRef[] {

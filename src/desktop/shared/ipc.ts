@@ -44,10 +44,10 @@ export interface DesktopApi {
   resumeTask(input: { taskId: string; prompt?: string | undefined; requestId?: string | undefined }): Promise<TaskActionAccepted & { resumed: true }>;
   pauseTask(taskId: string): Promise<TaskActionAccepted>;
   cancelTask(taskId: string): Promise<{ ok: true; taskId: string; cancelled: true }>;
-  closeTask(input: { taskId: string; summary?: string | undefined } | string): Promise<{ ok: true; taskId: string; closed: true }>;
-  handoffTask(input: { taskId: string; targetProfileId: string; prompt?: string | undefined; reason: string; requestId?: string | undefined }): Promise<{ ok: true; taskId: string; handoff: true }>;
-  forkTask(input: { taskId: string; fromTurnId?: string | undefined; name?: string | undefined; mode?: "task" | "session" | undefined; prompt?: string | undefined; requestId?: string | undefined }): Promise<unknown>;
-  rolloverSession(input: { taskId: string; reason: "context_limit" | "model_change" | "profile_change" | "session_corrupt" | "manual"; targetProfileId?: string | undefined; carryOverPrompt?: string | undefined; requestId?: string | undefined }): Promise<{ ok: true; taskId: string; rollover: true }>;
+  closeTask(input: { taskId: string; summary?: string | undefined } | string): Promise<TaskActionAccepted>;
+  handoffTask(input: { taskId: string; targetProfileId: string; prompt?: string | undefined; reason: string; requestId?: string | undefined }): Promise<TaskActionAccepted>;
+  forkTask(input: { taskId: string; fromTurnId?: string | undefined; name?: string | undefined; mode?: "task" | "session" | undefined; prompt?: string | undefined; requestId?: string | undefined }): Promise<TaskActionAccepted>;
+  rolloverSession(input: { taskId: string; reason: "context_limit" | "model_change" | "profile_change" | "session_corrupt" | "manual"; targetProfileId?: string | undefined; carryOverPrompt?: string | undefined; requestId?: string | undefined }): Promise<TaskActionAccepted>;
   listApprovals(taskId?: string | undefined): Promise<ApprovalView[]>;
   resolveApproval(input: { approvalId: string; approved: boolean; reason?: string | undefined }): Promise<unknown>;
   listWorkspaceChanges(taskId: string): Promise<WorkspaceChange[]>;

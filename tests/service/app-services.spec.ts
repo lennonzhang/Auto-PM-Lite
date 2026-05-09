@@ -18,6 +18,7 @@ import {
   requestWorkspaceMergeSchema,
   resolveApprovalRequestSchema,
   runtimeHealthSchema,
+  taskActionAcceptedSchema,
   taskDetailSchema,
   taskSummarySchema,
   workspaceChangeSchema,
@@ -25,21 +26,20 @@ import {
   workspaceMergeResultSchema,
 } from "../../src/api/schemas.js";
 import type { AppConfig } from "../../src/core/types.js";
-import type { RuntimeAdapter, RuntimeAdapterOutput, RuntimeSessionControlInput, RuntimeTaskHandle, RunTurnInput, StartRuntimeTaskInput, ResumeRuntimeTaskInput } from "../../src/runtime/adapter.js";
+import type { RuntimeAdapter, RuntimeAdapterOutput, RuntimeSessionControlInput, RuntimeTaskHandle, RunTurnInput, OpenRuntimeSessionInput } from "../../src/runtime/adapter.js";
 import { fileChanged, messageCompleted, turnCompleted, turnStarted } from "../helpers/v2-runtime.js";
 
 const tempPaths: string[] = [];
 
 class FakeRuntime implements RuntimeAdapter {
-  readonly started: StartRuntimeTaskInput[] = [];
+  readonly started: OpenRuntimeSessionInput[] = [];
   readonly turns: RunTurnInput[] = [];
-  readonly resumed: ResumeRuntimeTaskInput[] = [];
 
   constructor(readonly runtime: RuntimeAdapter["runtime"] = "claude") {}
 
-  async startTask(input: StartRuntimeTaskInput): Promise<RuntimeTaskHandle> {
+  async openSession(input: OpenRuntimeSessionInput): Promise<RuntimeTaskHandle> {
     this.started.push(input);
-    return { taskId: input.taskId, sessionId: input.sessionId, backendThreadId: `thread-${input.taskId}` };
+    return { taskId: input.taskId, sessionId: input.sessionId, backendThreadId: input.backendThreadId ?? `thread-${input.taskId}` };
   }
 
   async *runTurn(input: RunTurnInput): AsyncIterable<RuntimeAdapterOutput> {
@@ -50,14 +50,8 @@ class FakeRuntime implements RuntimeAdapter {
     yield turnCompleted(input, { inputTokens: 1, outputTokens: 1 }, ts);
   }
 
-  async resumeTask(input: ResumeRuntimeTaskInput): Promise<RuntimeTaskHandle> {
-    this.resumed.push(input);
-    return { taskId: input.taskId, sessionId: input.sessionId, backendThreadId: input.backendThreadId };
-  }
-
-  async pauseSession(_input: RuntimeSessionControlInput): Promise<void> {}
-  async interruptSession(_input: RuntimeSessionControlInput): Promise<void> {}
-  async closeSession(_input: RuntimeSessionControlInput): Promise<void> {}
+  async interruptTurn(_input: RuntimeSessionControlInput): Promise<void> {}
+  async terminateSession(_input: RuntimeSessionControlInput): Promise<void> {}
 }
 
 afterEach(async () => {
@@ -113,6 +107,16 @@ describe("AppServices", () => {
       expect(runtimes.claude.turns[0]?.model).toBe("claude-sonnet-4-6");
       const detail = services.tasks.getTask(task.id);
       expect(detail.latestMessage).toBe("selected model");
+      expect(taskDetailSchema.parse(detail).currentSession).toMatchObject({
+        runtime: "claude",
+        profileId: "claude_main",
+        model: "claude-sonnet-4-6",
+      });
+      expect(taskSummarySchema.parse(services.tasks.listTasks()[0]!).currentSession).toMatchObject({
+        runtime: "claude",
+        profileId: "claude_main",
+        model: "claude-sonnet-4-6",
+      });
       expect(services.tasks.listTasks()[0]?.latestMessage).toBe("selected model");
     } finally {
       await services.close();
@@ -550,6 +554,13 @@ CODEX__AUTO_CODE_VIP__KEY__CX_PRO=sk-codex
     expect(resolveApprovalRequestSchema.parse({ approvalId: "a", approved: true })).toEqual({ approvalId: "a", approved: true });
     expect(requestWorkspaceMergeSchema.parse({ taskId: "t", reason: "ready" })).toEqual({ taskId: "t", reason: "ready" });
     expect(eventSubscriptionRequestSchema.parse({ taskId: "task-1", sinceTaskSeq: 10 })).toEqual({ taskId: "task-1", sinceTaskSeq: 10 });
+    expect(taskActionAcceptedSchema.parse({
+      ok: true,
+      accepted: true,
+      taskId: "task-1",
+      actionId: "action-1",
+      action: "handoff",
+    }).action).toBe("handoff");
     expect(approvalViewSchema.parse({
       id: "a",
       taskId: "t",

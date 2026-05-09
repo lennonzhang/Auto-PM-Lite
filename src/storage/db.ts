@@ -55,6 +55,24 @@ export interface StoredApproval {
   expiresAt?: string | undefined;
 }
 
+export type PendingActionKind = "cross_harness_delegation";
+export type PendingActionStatus = "pending" | "running" | "completed" | "failed" | "denied";
+
+export interface StoredPendingAction<TPayload extends Record<string, unknown> = Record<string, unknown>> {
+  id: string;
+  taskId: string;
+  approvalId: string;
+  kind: PendingActionKind;
+  status: PendingActionStatus;
+  payload: TPayload;
+  payloadRawEncrypted?: string | undefined;
+  payloadRawTtlAt?: string | undefined;
+  createdAt: string;
+  updatedAt: string;
+  completedAt?: string | undefined;
+  error?: Record<string, unknown> | undefined;
+}
+
 export interface StoredArtifact {
   id: string;
   taskId: string;
@@ -656,6 +674,76 @@ export class AppDatabase {
     }));
   }
 
+  createPendingAction(input: StoredPendingAction): void {
+    this.db.prepare(`
+      INSERT INTO pending_actions (id, task_id, approval_id, kind, status, payload_json, payload_raw_encrypted, payload_raw_ttl_at, created_at, updated_at, completed_at, error_json)
+      VALUES (@id, @task_id, @approval_id, @kind, @status, @payload_json, @payload_raw_encrypted, @payload_raw_ttl_at, @created_at, @updated_at, @completed_at, @error_json)
+    `).run(pendingActionParams(input));
+  }
+
+  getPendingActionByApprovalId(approvalId: string): StoredPendingAction | null {
+    const row = this.db.prepare(`
+      SELECT id, task_id, approval_id, kind, status, payload_json, payload_raw_encrypted, payload_raw_ttl_at, created_at, updated_at, completed_at, error_json
+      FROM pending_actions
+      WHERE approval_id = ?
+    `).get(approvalId) as Record<string, unknown> | undefined;
+    return row ? rowToPendingAction(row) : null;
+  }
+
+  claimPendingAction(actionId: string, now: string): StoredPendingAction | null {
+    const result = this.db.prepare(`
+      UPDATE pending_actions
+      SET status = 'running',
+          updated_at = ?
+      WHERE id = ? AND status = 'pending'
+    `).run(now, actionId);
+    return result.changes === 1 ? this.getPendingAction(actionId) : null;
+  }
+
+  completePendingAction(actionId: string, now: string): void {
+    this.updatePendingActionStatus(actionId, "completed", now, now);
+  }
+
+  failPendingAction(actionId: string, now: string, error: Record<string, unknown>): void {
+    this.updatePendingActionStatus(actionId, "failed", now, now, error);
+  }
+
+  denyPendingAction(actionId: string, now: string): void {
+    this.updatePendingActionStatus(actionId, "denied", now, now);
+  }
+
+  private getPendingAction(actionId: string): StoredPendingAction | null {
+    const row = this.db.prepare(`
+      SELECT id, task_id, approval_id, kind, status, payload_json, payload_raw_encrypted, payload_raw_ttl_at, created_at, updated_at, completed_at, error_json
+      FROM pending_actions
+      WHERE id = ?
+    `).get(actionId) as Record<string, unknown> | undefined;
+    return row ? rowToPendingAction(row) : null;
+  }
+
+  private updatePendingActionStatus(
+    actionId: string,
+    status: PendingActionStatus,
+    updatedAt: string,
+    completedAt?: string | undefined,
+    error?: Record<string, unknown> | undefined,
+  ): void {
+    this.db.prepare(`
+      UPDATE pending_actions
+      SET status = @status,
+          updated_at = @updated_at,
+          completed_at = @completed_at,
+          error_json = @error_json
+      WHERE id = @id
+    `).run({
+      id: actionId,
+      status,
+      updated_at: updatedAt,
+      completed_at: completedAt ?? null,
+      error_json: error ? JSON.stringify(error) : null,
+    });
+  }
+
   createArtifact(input: StoredArtifact): void {
     this.db.prepare(`
       INSERT INTO artifacts (id, task_id, kind, ref, description, ts)
@@ -1025,6 +1113,22 @@ export class AppDatabase {
         expires_at TEXT
       );
 
+      CREATE TABLE IF NOT EXISTS pending_actions (
+        id TEXT PRIMARY KEY,
+        task_id TEXT NOT NULL REFERENCES tasks(id),
+        approval_id TEXT NOT NULL UNIQUE REFERENCES approvals(id),
+        kind TEXT NOT NULL,
+        status TEXT NOT NULL,
+        payload_json TEXT NOT NULL,
+        payload_raw_encrypted TEXT,
+        payload_raw_ttl_at TEXT,
+        created_at TEXT NOT NULL,
+        updated_at TEXT NOT NULL,
+        completed_at TEXT,
+        error_json TEXT
+      );
+      CREATE INDEX IF NOT EXISTS idx_pending_actions_task ON pending_actions(task_id, status);
+
       CREATE TABLE IF NOT EXISTS file_changes (
         id INTEGER PRIMARY KEY AUTOINCREMENT,
         task_id TEXT NOT NULL REFERENCES tasks(id),
@@ -1065,6 +1169,8 @@ export class AppDatabase {
     this.ensureColumn("turns", "session_id", "TEXT");
     this.ensureColumn("turns", "turn_number", "INTEGER");
     this.ensureColumn("turns", "request_id", "TEXT");
+    this.ensureColumn("pending_actions", "payload_raw_encrypted", "TEXT");
+    this.ensureColumn("pending_actions", "payload_raw_ttl_at", "TEXT");
     this.backfillTaskModels();
     this.backfillTaskDefaults();
     this.backfillTurnSessionColumns();
@@ -1074,6 +1180,7 @@ export class AppDatabase {
     this.recordMigration("004_runtime_sessions");
     this.recordMigration("005_task_defaults");
     this.recordMigration("006_turn_assistant_messages");
+    this.recordMigration("007_pending_actions");
   }
 
   private backfillTaskModels(): void {
@@ -1204,6 +1311,40 @@ function runtimeSessionParams(session: StoredRuntimeSession): Record<string, unk
     created_at: session.createdAt,
     last_used_at: session.lastUsedAt ?? null,
     closed_at: session.closedAt ?? null,
+  };
+}
+
+function pendingActionParams(action: StoredPendingAction): Record<string, unknown> {
+  return {
+    id: action.id,
+    task_id: action.taskId,
+    approval_id: action.approvalId,
+    kind: action.kind,
+    status: action.status,
+    payload_json: JSON.stringify(action.payload),
+    payload_raw_encrypted: action.payloadRawEncrypted ?? null,
+    payload_raw_ttl_at: action.payloadRawTtlAt ?? null,
+    created_at: action.createdAt,
+    updated_at: action.updatedAt,
+    completed_at: action.completedAt ?? null,
+    error_json: action.error ? JSON.stringify(action.error) : null,
+  };
+}
+
+function rowToPendingAction(row: Record<string, unknown>): StoredPendingAction {
+  return {
+    id: String(row.id),
+    taskId: String(row.task_id),
+    approvalId: String(row.approval_id),
+    kind: String(row.kind) as PendingActionKind,
+    status: String(row.status) as PendingActionStatus,
+    payload: JSON.parse(String(row.payload_json)) as Record<string, unknown>,
+    ...(row.payload_raw_encrypted === null ? {} : { payloadRawEncrypted: String(row.payload_raw_encrypted) }),
+    ...(row.payload_raw_ttl_at === null ? {} : { payloadRawTtlAt: String(row.payload_raw_ttl_at) }),
+    createdAt: String(row.created_at),
+    updatedAt: String(row.updated_at),
+    ...(row.completed_at === null ? {} : { completedAt: String(row.completed_at) }),
+    ...(row.error_json === null ? {} : { error: JSON.parse(String(row.error_json)) as Record<string, unknown> }),
   };
 }
 

@@ -5,7 +5,7 @@ import { afterEach, describe, expect, it } from "vitest";
 import { loadConfig } from "../../src/core/config.js";
 import { AppDatabase } from "../../src/storage/db.js";
 import { Orchestrator } from "../../src/orchestrator/orchestrator.js";
-import type { RuntimeAdapter, RuntimeAdapterOutput, RuntimeSessionControlInput, RuntimeTaskHandle, RunTurnInput, StartRuntimeTaskInput, ResumeRuntimeTaskInput } from "../../src/runtime/adapter.js";
+import type { RuntimeAdapter, RuntimeAdapterOutput, RuntimeSessionControlInput, RuntimeTaskHandle, RunTurnInput, OpenRuntimeSessionInput } from "../../src/runtime/adapter.js";
 import { fileChanged, messageCompleted, turnCompleted, turnStarted } from "../helpers/v2-runtime.js";
 
 const tempPaths: string[] = [];
@@ -13,12 +13,11 @@ const tempPaths: string[] = [];
 class FakeAdapter implements RuntimeAdapter {
   readonly runtime: RuntimeAdapter["runtime"] = "claude";
   public usage = { inputTokens: 100, outputTokens: 50 };
-  public resumeCount = 0;
-  public startCount = 0;
+  public openCount = 0;
 
-  async startTask(input: StartRuntimeTaskInput): Promise<RuntimeTaskHandle> {
-    this.startCount += 1;
-    return { taskId: input.taskId, sessionId: input.sessionId, backendThreadId: `thread-${input.taskId}` };
+  async openSession(input: OpenRuntimeSessionInput): Promise<RuntimeTaskHandle> {
+    this.openCount += 1;
+    return { taskId: input.taskId, sessionId: input.sessionId, backendThreadId: input.backendThreadId ?? `thread-${input.taskId}` };
   }
 
   async *runTurn(input: RunTurnInput): AsyncIterable<RuntimeAdapterOutput> {
@@ -28,23 +27,17 @@ class FakeAdapter implements RuntimeAdapter {
     yield turnCompleted(input, this.usage, ts);
   }
 
-  async resumeTask(input: ResumeRuntimeTaskInput): Promise<RuntimeTaskHandle> {
-    this.resumeCount += 1;
-    return { taskId: input.taskId, sessionId: input.sessionId, backendThreadId: input.backendThreadId };
-  }
-
-  async pauseSession(_input: RuntimeSessionControlInput): Promise<void> {}
-  async interruptSession(_input: RuntimeSessionControlInput): Promise<void> {}
-  async closeSession(_input: RuntimeSessionControlInput): Promise<void> {}
+  async interruptTurn(_input: RuntimeSessionControlInput): Promise<void> {}
+  async terminateSession(_input: RuntimeSessionControlInput): Promise<void> {}
 }
 
 class FakeCodexAdapter implements RuntimeAdapter {
   readonly runtime: RuntimeAdapter["runtime"] = "codex";
   public startCount = 0;
 
-  async startTask(input: StartRuntimeTaskInput): Promise<RuntimeTaskHandle> {
+  async openSession(input: OpenRuntimeSessionInput): Promise<RuntimeTaskHandle> {
     this.startCount += 1;
-    return { taskId: input.taskId, sessionId: input.sessionId, backendThreadId: `codex-thread-${input.taskId}` };
+    return { taskId: input.taskId, sessionId: input.sessionId, backendThreadId: input.backendThreadId ?? `codex-thread-${input.taskId}` };
   }
 
   async *runTurn(input: RunTurnInput): AsyncIterable<RuntimeAdapterOutput> {
@@ -54,13 +47,8 @@ class FakeCodexAdapter implements RuntimeAdapter {
     yield turnCompleted(input, { inputTokens: 10, outputTokens: 5 }, ts);
   }
 
-  async resumeTask(input: ResumeRuntimeTaskInput): Promise<RuntimeTaskHandle> {
-    return { taskId: input.taskId, sessionId: input.sessionId, backendThreadId: input.backendThreadId };
-  }
-
-  async pauseSession(_input: RuntimeSessionControlInput): Promise<void> {}
-  async interruptSession(_input: RuntimeSessionControlInput): Promise<void> {}
-  async closeSession(_input: RuntimeSessionControlInput): Promise<void> {}
+  async interruptTurn(_input: RuntimeSessionControlInput): Promise<void> {}
+  async terminateSession(_input: RuntimeSessionControlInput): Promise<void> {}
 }
 
 class ThrowingStartAdapter extends FakeAdapter {
@@ -119,6 +107,9 @@ flushBatchSize = 10
 rootDir = "${wsRoot.replace(/\\/g, "/")}"
 topLevelUseWorktree = false
 
+[redaction]
+additionalPatterns = ["secret-token-[0-9]+"]
+
 [policy.basic]
 permissionMode = "read-only"
 sandboxMode = "read-only"
@@ -171,7 +162,7 @@ codex_network_access_enabled = false
   const codex = adapters.codex ?? new FakeCodexAdapter();
   const orchestrator = new Orchestrator(config, db, { claude, codex });
   orchestrator.syncConfig();
-  return { claude, codex, db, orchestrator, root };
+  return { claude, codex, config, db, orchestrator, root };
 }
 
 async function buildEnv(options?: {
@@ -183,6 +174,7 @@ async function buildEnv(options?: {
   return {
     adapter: env.claude as FakeAdapter,
     codex: env.codex as FakeCodexAdapter,
+    config: env.config,
     db: env.db,
     orchestrator: env.orchestrator,
     root: env.root,
@@ -263,7 +255,7 @@ describe("budget auto-pause + approval-resume", () => {
       await orchestrator.resolveApproval({ approvalId: approval!.id, approved: true });
       await new Promise((resolve) => setTimeout(resolve, 0));
 
-      expect(adapter.resumeCount + adapter.startCount).toBeGreaterThan(1);
+      expect(adapter.openCount).toBeGreaterThan(1);
     } finally {
       await orchestrator.close();
     }
@@ -289,19 +281,19 @@ describe("budget auto-pause + approval-resume", () => {
       await orchestrator.resolveApproval({ approvalId: budgetApproval!.id, approved: true });
       await new Promise((resolve) => setTimeout(resolve, 0));
 
-      expect(adapter.resumeCount + adapter.startCount).toBe(1);
+      expect(adapter.openCount).toBe(1);
       expect(db.getTask(task.id)?.status).toBe("awaiting_approval");
 
       await orchestrator.resolveApproval({ approvalId: extraApprovalId, approved: true });
       await new Promise((resolve) => setTimeout(resolve, 0));
 
-      expect(adapter.resumeCount + adapter.startCount).toBeGreaterThan(1);
+      expect(adapter.openCount).toBeGreaterThan(1);
     } finally {
       await orchestrator.close();
     }
   });
 
-  it("resolving delegation approval requeues but does not auto-replay the child request", async () => {
+  it("resolving delegation approval continues the pending child request", async () => {
     const { codex, db, orchestrator, root } = await buildEnv({
       requireApprovalFor: ["cross_harness_delegation"],
       enableDelegation: true,
@@ -325,9 +317,109 @@ describe("budget auto-pause + approval-resume", () => {
       await orchestrator.resolveApproval({ approvalId: result.approvalId!, approved: true });
       await new Promise((resolve) => setTimeout(resolve, 0));
 
-      expect(db.getTask(parent.id)?.status).toBe("queued");
+      expect(db.getTask(parent.id)?.status).toBe("idle");
+      expect(codex.startCount).toBe(1);
+      const childTasks = db.listTasks().filter((task) => task.defaultRuntime === "codex");
+      expect(childTasks).toHaveLength(1);
+      expect(db.getLatestCompletedMessage(childTasks[0]!.id)).toBe("codex:review");
+      expect(db.getPendingActionByApprovalId(result.approvalId!)?.status).toBe("completed");
+
+      await orchestrator.resolveApproval({ approvalId: result.approvalId!, approved: true });
+      await new Promise((resolve) => setTimeout(resolve, 0));
+
+      expect(codex.startCount).toBe(1);
+      expect(db.listTasks().filter((task) => task.defaultRuntime === "codex")).toHaveLength(1);
+    } finally {
+      await orchestrator.close();
+    }
+  });
+
+  it("denying delegation approval denies the pending action without creating a child task", async () => {
+    const { codex, db, orchestrator, root } = await buildEnv({
+      requireApprovalFor: ["cross_harness_delegation"],
+      enableDelegation: true,
+    });
+
+    try {
+      const parent = await orchestrator.createTask({ profileId: "claude_main", cwd: root });
+      const result = await orchestrator.delegateTask({
+        parentTaskId: parent.id,
+        targetRuntime: "codex",
+        taskType: "ask",
+        prompt: "review",
+        reason: "approval gate",
+        workspaceMode: "share",
+        requestedPermissionMode: "read-only",
+      });
+
+      await orchestrator.resolveApproval({ approvalId: result.approvalId!, approved: false });
+
+      expect(db.getTask(parent.id)?.status).toBe("idle");
       expect(codex.startCount).toBe(0);
       expect(db.listTasks().filter((task) => task.defaultRuntime === "codex")).toHaveLength(0);
+      expect(db.getPendingActionByApprovalId(result.approvalId!)?.status).toBe("denied");
+    } finally {
+      await orchestrator.close();
+    }
+  });
+
+  it("continues approved delegation from durable pending action storage after restart", async () => {
+    const env = await buildEnv({
+      requireApprovalFor: ["cross_harness_delegation"],
+      enableDelegation: true,
+    });
+
+    const parent = await env.orchestrator.createTask({ profileId: "claude_main", cwd: env.root });
+    const result = await env.orchestrator.delegateTask({
+      parentTaskId: parent.id,
+      targetRuntime: "codex",
+      taskType: "ask",
+      prompt: "review after restart",
+      reason: "approval gate",
+      workspaceMode: "share",
+      requestedPermissionMode: "read-only",
+    });
+    await env.orchestrator.close();
+
+    const restartedDb = new AppDatabase({ dbPath: env.config.storage.dbPath, busyTimeoutMs: env.config.storage.busyTimeoutMs });
+    const restartedCodex = new FakeCodexAdapter();
+    const restarted = new Orchestrator(env.config, restartedDb, { claude: new FakeAdapter(), codex: restartedCodex });
+    restarted.syncConfig();
+    try {
+      await restarted.resolveApproval({ approvalId: result.approvalId!, approved: true });
+      await new Promise((resolve) => setTimeout(resolve, 0));
+
+      expect(restartedCodex.startCount).toBe(1);
+      const childTasks = restartedDb.listTasks().filter((task) => task.defaultRuntime === "codex");
+      expect(childTasks).toHaveLength(1);
+      expect(restartedDb.getLatestCompletedMessage(childTasks[0]!.id)).toBe("codex:review after restart");
+      expect(restartedDb.getPendingActionByApprovalId(result.approvalId!)?.status).toBe("completed");
+    } finally {
+      await restarted.close();
+    }
+  });
+
+  it("stores pending delegation payload with redacted prompt text", async () => {
+    const { db, orchestrator, root } = await buildEnv({
+      requireApprovalFor: ["cross_harness_delegation"],
+      enableDelegation: true,
+    });
+
+    try {
+      const parent = await orchestrator.createTask({ profileId: "claude_main", cwd: root });
+      const result = await orchestrator.delegateTask({
+        parentTaskId: parent.id,
+        targetRuntime: "codex",
+        taskType: "ask",
+        prompt: "review with secret-token-123",
+        reason: "approval gate",
+        workspaceMode: "share",
+        requestedPermissionMode: "read-only",
+      });
+
+      const pending = db.getPendingActionByApprovalId(result.approvalId!);
+      expect(String(pending?.payload.prompt)).not.toContain("secret-token-123");
+      expect(JSON.stringify(pending?.payload)).toContain("[REDACTED]");
     } finally {
       await orchestrator.close();
     }

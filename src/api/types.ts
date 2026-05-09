@@ -86,6 +86,7 @@ export interface TaskSummary {
 }
 
 export interface TaskDetail extends Task {
+  currentSession?: RuntimeSession | undefined;
   turns: TurnView[];
   artifacts: ArtifactView[];
   latestMessage?: string | undefined;

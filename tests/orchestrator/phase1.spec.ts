@@ -6,7 +6,7 @@ import { loadConfig } from "../../src/core/config.js";
 import { AppDatabase } from "../../src/storage/db.js";
 import { Orchestrator } from "../../src/orchestrator/orchestrator.js";
 import { WorkspaceManager } from "../../src/orchestrator/workspace.js";
-import type { RuntimeAdapter, RuntimeAdapterOutput, RuntimeSessionControlInput, RuntimeTaskHandle, RunTurnInput, StartRuntimeTaskInput, ResumeRuntimeTaskInput } from "../../src/runtime/adapter.js";
+import type { RuntimeAdapter, RuntimeAdapterOutput, RuntimeSessionControlInput, RuntimeTaskHandle, RunTurnInput, OpenRuntimeSessionInput } from "../../src/runtime/adapter.js";
 import { fileChanged, messageCompleted, turnCompleted, turnStarted } from "../helpers/v2-runtime.js";
 
 const tempPaths: string[] = [];
@@ -15,14 +15,15 @@ class FakeRuntimeAdapter implements RuntimeAdapter {
   readonly runtime: RuntimeAdapter["runtime"] = "claude";
   public failNextRun = false;
   public cancelCalls = 0;
-  public resumeCalls = 0;
+  public openCalls = 0;
   public delayMs = 0;
 
-  async startTask(input: StartRuntimeTaskInput): Promise<RuntimeTaskHandle> {
+  async openSession(input: OpenRuntimeSessionInput): Promise<RuntimeTaskHandle> {
+    this.openCalls += 1;
     return {
       taskId: input.taskId,
       sessionId: input.sessionId,
-      backendThreadId: `thread-${input.taskId}`,
+      backendThreadId: input.backendThreadId ?? `thread-${input.taskId}`,
     };
   }
 
@@ -44,24 +45,11 @@ class FakeRuntimeAdapter implements RuntimeAdapter {
     yield turnCompleted(input, { inputTokens: 3, outputTokens: 2 }, ts);
   }
 
-  async resumeTask(input: ResumeRuntimeTaskInput): Promise<RuntimeTaskHandle> {
-    this.resumeCalls += 1;
-    return {
-      taskId: input.taskId,
-      sessionId: input.sessionId,
-      backendThreadId: input.backendThreadId,
-    };
-  }
-
-  async interruptSession(_input: RuntimeSessionControlInput): Promise<void> {
+  async interruptTurn(_input: RuntimeSessionControlInput): Promise<void> {
     this.cancelCalls += 1;
   }
 
-  async pauseSession(_input: RuntimeSessionControlInput): Promise<void> {
-    this.cancelCalls += 1;
-  }
-
-  async closeSession(_input: RuntimeSessionControlInput): Promise<void> {}
+  async terminateSession(_input: RuntimeSessionControlInput): Promise<void> {}
 }
 
 class FakeCodexRuntimeAdapter extends FakeRuntimeAdapter {

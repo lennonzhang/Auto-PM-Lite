@@ -5,19 +5,22 @@ import { afterEach, describe, expect, it } from "vitest";
 import { loadConfig } from "../../src/core/config.js";
 import { AppDatabase } from "../../src/storage/db.js";
 import { Orchestrator } from "../../src/orchestrator/orchestrator.js";
-import type { ForkRuntimeSessionInput, ForkRuntimeSessionResult, ResumeRuntimeTaskInput, RunTurnInput, RuntimeAdapter, RuntimeAdapterOutput, RuntimeSessionControlInput, RuntimeTaskHandle, StartRuntimeTaskInput } from "../../src/runtime/adapter.js";
+import type { ForkRuntimeSessionInput, ForkRuntimeSessionResult, RunTurnInput, RuntimeAdapter, RuntimeAdapterOutput, RuntimeSessionControlInput, RuntimeTaskHandle, OpenRuntimeSessionInput } from "../../src/runtime/adapter.js";
 import { fileChanged, messageCompleted, turnCompleted, turnStarted } from "../helpers/v2-runtime.js";
 
 const tempPaths: string[] = [];
 
 class MultiTurnRuntime implements RuntimeAdapter {
   readonly runtime: RuntimeAdapter["runtime"];
-  readonly starts: StartRuntimeTaskInput[] = [];
-  readonly resumes: ResumeRuntimeTaskInput[] = [];
+  readonly opens: OpenRuntimeSessionInput[] = [];
   readonly turns: RunTurnInput[] = [];
   readonly closes: string[] = [];
   readonly cancels: string[] = [];
   readonly forks: ForkRuntimeSessionInput[] = [];
+  readonly liveSessions = new Map<string, string>();
+  nativeCreateCount = 0;
+  nativeResumeCount = 0;
+  shutdownCount = 0;
   delayMs = 0;
   failNextTurn = false;
   fileChanges: Array<{ path: string; changeKind: "create" | "modify" | "delete"; binary: boolean }> = [];
@@ -26,9 +29,20 @@ class MultiTurnRuntime implements RuntimeAdapter {
     this.runtime = runtime;
   }
 
-  async startTask(input: StartRuntimeTaskInput): Promise<RuntimeTaskHandle> {
-    this.starts.push(input);
-    return { taskId: input.taskId, sessionId: input.sessionId, backendThreadId: `${this.runtime}-thread-${input.sessionId}` };
+  async openSession(input: OpenRuntimeSessionInput): Promise<RuntimeTaskHandle> {
+    this.opens.push(input);
+    const existing = this.liveSessions.get(input.sessionId);
+    if (existing) {
+      return { taskId: input.taskId, sessionId: input.sessionId, backendThreadId: existing };
+    }
+    const backendThreadId = input.backendThreadId ?? `${this.runtime}-thread-${input.sessionId}`;
+    if (input.backendThreadId) {
+      this.nativeResumeCount += 1;
+    } else {
+      this.nativeCreateCount += 1;
+    }
+    this.liveSessions.set(input.sessionId, backendThreadId);
+    return { taskId: input.taskId, sessionId: input.sessionId, backendThreadId };
   }
 
   async *runTurn(input: RunTurnInput): AsyncIterable<RuntimeAdapterOutput> {
@@ -49,26 +63,27 @@ class MultiTurnRuntime implements RuntimeAdapter {
     yield turnCompleted(input, { inputTokens: 1, outputTokens: 1 }, ts);
   }
 
-  async resumeTask(input: ResumeRuntimeTaskInput): Promise<RuntimeTaskHandle> {
-    this.resumes.push(input);
-    return { taskId: input.taskId, sessionId: input.sessionId, backendThreadId: input.backendThreadId };
-  }
-
   async forkSession(input: ForkRuntimeSessionInput): Promise<ForkRuntimeSessionResult> {
     this.forks.push(input);
     return { backendThreadId: `forked-${input.targetSessionId}`, forkKind: "native" };
   }
 
-  async pauseSession(input: RuntimeSessionControlInput): Promise<void> {
+  async interruptTurn(input: RuntimeSessionControlInput): Promise<void> {
     this.cancels.push(input.sessionId);
   }
 
-  async interruptSession(input: RuntimeSessionControlInput): Promise<void> {
-    this.cancels.push(input.sessionId);
-  }
-
-  async closeSession(input: RuntimeSessionControlInput): Promise<void> {
+  async terminateSession(input: RuntimeSessionControlInput): Promise<void> {
     this.closes.push(input.sessionId);
+    this.liveSessions.delete(input.sessionId);
+  }
+
+  hasLiveSession(sessionId: string): boolean {
+    return this.liveSessions.has(sessionId);
+  }
+
+  async shutdown(): Promise<void> {
+    this.shutdownCount += 1;
+    this.liveSessions.clear();
   }
 }
 
@@ -93,8 +108,10 @@ describe("task multi-turn lifecycle", () => {
       expect(sessions).toHaveLength(1);
       expect(sessions[0]?.status).toBe("active");
       expect(db.listTurns(task.id).map((turn) => turn.turnNumber)).toEqual([1, 2, 3, 4, 5]);
-      expect(runtime.starts).toHaveLength(1);
-      expect(runtime.resumes).toHaveLength(4);
+      expect(runtime.opens).toHaveLength(5);
+      expect(runtime.nativeCreateCount).toBe(1);
+      expect(runtime.nativeResumeCount).toBe(0);
+      expect(runtime.hasLiveSession(sessions[0]!.id)).toBe(true);
     } finally {
       await orchestrator.close();
     }
@@ -130,6 +147,7 @@ describe("task multi-turn lifecycle", () => {
       expect(db.getRuntimeSession(sessionId ?? "")?.closeReason).toBe("cancelled");
       expect(runtime.cancels).toEqual([sessionId]);
       expect(runtime.closes).toContain(sessionId);
+      expect(runtime.hasLiveSession(sessionId ?? "")).toBe(false);
       expect(db.listTaskEvents({ taskId: task.id }).map((row) => row.event.kind)).toEqual(expect.arrayContaining([
         "task.cancellation_requested",
         "task.cancelled",
@@ -140,14 +158,17 @@ describe("task multi-turn lifecycle", () => {
   });
 
   it("only turns closed through explicit closeTask", async () => {
-    const { db, orchestrator, root } = await buildEnv();
+    const { db, orchestrator, runtime, root } = await buildEnv();
     try {
       const task = await orchestrator.createTask({ profileId: "claude_main", cwd: root });
       await orchestrator.sendTurn({ taskId: task.id, prompt: "seed" });
+      const sessionId = db.getCurrentSession(task.id)?.id;
       expect(db.getTask(task.id)?.status).toBe("idle");
 
       await orchestrator.closeTask(task.id, "done");
       expect(db.getTask(task.id)?.status).toBe("closed");
+      expect(runtime.closes).toContain(sessionId);
+      expect(runtime.hasLiveSession(sessionId ?? "")).toBe(false);
       expect(db.getTask(task.id)?.closedAt).toBeDefined();
       expect(db.listTaskEvents({ taskId: task.id }).map((row) => row.event.kind)).toContain("task.closed");
     } finally {
@@ -170,6 +191,8 @@ describe("task multi-turn lifecycle", () => {
       expect(sessions).toHaveLength(2);
       expect(sessions.find((session) => session.id === sourceSession?.id)?.closeReason).toBe("handoff");
       expect(db.getCurrentSession(task.id)?.runtime).toBe("codex");
+      expect(claude.hasLiveSession(sourceSession?.id ?? "")).toBe(false);
+      expect(codex.hasLiveSession(db.getCurrentSession(task.id)?.id ?? "")).toBe(true);
       const detail = orchestrator.getTask(task.id);
       const summary = orchestrator.listTasks().find((entry) => entry.id === task.id);
       expect(detail?.defaultRuntime).toBe("claude");
@@ -229,7 +252,7 @@ describe("task multi-turn lifecycle", () => {
   });
 
   it("rollover creates a new active session and closes the old one with rollover reason", async () => {
-    const { db, orchestrator, root } = await buildEnv();
+    const { db, orchestrator, runtime, root } = await buildEnv();
     try {
       const task = await orchestrator.createTask({ profileId: "claude_main", cwd: root, name: "rollover" });
       await orchestrator.sendTurn({ taskId: task.id, prompt: "seed" });
@@ -239,6 +262,8 @@ describe("task multi-turn lifecycle", () => {
 
       expect(db.listRuntimeSessions(task.id)).toHaveLength(2);
       expect(db.getRuntimeSession(sourceSession?.id ?? "")?.closeReason).toBe("rollover");
+      expect(runtime.hasLiveSession(sourceSession?.id ?? "")).toBe(false);
+      expect(runtime.hasLiveSession(db.getCurrentSession(task.id)?.id ?? "")).toBe(true);
       expect(db.getCurrentSession(task.id)?.rolloverFromSessionId).toBe(sourceSession?.id);
       expect(db.listTaskEvents({ taskId: task.id }).map((row) => row.event.kind)).toEqual(expect.arrayContaining([
         "task.rollover_started",
@@ -317,7 +342,7 @@ describe("task multi-turn lifecycle", () => {
   });
 
   it("fork mode session records a non-active branch without replacing current session", async () => {
-    const { db, orchestrator, root } = await buildEnv();
+    const { db, orchestrator, runtime, root } = await buildEnv();
     try {
       const task = await orchestrator.createTask({ profileId: "claude_main", cwd: root, name: "session fork" });
       await orchestrator.sendTurn({ taskId: task.id, prompt: "seed" });
@@ -331,9 +356,45 @@ describe("task multi-turn lifecycle", () => {
       expect(forkSession?.status).toBe("closed");
       expect(forkSession?.closeReason).toBe("forked");
       expect(forkSession?.parentSessionId).toBe(sourceSession?.id);
+      expect(runtime.hasLiveSession(result.childSessionId)).toBe(false);
     } finally {
       await orchestrator.close();
     }
+  });
+
+  it("rebuilds a live runtime handle from backendThreadId after adapter memory is lost", async () => {
+    const runtime = new MultiTurnRuntime("claude");
+    const { db, orchestrator, root } = await buildEnv({ claude: runtime });
+    try {
+      const task = await orchestrator.createTask({ profileId: "claude_main", cwd: root, name: "resume live" });
+      await orchestrator.sendTurn({ taskId: task.id, prompt: "seed" });
+      const session = db.getCurrentSession(task.id);
+      expect(session?.backendThreadId).toBeDefined();
+      runtime.liveSessions.clear();
+
+      await orchestrator.sendTurn({ taskId: task.id, prompt: "after restart" });
+
+      expect(runtime.nativeCreateCount).toBe(1);
+      expect(runtime.nativeResumeCount).toBe(1);
+      expect(runtime.opens.at(-1)?.backendThreadId).toBe(session?.backendThreadId);
+      expect(runtime.hasLiveSession(session?.id ?? "")).toBe(true);
+    } finally {
+      await orchestrator.close();
+    }
+  });
+
+  it("orchestrator close releases live handles without closing DB sessions", async () => {
+    const { db, orchestrator, runtime, root } = await buildEnv();
+    const task = await orchestrator.createTask({ profileId: "claude_main", cwd: root, name: "shutdown" });
+    await orchestrator.sendTurn({ taskId: task.id, prompt: "seed" });
+    const sessionId = db.getCurrentSession(task.id)?.id;
+    const dbStatusBeforeShutdown = db.getRuntimeSession(sessionId ?? "")?.status;
+
+    await orchestrator.close();
+
+    expect(runtime.shutdownCount).toBe(1);
+    expect(runtime.hasLiveSession(sessionId ?? "")).toBe(false);
+    expect(dbStatusBeforeShutdown).toBe("active");
   });
 
   it("fails fast when continuation context exceeds 2048 token estimate", async () => {

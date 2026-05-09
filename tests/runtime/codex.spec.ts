@@ -182,6 +182,57 @@ describe("CodexRuntimeAdapter", () => {
 
     await expect(collectRunTurn(adapter)).rejects.toThrow("Failed to parse item: not json");
   });
+
+  it("keeps one live Thread for repeated opens of the same runtime session", async () => {
+    const adapter = new CodexRuntimeAdapter({
+      config: buildConfig(),
+      configPath: "D:/tmp/auto-pm-lite/config.toml",
+      secretBackend: {
+        async resolve() {
+          return "secret-value";
+        },
+      },
+    });
+    const firstThread = fakeThread([]);
+    const secondThread = fakeThread([], "thread-should-not-be-used");
+    const fakeCodex = {
+      startCalls: 0,
+      resumeCalls: 0,
+      startThread() {
+        this.startCalls += 1;
+        return firstThread;
+      },
+      resumeThread() {
+        this.resumeCalls += 1;
+        return secondThread;
+      },
+    };
+    (adapter as unknown as {
+      createCodexClient(accountId: string, taskId: string, cwd?: string): Promise<typeof fakeCodex>;
+    }).createCodexClient = async () => fakeCodex;
+
+    const first = await adapter.openSession({
+      taskId: "task-1",
+      sessionId: "session-1",
+      profileId: "codex_plan",
+      model: "gpt-5-4",
+      cwd: "D:/Code/Auto-PM-Lite",
+    });
+    const second = await adapter.openSession({
+      taskId: "task-1",
+      sessionId: "session-1",
+      profileId: "codex_plan",
+      model: "gpt-5-4",
+      cwd: "D:/Code/Auto-PM-Lite",
+      backendThreadId: first.backendThreadId,
+    });
+
+    expect(first.backendThreadId).toBe("thread-1");
+    expect(second.backendThreadId).toBe("thread-1");
+    expect(fakeCodex.startCalls).toBe(1);
+    expect(fakeCodex.resumeCalls).toBe(0);
+    expect(adapter.hasLiveSession("session-1")).toBe(true);
+  });
 });
 
 function buildConfig(overrides?: { secretRef?: string | undefined }): AppConfig {
@@ -209,8 +260,32 @@ function buildConfig(overrides?: { secretRef?: string | undefined }): AppConfig 
         },
       },
     },
-    policies: {},
-    profiles: {},
+    policies: {
+      edit: {
+        id: "edit",
+        permissionMode: "edit",
+        sandboxMode: "workspace-write",
+        networkAllowed: false,
+        approvalPolicy: "orchestrator",
+        requireApprovalFor: [],
+        maxDepth: 3,
+        allowCrossHarnessDelegation: true,
+        allowChildEdit: true,
+        allowChildNetwork: false,
+      },
+    },
+    profiles: {
+      codex_plan: {
+        id: "codex_plan",
+        runtime: "codex",
+        accountId: "vip",
+        policyId: "edit",
+        model: "gpt-5-4",
+        codexSandboxMode: "workspace-write",
+        codexApprovalPolicy: "on-request",
+        codexNetworkAccessEnabled: false,
+      },
+    },
     redaction: { additionalPatterns: [] },
     transcript: { storeRawEncrypted: false },
     storage: {
